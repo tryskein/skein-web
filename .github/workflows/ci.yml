@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint (build with warnings as errors)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Restore
+        working-directory: src
+        run: dotnet restore SkeinWeb.csproj
+      - name: Build with /warnaserror
+        working-directory: src
+        run: dotnet build SkeinWeb.csproj --no-restore -c Release /warnaserror
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Run xUnit suite
+        working-directory: src/Tests
+        run: |
+          set -o pipefail
+          dotnet test --nologo 2>&1 | tee "$RUNNER_TEMP/dotnet-unit.out"
+      - name: Require an executed, green suite
+        run: |
+          out="$RUNNER_TEMP/dotnet-unit.out"
+          if ! grep -Eq 'Passed!|Passed:\s*[1-9]' "$out"; then
+            echo "::error::zero unit tests passed or the suite did not run"
+            exit 1
+          fi
+          if grep -Eq 'Total:\s*0\b' "$out"; then
+            echo "::error::Total: 0 tests"
+            exit 1
+          fi
+          if grep -Eq 'Failed!\s|Failed:\s*[1-9]' "$out"; then
+            echo "::error::test failures reported"
+            exit 1
+          fi

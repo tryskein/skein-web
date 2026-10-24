@@ -1,0 +1,56 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/out/
+**/publish/
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Local env (never commit secrets)
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# React bundle copied in from skein-frontend at build time (multi-stage Docker build).
+# Local development uses the placeholder src/wwwroot/index.html which IS committed.
+src/wwwroot/assets/
+src/wwwroot/static/
+
+.worktrees/
+
+# Local environment — real values and secrets never go into git.
+.env.*
+!.env.example
+!.env.*.example
+
+# AI agent local settings (per-developer, may hold tokens).
+.claude/settings.local.json
+.mcp.json
+CLAUDE.local.md
+docs/coderev/
+docs/research/
+docs/plan/
+docs/tasks/

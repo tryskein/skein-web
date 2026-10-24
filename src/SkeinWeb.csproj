@@ -1,0 +1,105 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SkeinWeb</RootNamespace>
+    <AssemblyName>SkeinWeb</AssemblyName>
+    <!-- Always emit debug symbols (PDB) so production stack traces are useful -->
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <!-- XML doc generation for Swashbuckle annotations -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Prometheus metrics: HTTP, .NET runtime, system -->
+    <PackageReference Include="prometheus-net.AspNetCore" Version="8.2.1" />
+    <PackageReference Include="prometheus-net.SystemMetrics" Version="3.1.0" />
+    <PackageReference Include="prometheus-net.DotNetRuntime" Version="4.4.0" />
+
+    <!-- Redis: session ticket store + DataProtection key ring + login rate limiter.
+         StackExchange.Redis is the low-level client (used directly for atomic INCR
+         in LoginRateLimiter). Caching.StackExchangeRedis wires IDistributedCache
+         on top. DataProtection.StackExchangeRedis persists the AES keyring so
+         multiple skein-web replicas share a single set of cookie-encryption keys. -->
+    <PackageReference Include="StackExchange.Redis" Version="2.12.14" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.9" />
+    <PackageReference Include="Microsoft.AspNetCore.DataProtection.StackExchangeRedis" Version="10.0.9" />
+
+    <!-- Polly retry policy for the typed SkeinApiClient HttpClient. -->
+    <PackageReference Include="Microsoft.Extensions.Http.Polly" Version="10.0.9" />
+
+    <!-- OpenAPI: Swashbuckle.AspNetCore.Annotations gives [SwaggerOperation],
+         [SwaggerParameter], [SwaggerTag], [SwaggerRequestBody], etc. — required
+         by the project conventions. -->
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.1.7" />
+    <PackageReference Include="Swashbuckle.AspNetCore.Annotations" Version="10.1.7" />
+    <!-- Pin Microsoft.OpenApi to a patched build: Swashbuckle 10.1.7 pulls the
+         transitive 2.4.1, which CVE-2026-49451 (GHSA-v5pm-xwqc-g5wc, NU1903 —
+         uncontrolled recursion on circular schema refs) marks vulnerable through
+         2.7.4. 2.7.5 is the first patched 2.x build. Direct ref overrides the
+         transitive version and clears the NuGet-audit error under /warnaserror. -->
+    <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
+
+    <!-- NATS Core client for the SignalR live-events bridge (R3.2c). Pinned
+         per G-4 of the R3.2c plan: 2.7.3 is the verified-compatible build
+         on .NET 10 at the time of this work. -->
+    <PackageReference Include="NATS.Net" Version="2.7.3" />
+
+    <!-- [MetricInfo] / [MetricLabel] on custom Prometheus metrics, read by
+         a metrics extractor. -->
+    <PackageReference Include="Metricy.Annotations" Version="0.4.0" />
+
+    <!-- SignalR Redis backplane — required for multi-replica skein-web.
+         Without it, a SignalR message published on pod A never reaches a
+         client whose WebSocket is held on pod B. Microsoft.AspNetCore.SignalR
+         already ships with AspNetCore; this is the StackExchange.Redis
+         transport that fanouts hub messages across replicas via Redis
+         pub/sub. Version line matches the .NET 10 framework. -->
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.StackExchangeRedis" Version="10.0.9" />
+
+    <!-- MessagePack — direct pin to override the vulnerable 2.5.187 pulled in
+         transitively by SignalR.Protocols.MessagePack (via the Redis backplane).
+         2.5.187 is affected by CVE-2026-48109 (LZ4 decompress DoS) + related
+         advisories; NuGet audit fails the /warnaserror lint on it. 3.1.12 is the
+         latest patched release. Direct reference wins over the transitive. -->
+    <PackageReference Include="MessagePack" Version="3.1.12" />
+
+    <!-- Native OIDC (KeycloakOidc: skein-api SSO mode + Authentication:Oidc:Authority set). Microsoft handler
+         performs Authorization Code + PKCE against Keycloak, validates
+         the id_token using the realm JWKS (refreshed automatically),
+         and surfaces claims via OnTokenValidated so we can gate on
+         group membership and provision the local user.
+         Only the OpenIdConnect handler is added — the legacy Keycloak
+         mode (trust-headers, no token validation in this pod) keeps
+         working unchanged when the package is in the image but the
+         handler is not registered. -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.9" />
+  </ItemGroup>
+
+  <!-- The Tests project asserts internal-only state in MembershipCache
+       (Count, RefCountFor) and drives NatsBridge.Dispatch directly to
+       exercise routing without spinning a real NATS server. Exposing
+       the surface to one test assembly is preferable to over-exposing
+       it as public API. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="SkeinWeb.Tests" />
+  </ItemGroup>
+
+  <!-- wwwroot is auto-included by Microsoft.NET.Sdk.Web; no explicit Content needed -->
+
+  <!-- Exclude the Tests/ subtree — it's a sibling project (SkeinWeb.Tests.csproj)
+       that ProjectReferences this one. Without these excludes, the .Web SDK's
+       glob-based Compile / EmbeddedResource pulls every test .cs into the
+       BFF assembly and the test runner can't load Xunit. -->
+  <ItemGroup>
+    <Compile Remove="Tests/**/*.cs" />
+    <Content Remove="Tests/**/*" />
+    <None Remove="Tests/**/*" />
+    <EmbeddedResource Remove="Tests/**/*" />
+  </ItemGroup>
+
+</Project>

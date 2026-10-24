@@ -1,0 +1,156 @@
+name: Release
+
+# Final release tags only (X.Y.Z). Pre-release tags such as X.Y.Z-rc.N do not
+# match the glob below and publish nothing.
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/tryskein/skein-web
+
+jobs:
+  gate:
+    name: validate tag and branch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate tag format
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Actions tag filters are globs, not regular expressions: re-check strictly.
+          if ! printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$TAG' is not of the form X.Y.Z"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Tag commit must be on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::commit $GITHUB_SHA is not an ancestor of origin/main"
+            exit 1
+          fi
+
+  test:
+    name: tests
+    needs: gate
+    uses: ./.github/workflows/ci.yml
+
+  approve:
+    name: release approval
+    needs: test
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - run: echo "Release ${{ github.ref_name }} approved"
+
+  build:
+    name: build ${{ matrix.platform }}
+    needs: approve
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute build time
+        id: time
+        run: echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            BUILD_TIME=${{ steps.time.outputs.build_time }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/tryskein/skein-web
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.suffix }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: publish multi-arch manifest
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create manifest list
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          test "$(ls | wc -l)" -eq 2
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Inspect
+        env:
+          TAG: ${{ github.ref_name }}
+        run: docker buildx imagetools inspect "$IMAGE:$TAG"
+
+  github-release:
+    name: GitHub Release
+    needs: merge
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --verify-tag --generate-notes
