@@ -52,7 +52,8 @@ umbrella's
 From the top of `skein/`:
 
 ```bash
-docker compose -f docker-compose.local.yml up -d --build
+docker compose --env-file versions.env -f docker-compose.local.yml \
+  -f docker-compose.local.build.yml up -d --build   # builds the services from projects/
 # UI: http://localhost:8080 (served by skein-frontend, which proxies to skein-web)
 ```
 

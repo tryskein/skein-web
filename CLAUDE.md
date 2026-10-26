@@ -36,7 +36,8 @@ docker build -t skein-web:dev .                                  # image, from t
 
 Running it on its own needs skein-api, Redis and NATS to be reachable; see `README.md`. The
 normal way to run it is the umbrella's local stack (from the top of `skein/`):
-`docker compose -f docker-compose.local.yml up -d --build`. There skein-web is
+`docker compose --env-file versions.env -f docker-compose.local.yml -f docker-compose.local.build.yml up -d --build`
+(the second file builds the services from `projects/`; without it the published images run). There skein-web is
 internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 
 ## Invariants
