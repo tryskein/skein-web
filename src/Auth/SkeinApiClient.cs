@@ -264,8 +264,8 @@ public sealed class SkeinApiClient
             var err = await TryReadErrorAsync(resp, ct);
             // err.Code is the machine-readable code (user_not_provisioned,
             // missing_claims, username_conflict). Empty when the body
-            // didn't parse — middleware treats that as "user_not_provisioned"
-            // for 403, "unknown" otherwise.
+            // didn't parse — both SSO paths treat an empty code as a
+            // provisioning failure (502), including for a 403 response.
             throw new SsoProvisioningException(
                 (int)resp.StatusCode,
                 err.Code,

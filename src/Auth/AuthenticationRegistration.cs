@@ -21,6 +21,11 @@ namespace SkeinWeb.Auth;
 /// </remarks>
 public static class AuthenticationRegistration
 {
+    private const string UserNotProvisionedResponseJson =
+        "{\"error\":\"user_not_provisioned\"," +
+        "\"message\":\"Your SSO identity is authenticated but not authorized for Skein. " +
+        "Contact your administrator to request access.\"}";
+
     /// <summary>
     /// Validates the OIDC-client settings for <paramref name="mode"/>, registers
     /// <paramref name="mode"/> as a singleton, and adds the authentication schemes:
@@ -187,9 +192,7 @@ public static class AuthenticationRegistration
                             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
                             ctx.Response.ContentType = "application/json";
                             await ctx.Response.WriteAsync(
-                                "{\"error\":\"user_not_provisioned\"," +
-                                "\"message\":\"Your SSO identity is authenticated but not authorized for Skein. " +
-                                "Contact your administrator to request access.\"}",
+                                UserNotProvisionedResponseJson,
                                 ctx.HttpContext.RequestAborted);
                             ctx.HandleResponse();
                             return;
@@ -236,9 +239,7 @@ public static class AuthenticationRegistration
                             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
                             ctx.Response.ContentType = "application/json";
                             await ctx.Response.WriteAsync(
-                                "{\"error\":\"user_not_provisioned\"," +
-                                "\"message\":\"Your SSO identity is authenticated but not authorized for Skein. " +
-                                "Contact your administrator to request access.\"}",
+                                UserNotProvisionedResponseJson,
                                 ctx.HttpContext.RequestAborted);
                             ctx.HandleResponse();
                             return;
