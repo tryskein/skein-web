@@ -242,7 +242,7 @@ Unit tests need only the .NET 10 SDK. skein-web has no integration suite of its
 own; the live path (hub, session, proxy) is covered by the product-wide e2e
 suite, run from the top of the umbrella workspace with
 `./scripts/e2e-test.sh`. For all test kinds, narrowed runs and pitfalls, see
-the `## Testing` section of [`CLAUDE.md`](CLAUDE.md).
+the `## Testing` section of [`AGENTS.md`](AGENTS.md).
 
 ## Contributing
 
