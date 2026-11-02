@@ -162,7 +162,8 @@ public static class AuthenticationRegistration
                 {
                     // After the id_token is validated by the OIDC handler:
                     // 1) enforce group membership — non-members get 403, no cookie
-                    // 2) provision (or look up) the local Skein user via skein-api
+                    // 2) provision (or look up) the local Skein user via skein-api;
+                    //    user_not_provisioned stays a 403 access denial, no cookie
                     // 3) replace the OIDC principal with the canonical cookie
                     //    principal so the cookie ticket carries exactly the same
                     //    claims as a local-password login.
@@ -224,6 +225,23 @@ public static class AuthenticationRegistration
                         {
                             provisioned = await api.OidcProvisionAsync(
                                 email, username, name, ctx.HttpContext.RequestAborted);
+                        }
+                        catch (SsoProvisioningException ex) when (
+                            ex.StatusCode == StatusCodes.Status403Forbidden && ex.ErrorCode == "user_not_provisioned")
+                        {
+                            var logger = ctx.HttpContext.RequestServices
+                                .GetRequiredService<ILoggerFactory>()
+                                .CreateLogger("Oidc");
+                            logger.LogWarning("oidc: provisioning denied ({StatusCode} {Code})", ex.StatusCode, ex.ErrorCode);
+                            ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+                            ctx.Response.ContentType = "application/json";
+                            await ctx.Response.WriteAsync(
+                                "{\"error\":\"user_not_provisioned\"," +
+                                "\"message\":\"Your SSO identity is authenticated but not authorized for Skein. " +
+                                "Contact your administrator to request access.\"}",
+                                ctx.HttpContext.RequestAborted);
+                            ctx.HandleResponse();
+                            return;
                         }
                         catch (SsoProvisioningException ex)
                         {
