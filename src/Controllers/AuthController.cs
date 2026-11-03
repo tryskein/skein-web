@@ -491,7 +491,10 @@ public sealed class AuthController : ControllerBase
     /// The .NET handler builds an end_session request against the
     /// realm (issuer + client_id + post_logout_redirect_uri pointing
     /// to <see cref="OidcOptions.SignedOutCallbackPath"/>) and returns
-    /// a 302 to Keycloak. Keycloak clears its realm session cookie
+    /// a 302 to Keycloak. The client id identifies the relying party even
+    /// after the local session and its tokens have been removed. Without
+    /// an id_token_hint, Keycloak may ask the user to confirm the logout.
+    /// Keycloak clears its realm session cookie
     /// and bounces back to the callback, which finally lands the
     /// user on <see cref="OidcOptions.SignedOutRedirectUri"/>.
     /// 404 outside <c>KeycloakOidc</c> mode so the path does not

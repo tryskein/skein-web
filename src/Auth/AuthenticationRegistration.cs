@@ -165,6 +165,17 @@ public static class AuthenticationRegistration
 
                 options.Events = new OpenIdConnectEvents
                 {
+                    // POST /logout has already removed the local session, so
+                    // no saved id_token is available on the browser's next
+                    // request. Identify the RP explicitly: Keycloak accepts
+                    // client_id with the registered post_logout_redirect_uri
+                    // and may ask the user to confirm logout without a hint.
+                    OnRedirectToIdentityProviderForSignOut = ctx =>
+                    {
+                        ctx.ProtocolMessage.ClientId = ctx.Options.ClientId;
+                        return Task.CompletedTask;
+                    },
+
                     // After the id_token is validated by the OIDC handler:
                     // 1) enforce group membership — non-members get 403, no cookie
                     // 2) provision (or look up) the local Skein user via skein-api;

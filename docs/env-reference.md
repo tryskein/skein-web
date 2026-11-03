@@ -344,6 +344,10 @@ deployment still sets them, they are ignored.
   same-origin path, validated like `CallbackPath`.
 - **If unset:** the default. Must be registered on the Keycloak client as a valid
   post-logout redirect URI.
+- **Logout request:** the BFF sends its configured client id with this callback.
+  The local session is already deleted, so no saved `id_token_hint` is required.
+  Keycloak may display a logout-confirmation page before ending the SSO session;
+  the user must confirm it to complete external logout.
 
 #### `Authentication__Oidc__SignedOutRedirectUri` (`Authentication:Oidc:SignedOutRedirectUri`)
 
