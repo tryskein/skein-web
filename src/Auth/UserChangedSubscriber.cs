@@ -46,9 +46,13 @@ namespace SkeinWeb.Auth;
 /// next provision call.
 /// </para>
 /// <para>
-/// QUEUE GROUP: shares the <c>skein-web</c> queue group with
-/// <see cref="NatsBridge"/> so the multi-replica deployment processes
-/// each event exactly once. After revocation the affected user's next
+/// QUEUE GROUP: uses a separate group from <see cref="NatsBridge"/>.
+/// Their wildcard subjects overlap, so sharing a group would let the
+/// bridge consume and discard events needed for session revocation.
+/// All replicas of this subscriber share the revocation group: one
+/// receives each event and removes tickets from the shared Redis store.
+/// Core NATS delivery is at-most-once, without acknowledgement or retry.
+/// After revocation the affected user's next
 /// request lands without a valid cookie and either bounces to login
 /// (local mode) or re-provisions via <see cref="SkeinWeb.Middleware.SsoSessionMiddleware"/>
 /// (keycloak mode — the oauth2-proxy trust headers are still present).
@@ -59,7 +63,8 @@ namespace SkeinWeb.Auth;
 /// loop is the SLOW path: even if NATS lag, pod crash, or the queue
 /// group dropping the message means this subscriber never fires, the
 /// middleware re-fetches claims from skein-api every 5 minutes and
-/// catches the drift on its own.
+/// catches the drift on its own in legacy Keycloak trust-header mode.
+/// That refresh loop does not run in local or native OIDC mode.
 /// </para>
 /// </remarks>
 public sealed class UserChangedSubscriber : IHostedService
@@ -71,12 +76,12 @@ public sealed class UserChangedSubscriber : IHostedService
     private const string Subject = "skein.user.*.field.>";
 
     /// <summary>
-    /// Shared with <see cref="NatsBridge"/> — every skein-web replica
-    /// joins the same queue group so each NATS message reaches exactly
-    /// one pod. Revocation only needs to happen once per cluster; the
+    /// Shared by revocation subscribers across replicas, separate from
+    /// the bridge's queue group. Revocation only needs to happen once
+    /// per cluster; the
     /// Valkey-backed <see cref="RedisTicketStore"/> is the shared state.
     /// </summary>
-    private const string QueueGroup = "skein-web";
+    private const string QueueGroup = "skein-web-session-revocation";
 
     /// <summary>
     /// Kebab-case field names that, when changed, force a session

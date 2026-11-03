@@ -79,8 +79,8 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 
 | Kind | Status | What it is here | Command (local) | Narrowed run | Location |
 |---|---|---|---|---|---|
-| unit | enabled | xUnit + Moq, in-process; `*Integration*` classes are mock-based too, no live NATS or Redis | `cd src/Tests && dotnet test --nologo` | `cd src/Tests && dotnet test --nologo --filter "FullyQualifiedName~<Class or Method>"` | `src/Tests/**` |
-| integration | not used | the BFF is tested at its boundaries with HTTP handler stubs and a mocked hub | — | — | — |
+| unit | enabled | xUnit + Moq, in-process; infrastructure-dependent tests skip without their settings | `cd src/Tests && dotnet test --nologo --filter 'Category!=Integration'` | `cd src/Tests && dotnet test --nologo --filter 'Category!=Integration&FullyQualifiedName~<Class or Method>'` | `src/Tests/**` |
+| integration | enabled | Session revocation through real NATS subscriptions and the shared Redis ticket store | `./scripts/integration-test.sh` | `./scripts/integration-test.sh 'FullyQualifiedName~<Class or Method>'` | `src/Tests/Auth/UserChangedSubscriberIntegrationTests.cs` |
 | e2e | covered by skein-frontend | no own suite; the `e2e` group of skein-frontend exercises the hub, the cookie session and the proxy on a live stack built from `projects/*` | from the top of `skein/`: `./scripts/e2e-test.sh` | from the top of `skein/`: `./scripts/e2e-test.sh -- -g '<test title>'` | `projects/skein-frontend/browser/e2e/` |
 | smoke (image contract) | not used | — | — | — | — |
 | mutation | not used | — | — | — | — |
@@ -89,14 +89,20 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 
 ### Project specifics
 
-- Live NATS, Redis and SignalR are exercised only by the product e2e suite.
-  There is no e2e job in this repository; the e2e harness builds this image
-  from the working tree.
+- Session revocation is tested against isolated NATS and Redis containers;
+  SignalR is exercised live by the product e2e suite. There is no e2e job
+  in this repository; the e2e harness builds this image from the working tree.
 - Do not add checks that read source code without a maintainer's decision.
 
 ### Prerequisites
 
 - Unit: .NET 10 SDK only. No environment variables, no secrets, no Docker.
+- Integration: Docker, Bash and Python 3; run from a checkout on the Docker
+  daemon's host (container bind mounts must resolve to that checkout).
+  `TEST_NATS_URL`, `TEST_NATS_MONITOR_URL` and `TEST_REDIS_URL` are set by
+  the harness; without any of them the integration theory is skipped.
+  The harness uses .NET SDK 10; `SKEIN_TEST_RUNNER_IMAGE`, `SKEIN_TEST_CPUS`
+  and `SKEIN_TEST_MEMORY` override its runner image and resource limits.
 - e2e: Docker and the full `skein/` workspace with all three services cloned
   into `projects/`. Inside a devcontainer export `HOST_WORKSPACE` (see the
   umbrella `AGENTS.md`).
@@ -131,4 +137,5 @@ creates a GitHub Release. e2e and mutation are never run on GitHub.
 
 ### Kinds without automatic runs
 
+- Integration is run only by hand, through `./scripts/integration-test.sh`.
 - e2e for this service is run only by hand, through the umbrella harness.
