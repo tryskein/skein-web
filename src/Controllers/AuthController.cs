@@ -494,9 +494,11 @@ public sealed class AuthController : ControllerBase
     /// a 302 to Keycloak. The client id identifies the relying party even
     /// after the local session and its tokens have been removed. Without
     /// an id_token_hint, Keycloak may ask the user to confirm the logout.
-    /// Keycloak clears its realm session cookie
+    /// After any required confirmation, Keycloak clears its realm session cookie
     /// and bounces back to the callback, which finally lands the
     /// user on <see cref="OidcOptions.SignedOutRedirectUri"/>.
+    /// Without that confirmation the external session remains active and
+    /// the browser does not return to the callback.
     /// 404 outside <c>KeycloakOidc</c> mode so the path does not
     /// accidentally hit the legacy or local stacks.
     /// </remarks>
