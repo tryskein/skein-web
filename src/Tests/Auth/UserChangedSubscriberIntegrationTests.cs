@@ -37,12 +37,15 @@ public sealed class UserChangedSubscriberIntegrationTests
         var connections = new List<NatsConnection>();
         var bridges = new List<NatsBridge>();
         var subscribers = new List<UserChangedSubscriber>();
+        var clientNames = new List<string>();
         var keys = new List<string>();
         try
         {
             for (var replica = 0; replica < replicas; replica++)
             {
-                var conn = new NatsConnection(new NatsOpts { Url = natsUrl });
+                var name = $"session-revocation-test-{Guid.NewGuid():N}";
+                clientNames.Add(name);
+                var conn = new NatsConnection(new NatsOpts { Url = natsUrl, Name = name });
                 connections.Add(conn);
                 var bridge = new NatsBridge(conn, Mock.Of<IHubContext<SkeinHub>>(), NullLogger<NatsBridge>.Instance);
                 var subscriber = new UserChangedSubscriber(conn, store, NullLogger<UserChangedSubscriber>.Instance);
@@ -52,13 +55,15 @@ public sealed class UserChangedSubscriberIntegrationTests
                 await subscriber.StartAsync(ct);
             }
 
-            // Wait for all three real subscriptions per replica. StartAsync starts
-            // background tasks; publishing immediately would race their registration.
-            await UntilAsync(async () =>
+            // Wait for this test's subscriptions, excluding stale connections from
+            // a preceding theory row or clients belonging to another test.
+            Assert.True(await UntilAsync(async () =>
             {
-                var state = await monitor.GetFromJsonAsync<SubscriptionState>("subsz", ct);
-                return state?.NumSubscriptions >= replicas * 3;
-            }, ct);
+                var state = await monitor.GetFromJsonAsync<ConnectionState>("connz?subs=true", ct);
+                return clientNames.All(name => state?.Connections?.Any(client =>
+                    client.Name == name && new[] { "skein.events.>", "skein.user.>", "skein.user.*.field.>" }
+                        .All(subject => client.SubscriptionsList?.Contains(subject) == true)) == true);
+            }, ct), "The current replicas did not register all NATS subscriptions.");
 
             await using var publisher = new NatsConnection(new NatsOpts { Url = natsUrl });
             var events = new List<(Guid User, string Field, string Key)>();
@@ -77,6 +82,8 @@ public sealed class UserChangedSubscriberIntegrationTests
             var unaffectedKey = await store.StoreAsync(Ticket(unaffectedUser));
             keys.Add(unaffectedKey);
 
+            using var revocationDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var revocationToken = revocationDeadline.Token;
             foreach (var change in events)
             {
                 await publisher.PublishAsync($"skein.user.{change.User}.field.{change.Field}",
@@ -84,24 +91,27 @@ public sealed class UserChangedSubscriberIntegrationTests
                     {
                         eventType = "user.field_changed", entityType = "user", entityId = change.User.ToString(),
                     }),
-                    cancellationToken: ct);
+                    cancellationToken: revocationToken);
             }
-            await publisher.PingAsync(ct);
+            await publisher.PingAsync(revocationToken);
 
             // Observe the product's effect in the shared ticket store, rather than
             // asserting queue names or calling the handler directly. Every event
             // must revoke its user's ticket; unrelated tickets must survive.
-            await UntilAsync(async () =>
+            var remaining = new List<string>();
+            var revoked = await UntilAsync(async () =>
             {
+                remaining.Clear();
                 foreach (var change in events)
                 {
                     if (await store.RetrieveAsync(change.Key) is not null)
                     {
-                        return false;
+                        remaining.Add(change.Field);
                     }
                 }
-                return true;
-            }, ct);
+                return remaining.Count == 0;
+            }, revocationToken);
+            Assert.True(revoked, $"{remaining.Count} session tickets were not revoked; fields: {string.Join(", ", remaining)}");
             Assert.NotNull(await store.RetrieveAsync(unaffectedKey));
         }
         finally
@@ -133,17 +143,27 @@ public sealed class UserChangedSubscriberIntegrationTests
     private static string Required(string name) => Environment.GetEnvironmentVariable(name)
         ?? throw new InvalidOperationException($"{name} is required");
 
-    private static async Task UntilAsync(Func<Task<bool>> condition, CancellationToken ct)
+    private static async Task<bool> UntilAsync(Func<Task<bool>> condition, CancellationToken ct)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(25));
-        while (!await condition())
+        try
         {
-            await timer.WaitForNextTickAsync(ct);
+            while (!await condition())
+            {
+                await timer.WaitForNextTickAsync(ct);
+            }
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            return false;
         }
     }
 
-    private sealed record SubscriptionState(
-        [property: System.Text.Json.Serialization.JsonPropertyName("num_subscriptions")] int NumSubscriptions);
+    private sealed record ConnectionState(NatsClient[]? Connections);
+
+    private sealed record NatsClient(string? Name,
+        [property: System.Text.Json.Serialization.JsonPropertyName("subscriptions_list")] string[]? SubscriptionsList);
 
     private sealed class InfrastructureTheoryAttribute : TheoryAttribute
     {

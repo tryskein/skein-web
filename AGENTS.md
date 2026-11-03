@@ -80,7 +80,7 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 | Kind | Status | What it is here | Command (local) | Narrowed run | Location |
 |---|---|---|---|---|---|
 | unit | enabled | xUnit + Moq, in-process; infrastructure-dependent tests skip without their settings | `cd src/Tests && dotnet test --nologo --filter 'Category!=Integration'` | `cd src/Tests && dotnet test --nologo --filter 'Category!=Integration&FullyQualifiedName~<Class or Method>'` | `src/Tests/**` |
-| integration | enabled | Session revocation through real NATS subscriptions and the shared Redis ticket store | `./scripts/integration-test.sh` | `./scripts/integration-test.sh 'FullyQualifiedName~<Class or Method>'` | `src/Tests/Auth/UserChangedSubscriberIntegrationTests.cs` |
+| integration | enabled | Session revocation through real NATS subscriptions and the shared Redis ticket store | `./scripts/integration-test.sh` | `./scripts/integration-test.sh 'FullyQualifiedName~<Class or Method>'` | `src/Tests/**`, trait `Category=Integration` |
 | e2e | covered by skein-frontend | no own suite; the `e2e` group of skein-frontend exercises the hub, the cookie session and the proxy on a live stack built from `projects/*` | from the top of `skein/`: `./scripts/e2e-test.sh` | from the top of `skein/`: `./scripts/e2e-test.sh -- -g '<test title>'` | `projects/skein-frontend/browser/e2e/` |
 | smoke (image contract) | not used | — | — | — | — |
 | mutation | not used | — | — | — | — |
@@ -114,7 +114,7 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 | pull request / push to `main` | `ci.yml`: lint + unit | — | — | — | — |
 | release tag `X.Y.Z` | `release.yml` runs `ci.yml` first | — | — | — | — |
 | release tag `X.Y.Z-rc.N` | nothing (publishes nothing) | — | — | — | — |
-| manual | local only | — | local only (`./scripts/e2e-test.sh`) | — | — |
+| manual | local only | local only (`./scripts/integration-test.sh`) | local only (`./scripts/e2e-test.sh`) | — | — |
 
 `.github/workflows/ci.yml` runs on pull requests, on pushes to `main` and as a
 reusable workflow: the lint build (`/warnaserror`) and the unit suite, with a
@@ -124,6 +124,9 @@ to be on `main`, runs `ci.yml`, waits for approval on the `release`
 environment, builds `linux/amd64` and `linux/arm64` natively, publishes the
 multi-arch image `ghcr.io/tryskein/skein-web` as `X.Y.Z` and `latest`, and then
 creates a GitHub Release. e2e and mutation are never run on GitHub.
+
+CI runs the unfiltered xUnit suite; integration tests skip because their
+infrastructure settings are absent. The local unit command excludes that trait.
 
 ### Pitfalls
 

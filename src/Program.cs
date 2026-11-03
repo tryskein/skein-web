@@ -338,8 +338,9 @@ builder.Services.AddSkeinHubDelivery(
 // skein.user.{uid}.field.{kebab} (role, deactivated-at, name, username),
 // the subscriber wipes every active Valkey ticket for that user via
 // RedisTicketStore.RemoveByUserIdAsync. Sub-second invalidation in the
-// happy path; SsoSessionMiddleware's TTL-refresh loop is the fallback
-// for the case where NATS lag or a queue-group drop swallows the event.
+// happy path. In legacy Keycloak trust-header mode, SsoSessionMiddleware's
+// TTL-refresh loop also catches missed events; local and native OIDC mode
+// do not run that refresh loop.
 builder.Services.AddHostedService<UserChangedSubscriber>();
 
 // ---- Controllers + ProblemDetails + Swagger --------------------------------

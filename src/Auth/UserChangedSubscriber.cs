@@ -78,8 +78,8 @@ public sealed class UserChangedSubscriber : IHostedService
     /// <summary>
     /// Shared by revocation subscribers across replicas, separate from
     /// the bridge's queue group. Revocation only needs to happen once
-    /// per cluster; the
-    /// Valkey-backed <see cref="RedisTicketStore"/> is the shared state.
+    /// per cluster; the Valkey-backed <see cref="RedisTicketStore"/>
+    /// is the shared state.
     /// </summary>
     private const string QueueGroup = "skein-web-session-revocation";
 
