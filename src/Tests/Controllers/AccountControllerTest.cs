@@ -128,7 +128,7 @@ public class AccountControllerTest
                 "/ui/v1/auth/password-reset" when post => new HttpResponseMessage(HttpStatusCode.NoContent),
                 _ when post && path.StartsWith("/ui/v1/auth/password-reset/") => Json(ResetCompleteBody),
                 _ when post && path.StartsWith("/ui/v1/auth/confirm-email/") => new HttpResponseMessage(HttpStatusCode.NoContent),
-                _ when post && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
+                _ when post && path.StartsWith("/ui/v1/auth/invitations/") && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
                 _ when path.StartsWith("/ui/v1/auth/invitations/") => Json(PreviewLiteral),
                 _ => new HttpResponseMessage(HttpStatusCode.NotFound),
             });

@@ -70,10 +70,11 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
                 "/ui/v1/auth/password-reset" when post => new HttpResponseMessage(HttpStatusCode.NoContent),
                 _ when post && path.StartsWith("/ui/v1/auth/password-reset/") => Json(AuthResponseU1),
                 _ when post && path.StartsWith("/ui/v1/auth/confirm-email/") => new HttpResponseMessage(HttpStatusCode.NoContent),
-                _ when post && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
+                _ when post && path.StartsWith("/ui/v1/auth/invitations/") && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
                 _ when path.StartsWith("/ui/v1/auth/invitations/") => Json(
                     """{"status":"invalid","space":null,"inviterUsername":null,"email":null,"hasAccount":null}"""),
-                _ => Json("""{"ok":true}"""),
+                "/ui/v1/projects" => Json("""{"ok":true}"""),
+                _ => new HttpResponseMessage(HttpStatusCode.NotFound),
             });
         }
 
