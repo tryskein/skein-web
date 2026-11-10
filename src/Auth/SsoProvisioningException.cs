@@ -4,7 +4,7 @@ namespace SkeinWeb.Auth;
 /// Thrown by <see cref="SkeinApiClient.OidcProvisionAsync"/> when
 /// skein-api rejects a provisioning request with a structured business
 /// error (HTTP 403 / 422 / 409 from
-/// <c>POST /api/v1/auth/oidc/provision</c>).
+/// <c>POST /ui/v1/auth/oidc/provision</c>).
 /// </summary>
 /// <remarks>
 /// The <see cref="ErrorCode"/> is the machine-readable code in the

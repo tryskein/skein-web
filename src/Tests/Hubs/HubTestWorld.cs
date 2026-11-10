@@ -207,7 +207,7 @@ internal sealed class HubTestWorld
 }
 
 /// <summary>
-/// skein-api stand-in for <c>POST /api/v1/hub/project-access</c>, version 2
+/// skein-api stand-in for <c>POST /ui/v1/hub/project-access</c>, version 2
 /// (T014 <c>internal/projects/access_contract.go</c>, ADR-3): a member sees its
 /// projects; an internal admin additionally sees every KNOWN project outside
 /// other users' personal spaces (no wildcard: an unknown project is denied to

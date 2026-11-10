@@ -69,7 +69,7 @@ public sealed class SkeinApiClient
     /// <param name="ct">Cancellation token tied to the inbound request.</param>
     public async Task<LoginResult> LoginAsync(string email, string password, CancellationToken ct)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Post, "/api/v1/auth/login")
+        using var req = new HttpRequestMessage(HttpMethod.Post, "/ui/v1/auth/login")
         {
             Content = JsonContent.Create(new { email, password }, options: JsonOpts),
         };
@@ -125,7 +125,7 @@ public sealed class SkeinApiClient
 
     /// <summary>
     /// The current session's user as skein-api sees it —
-    /// <c>GET /api/v1/auth/me</c>, with the session's identity and
+    /// <c>GET /ui/v1/auth/me</c>, with the session's identity and
     /// <c>X-Skein-Session-Epoch</c> (added by <see cref="InternalApiHandler"/>
     /// from the cookie principal of the ambient request).
     /// </summary>
@@ -137,7 +137,7 @@ public sealed class SkeinApiClient
     /// <param name="ct">Cancellation token tied to the inbound request.</param>
     public async Task<MeResult> MeAsync(CancellationToken ct)
     {
-        using var resp = await _http.GetAsync("/api/v1/auth/me", HttpCompletionOption.ResponseHeadersRead, ct);
+        using var resp = await _http.GetAsync("/ui/v1/auth/me", HttpCompletionOption.ResponseHeadersRead, ct);
         if (resp.StatusCode == HttpStatusCode.OK)
         {
             var me = await resp.Content.ReadFromJsonAsync<LoginResponse>(JsonOpts, ct);
@@ -163,7 +163,7 @@ public sealed class SkeinApiClient
     /// Provision (or refresh) an SSO user identity on skein-api after
     /// the BFF has read the trust headers forwarded by oauth2-proxy.
     /// Posts <c>{email, username, name}</c> to
-    /// <c>POST /api/v1/auth/oidc/provision</c>
+    /// <c>POST /ui/v1/auth/oidc/provision</c>
     /// (<c>X-Skein-Internal-Secret</c> is injected by
     /// <see cref="InternalApiHandler"/>).
     /// </summary>
@@ -180,7 +180,7 @@ public sealed class SkeinApiClient
     ///         role, …, sessionEpoch}</c>). User existed
     ///         (UPDATE) or was created (INSERT). Returned <see cref="UserDto"/>
     ///         carries null timestamps; clients that need them must call
-    ///         <c>/api/v1/auth/me</c> via the proxy.</item>
+    ///         the browser path <c>/api/v1/auth/me</c> via the proxy.</item>
     ///   <item>403 <c>user_not_provisioned</c> — email unknown and
     ///         <c>SKEIN_AUTO_PROVISION=false</c>. Surface as a friendly
     ///         "Access denied" message to the user.</item>
@@ -210,7 +210,7 @@ public sealed class SkeinApiClient
     public async Task<AuthenticatedUser> OidcProvisionAsync(
         string email, string username, string name, CancellationToken ct)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Post, "/api/v1/auth/oidc/provision")
+        using var req = new HttpRequestMessage(HttpMethod.Post, "/ui/v1/auth/oidc/provision")
         {
             // camelCase via JsonSerializerDefaults.Web — matches the
             // skein-api struct tags (email/username/name). `sub` is
@@ -321,7 +321,7 @@ public sealed class SkeinApiClient
         // so that an absent field stays distinguishable from epoch 0.
         [property: JsonPropertyName("sessionEpoch")] long? SessionEpoch);
 
-    /// <summary>200 body of <c>POST /api/v1/auth/login</c> — skein-api
+    /// <summary>200 body of <c>POST /ui/v1/auth/login</c> — skein-api
     /// <c>AuthResponse</c>; <c>sessionEpoch</c> nullable so absence is visible.</summary>
     private sealed record LoginResponse(
         string? Id,
@@ -377,7 +377,7 @@ public static class SkeinApiRetryPolicy
 /// </remarks>
 public sealed class SkeinServiceApiClient
 {
-    private const string ProjectAccessPath = "/api/v1/hub/project-access";
+    private const string ProjectAccessPath = "/ui/v1/hub/project-access";
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
@@ -423,7 +423,7 @@ public sealed class SkeinServiceApiClient
 
     /// <summary>
     /// Checks, for many users in one call, which projects each user can see —
-    /// <c>POST /api/v1/hub/project-access</c> (skein-api
+    /// <c>POST /ui/v1/hub/project-access</c> (skein-api
     /// <c>internal/projects/access_contract.go</c>, T028).
     /// </summary>
     /// <remarks>
@@ -486,7 +486,7 @@ public sealed class SkeinServiceApiClient
     }
 
     /// <summary>
-    /// Reads the installation settings — <c>GET /api/v1/internal/instance-config</c>
+    /// Reads the installation settings — <c>GET /ui/v1/internal/instance-config</c>
     /// (skein-api <c>internal/accounts/contract.go#InstanceConfig</c>, T012).
     /// </summary>
     /// <remarks>
@@ -639,7 +639,7 @@ public sealed class SkeinServiceApiClient
     }
 }
 
-/// <summary>Body of <c>POST /api/v1/hub/project-access</c> (T028 <c>ProjectAccessRequest</c>).</summary>
+/// <summary>Body of <c>POST /ui/v1/hub/project-access</c> (T028 <c>ProjectAccessRequest</c>).</summary>
 /// <param name="Users">The batch to check.</param>
 public sealed record ProjectAccessRequest(
     [property: JsonPropertyName("users")] IReadOnlyList<ProjectAccessQuery> Users);
@@ -655,7 +655,7 @@ public sealed record ProjectAccessQuery(
     [property: JsonPropertyName("allVisible"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     bool AllVisible = false);
 
-/// <summary>200 body of <c>POST /api/v1/hub/project-access</c> (T028 <c>ProjectAccessResponse</c>).</summary>
+/// <summary>200 body of <c>POST /ui/v1/hub/project-access</c> (T028 <c>ProjectAccessResponse</c>).</summary>
 /// <param name="Users">One result per query, in query order.</param>
 public sealed record ProjectAccessResponse(
     [property: JsonPropertyName("users")] IReadOnlyList<ProjectAccessResult> Users);
@@ -757,35 +757,35 @@ public sealed class SkeinAccountsApiClient
             .AddPolicyHandler(request => request.Method == HttpMethod.Get ? retry : noRetry);
     }
 
-    /// <summary><c>POST /api/v1/auth/signup</c>.</summary>
+    /// <summary><c>POST /ui/v1/auth/signup</c>.</summary>
     public Task<AccountApiResult> SignupAsync(SignupRequest body, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Post, "/api/v1/auth/signup", body, clientIp, ct);
+        SendAsync(HttpMethod.Post, "/ui/v1/auth/signup", body, clientIp, ct);
 
-    /// <summary><c>GET /api/v1/auth/username-suggestions?email=</c>.</summary>
+    /// <summary><c>GET /ui/v1/auth/username-suggestions?email=</c>.</summary>
     public Task<AccountApiResult> UsernameSuggestionsAsync(string email, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Get, "/api/v1/auth/username-suggestions?email=" + Uri.EscapeDataString(email), null, clientIp, ct);
+        SendAsync(HttpMethod.Get, "/ui/v1/auth/username-suggestions?email=" + Uri.EscapeDataString(email), null, clientIp, ct);
 
-    /// <summary><c>POST /api/v1/auth/password-reset</c>.</summary>
+    /// <summary><c>POST /ui/v1/auth/password-reset</c>.</summary>
     public Task<AccountApiResult> PasswordResetAsync(PasswordResetRequest body, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Post, "/api/v1/auth/password-reset", body, clientIp, ct);
+        SendAsync(HttpMethod.Post, "/ui/v1/auth/password-reset", body, clientIp, ct);
 
-    /// <summary><c>POST /api/v1/auth/password-reset/{token}</c>.</summary>
+    /// <summary><c>POST /ui/v1/auth/password-reset/{token}</c>.</summary>
     public Task<AccountApiResult> PasswordResetCompleteAsync(
         string token, PasswordResetCompleteRequest body, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Post, "/api/v1/auth/password-reset/" + Uri.EscapeDataString(token), body, clientIp, ct);
+        SendAsync(HttpMethod.Post, "/ui/v1/auth/password-reset/" + Uri.EscapeDataString(token), body, clientIp, ct);
 
-    /// <summary><c>POST /api/v1/auth/confirm-email/{token}</c> (no body).</summary>
+    /// <summary><c>POST /ui/v1/auth/confirm-email/{token}</c> (no body).</summary>
     public Task<AccountApiResult> ConfirmEmailAsync(string token, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Post, "/api/v1/auth/confirm-email/" + Uri.EscapeDataString(token), null, clientIp, ct);
+        SendAsync(HttpMethod.Post, "/ui/v1/auth/confirm-email/" + Uri.EscapeDataString(token), null, clientIp, ct);
 
-    /// <summary><c>GET /api/v1/auth/invitations/{token}</c>.</summary>
+    /// <summary><c>GET /ui/v1/auth/invitations/{token}</c>.</summary>
     public Task<AccountApiResult> InvitationPreviewAsync(string token, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Get, "/api/v1/auth/invitations/" + Uri.EscapeDataString(token), null, clientIp, ct);
+        SendAsync(HttpMethod.Get, "/ui/v1/auth/invitations/" + Uri.EscapeDataString(token), null, clientIp, ct);
 
-    /// <summary><c>POST /api/v1/auth/invitations/{token}/signup</c>.</summary>
+    /// <summary><c>POST /ui/v1/auth/invitations/{token}/signup</c>.</summary>
     public Task<AccountApiResult> InvitationSignupAsync(
         string token, InvitationSignupRequest body, string? clientIp, CancellationToken ct) =>
-        SendAsync(HttpMethod.Post, "/api/v1/auth/invitations/" + Uri.EscapeDataString(token) + "/signup", body, clientIp, ct);
+        SendAsync(HttpMethod.Post, "/ui/v1/auth/invitations/" + Uri.EscapeDataString(token) + "/signup", body, clientIp, ct);
 
     private async Task<AccountApiResult> SendAsync(
         HttpMethod method, string path, object? body, string? clientIp, CancellationToken ct)

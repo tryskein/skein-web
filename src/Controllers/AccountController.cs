@@ -112,7 +112,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Register an account (self-service signup)",
         Description =
-            "Forwards the form to skein-api POST /api/v1/auth/signup (no identity headers). " +
+            "Forwards the form to skein-api POST /ui/v1/auth/signup (no identity headers). " +
             "On success the user is logged in exactly as after POST /api/auth/login " +
             "(skein.sid cookie) and the user is returned. Rate limit per lower-cased email " +
             "and per client IP (IP only behind a trusted proxy): exceeded → 429 rate_limited " +
@@ -173,7 +173,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Suggest usernames from an email",
         Description =
-            "Forwards to skein-api GET /api/v1/auth/username-suggestions. Rate limit per " +
+            "Forwards to skein-api GET /ui/v1/auth/username-suggestions. Rate limit per " +
             "lower-cased email and per client IP; exceeded → 429 rate_limited.",
         OperationId = "GetUsernameSuggestions")]
     public async Task<ActionResult<UsernameSuggestionsResponse>> UsernameSuggestions(
@@ -225,7 +225,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Request a password reset",
         Description =
-            "Forwards to skein-api POST /api/v1/auth/password-reset; 204 whether or not the " +
+            "Forwards to skein-api POST /ui/v1/auth/password-reset; 204 whether or not the " +
             "account exists. Rate limit per lower-cased email and per client IP.",
         OperationId = "RequestPasswordReset")]
     public async Task<ActionResult> PasswordReset(
@@ -281,7 +281,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Complete a password reset",
         Description =
-            "Forwards to skein-api POST /api/v1/auth/password-reset/{token}; 204 on success. " +
+            "Forwards to skein-api POST /ui/v1/auth/password-reset/{token}; 204 on success. " +
             "Every session of the user ends; if this request carries a session of the same " +
             "user, that session is re-issued with the new session epoch (Set-Cookie) and stays " +
             "logged in; a session of another user is left as it is. The user's other session " +
@@ -344,7 +344,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Confirm an email address",
         Description =
-            "Forwards to skein-api POST /api/v1/auth/confirm-email/{token}; 204 on success. " +
+            "Forwards to skein-api POST /ui/v1/auth/confirm-email/{token}; 204 on success. " +
             "Rate limit per client IP only.",
         OperationId = "ConfirmEmail")]
     public async Task<ActionResult> ConfirmEmail(
@@ -385,7 +385,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Preview an invitation",
         Description =
-            "Forwards to skein-api GET /api/v1/auth/invitations/{token}. For a visitor without " +
+            "Forwards to skein-api GET /ui/v1/auth/invitations/{token}. For a visitor without " +
             "a session; a logged-in tab uses GET /api/v1/invitations/{token}. Rate limit per " +
             "client IP only.",
         OperationId = "GetInvitationPreview")]
@@ -443,7 +443,7 @@ public sealed class AccountController : ControllerBase
     [SwaggerOperation(
         Summary = "Register by invitation",
         Description =
-            "Forwards to skein-api POST /api/v1/auth/invitations/{token}/signup. On success the " +
+            "Forwards to skein-api POST /ui/v1/auth/invitations/{token}/signup. On success the " +
             "user is logged in (skein.sid cookie) and the joined space is returned for the " +
             "redirect. Rate limit per client IP only.",
         OperationId = "InvitationSignup")]

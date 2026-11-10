@@ -212,7 +212,7 @@ builder.Services.AddHttpClient<SkeinApiClient>(client =>
 builder.Services.AddSkeinServiceApiClient(skeinApiUrl);
 
 // Public account routes (plan K-17, AccountController): skein-api
-// /api/v1/auth/* with the service secret and the trusted client IP only — NO
+// /ui/v1/auth/* with the service secret and the trusted client IP only — NO
 // InternalApiHandler (a logged-in tab must not put its identity on them),
 // retry on GET only (a replayed signup would turn into email_taken).
 SkeinAccountsApiClient.Register(builder.Services, skeinApiUrl);
@@ -359,7 +359,7 @@ builder.Services.AddSwaggerGen(c =>
         Version = "v1",
         Description = "Cookie-backed gateway for the Skein web client. " +
                       "Authentication endpoints under /api/auth, transparent reverse-proxy " +
-                      "for /api/v1/* with X-Skein-User-* identity forwarding.",
+                      "of the browser path /api/v1/* to skein-api /ui/v1/* with X-Skein-User-* identity forwarding.",
     });
     c.EnableAnnotations();
 

@@ -14,7 +14,8 @@ service that sits between the browser and
   trust-headers SSO behind oauth2-proxy are supported as well.
 - **Live updates.** A SignalR hub at `/hub` relays skein-api's event stream from
   NATS to the browser, with a Redis backplane for multiple replicas.
-- **Reverse proxy** to skein-api for `/api/v1/*` (REST), `/mcp` (MCP Streamable
+- **Reverse proxy** to skein-api for `/api/v1/*` (REST, forwarded to skein-api's
+  internal API `/ui/v1/*`), `/mcp` (MCP Streamable
   HTTP), `/agent/v1/*` and the `/.well-known/oauth-protected-resource*`
   metadata. Identity is forwarded as headers the BFF sets from the session;
   inbound copies of those headers are stripped.
@@ -118,7 +119,7 @@ process in the umbrella's
 | POST | `/api/auth/confirm-email/{token}` | Confirm an email address |
 | GET / POST | `/api/auth/invitations/{token}`, `/api/auth/invitations/{token}/signup` | Preview an invitation / register by invitation |
 | GET | `/oauth2/start?rd=<path>` | OIDC challenge (native OIDC only) |
-| `*` | `/api/v1/*`, `/mcp`, `/agent/v1/*` | Proxied to skein-api |
+| `*` | `/api/v1/*`, `/mcp`, `/agent/v1/*` | Proxied to skein-api (`/api/v1/*` as `/ui/v1/*`) |
 | GET | `/.well-known/oauth-protected-resource[/mcp]` | Proxied to skein-api (RFC 9728 metadata, unauthenticated) |
 | WS | `/hub` | SignalR hub (live events, authenticated) |
 

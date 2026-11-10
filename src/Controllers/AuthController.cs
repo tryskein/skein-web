@@ -144,7 +144,7 @@ public sealed class AuthController : ControllerBase
     /// Algorithm:
     /// 1. Lower-case the email and check the per-email lockout bucket in Redis;
     ///    if locked, return 429 without contacting skein-api.
-    /// 2. Forward {email, password} to skein-api POST /api/v1/auth/login.
+    /// 2. Forward {email, password} to skein-api POST /ui/v1/auth/login.
     ///    The internal-secret header is added by InternalApiHandler.
     /// 3. On 422 from skein-api: increment the failure counter (rolls a 60s
     ///    window; 10 failures = 60s lockout) and return 422 ourselves.
@@ -528,7 +528,7 @@ public sealed class AuthController : ControllerBase
     /// </summary>
     /// <remarks>
     /// <para>Algorithm: the cookie principal must be authenticated
-    /// ([Authorize]); then <c>GET /api/v1/auth/me</c> is called on behalf of the
+    /// ([Authorize]); then <c>GET /ui/v1/auth/me</c> is called on behalf of the
     /// session — its identity headers and <c>X-Skein-Session-Epoch</c> — and
     /// skein-api's user is returned.</para>
     /// <para>sk-674.18 (INV-26, K-16): this is where a revoked session is
@@ -552,7 +552,7 @@ public sealed class AuthController : ControllerBase
     [SwaggerOperation(
         Summary = "Current user of the session",
         Description =
-            "Asks skein-api GET /api/v1/auth/me on behalf of the session (identity headers + " +
+            "Asks skein-api GET /ui/v1/auth/me on behalf of the session (identity headers + " +
             "X-Skein-Session-Epoch) and returns its user. A session skein-api revoked " +
             "(401 session_revoked) is ended here — cookie cleared — and answered 401 with " +
             "error=session_revoked; skein-api unavailable → 502 upstream_unavailable.",
