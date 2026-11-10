@@ -111,6 +111,12 @@ public class ApiProxyMiddlewarePrefixTest
     [InlineData("/api/v1/projects", "?q=api%2Fv1&limit=5", "http://skein-api.test/ui/v1/projects?q=api%2Fv1&limit=5")]
     [InlineData("/api/v1", "", "http://skein-api.test/ui/v1")]
     [InlineData("/api/v1/", "?a=1", "http://skein-api.test/ui/v1/?a=1")]
+    // The browser prefix is matched case-insensitively; upstream always gets
+    // the exact /ui/v1 and the remainder after the whole prefix.
+    [InlineData("/API/V1/issues", "", "http://skein-api.test/ui/v1/issues")]
+    // Kestrel leaves %2F encoded in Request.Path; it must reach skein-api
+    // once-encoded, not as %252F.
+    [InlineData("/api/v1/projects/a%2Fb", "", "http://skein-api.test/ui/v1/projects/a%2Fb")]
     public async Task OnlyTheLeadingPrefixIsSwapped_AndTheQueryIsKept(string path, string query, string expectedUpstream)
     {
         var (middleware, handler) = Build();
