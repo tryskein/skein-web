@@ -69,7 +69,7 @@ wait_for docker exec "$run_name-nats" wget -q -O /dev/null http://127.0.0.1:8222
 
 docker run --rm --name "$run_name-runner" --network "$run_name" \
     --user "$(id -u):$(id -g)" --cpus "$runner_cpus" --memory "$runner_memory" \
-    -e HOME=/tmp/home -e DOTNET_CLI_HOME=/tmp/dotnet -e NUGET_PACKAGES=/tmp/nuget \
+    -e HOME=/tmp -e DOTNET_CLI_HOME=/tmp -e NUGET_PACKAGES=/tmp/nuget \
     -e TEST_NATS_URL=nats://nats:4222 -e TEST_NATS_MONITOR_URL=http://nats:8222/ \
     -e TEST_REDIS_URL=redis:6379 \
     -v "$repo_root:/work:ro" -v "$result_dir:/results" -w /work "$runner_image" \
