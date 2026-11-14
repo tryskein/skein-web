@@ -26,11 +26,11 @@
          on top. DataProtection.StackExchangeRedis persists the AES keyring so
          multiple skein-web replicas share a single set of cookie-encryption keys. -->
     <PackageReference Include="StackExchange.Redis" Version="2.12.14" />
-    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.9" />
-    <PackageReference Include="Microsoft.AspNetCore.DataProtection.StackExchangeRedis" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.15" />
+    <PackageReference Include="Microsoft.AspNetCore.DataProtection.StackExchangeRedis" Version="10.0.15" />
 
     <!-- Polly retry policy for the typed SkeinApiClient HttpClient. -->
-    <PackageReference Include="Microsoft.Extensions.Http.Polly" Version="10.0.9" />
+    <PackageReference Include="Microsoft.Extensions.Http.Polly" Version="10.0.15" />
 
     <!-- OpenAPI: Swashbuckle.AspNetCore.Annotations gives [SwaggerOperation],
          [SwaggerParameter], [SwaggerTag], [SwaggerRequestBody], etc. — required
@@ -59,7 +59,7 @@
          already ships with AspNetCore; this is the StackExchange.Redis
          transport that fanouts hub messages across replicas via Redis
          pub/sub. Version line matches the .NET 10 framework. -->
-    <PackageReference Include="Microsoft.AspNetCore.SignalR.StackExchangeRedis" Version="10.0.9" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.StackExchangeRedis" Version="10.0.15" />
 
     <!-- MessagePack — direct pin to override the vulnerable 2.5.187 pulled in
          transitively by SignalR.Protocols.MessagePack (via the Redis backplane).
@@ -77,7 +77,7 @@
          mode (trust-headers, no token validation in this pod) keeps
          working unchanged when the package is in the image but the
          handler is not registered. -->
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.9" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.OpenIdConnect" Version="10.0.15" />
   </ItemGroup>
 
   <!-- The Tests project asserts internal-only state in MembershipCache
