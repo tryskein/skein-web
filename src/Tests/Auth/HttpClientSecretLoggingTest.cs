@@ -94,7 +94,7 @@ public class HttpClientSecretLoggingTest
         await using var _ = provider;
         var client = provider.GetRequiredService<IHttpClientFactory>().CreateClient(ApiProxyMiddleware.ProxyClientName);
 
-        await client.GetAsync($"/api/v1/invitations/{Token}");
+        await client.GetAsync($"/api/v1/invitations/{Token}", TestContext.Current.CancellationToken);
 
         Assert.DoesNotContain(log.Entries, e => e.Contains(Token, StringComparison.Ordinal));
     }
@@ -110,7 +110,7 @@ public class HttpClientSecretLoggingTest
         await using var _ = provider;
 
         await provider.GetRequiredService<IHttpClientFactory>().CreateClient("control")
-            .GetAsync($"http://skein-api.test/api/v1/invitations/{Token}");
+            .GetAsync($"http://skein-api.test/api/v1/invitations/{Token}", TestContext.Current.CancellationToken);
 
         Assert.Contains(log.Entries, e => e.Contains(Token, StringComparison.Ordinal));
     }

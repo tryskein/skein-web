@@ -18,14 +18,14 @@
     <!-- Prometheus metrics: HTTP, .NET runtime, system -->
     <PackageReference Include="prometheus-net.AspNetCore" Version="8.2.1" />
     <PackageReference Include="prometheus-net.SystemMetrics" Version="3.1.0" />
-    <PackageReference Include="prometheus-net.DotNetRuntime" Version="4.4.0" />
+    <PackageReference Include="prometheus-net.DotNetRuntime" Version="4.4.1" />
 
     <!-- Redis: session ticket store + DataProtection key ring + login rate limiter.
          StackExchange.Redis is the low-level client (used directly for atomic INCR
          in LoginRateLimiter). Caching.StackExchangeRedis wires IDistributedCache
          on top. DataProtection.StackExchangeRedis persists the AES keyring so
          multiple skein-web replicas share a single set of cookie-encryption keys. -->
-    <PackageReference Include="StackExchange.Redis" Version="2.12.14" />
+    <PackageReference Include="StackExchange.Redis" Version="3.4.35" />
     <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.15" />
     <PackageReference Include="Microsoft.AspNetCore.DataProtection.StackExchangeRedis" Version="10.0.15" />
 
@@ -35,23 +35,16 @@
     <!-- OpenAPI: Swashbuckle.AspNetCore.Annotations gives [SwaggerOperation],
          [SwaggerParameter], [SwaggerTag], [SwaggerRequestBody], etc. — required
          by the project conventions. -->
-    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.1.7" />
-    <PackageReference Include="Swashbuckle.AspNetCore.Annotations" Version="10.1.7" />
-    <!-- Pin Microsoft.OpenApi to a patched build: Swashbuckle 10.1.7 pulls the
-         transitive 2.4.1, which CVE-2026-49451 (GHSA-v5pm-xwqc-g5wc, NU1903 —
-         uncontrolled recursion on circular schema refs) marks vulnerable through
-         2.7.4. 2.7.5 is the first patched 2.x build. Direct ref overrides the
-         transitive version and clears the NuGet-audit error under /warnaserror. -->
-    <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="11.0.1" />
+    <PackageReference Include="Swashbuckle.AspNetCore.Annotations" Version="11.0.1" />
 
-    <!-- NATS Core client for the SignalR live-events bridge (R3.2c). Pinned
-         per G-4 of the R3.2c plan: 2.7.3 is the verified-compatible build
-         on .NET 10 at the time of this work. -->
-    <PackageReference Include="NATS.Net" Version="2.7.3" />
+    <!-- NATS Core client for the SignalR live-events bridge. Must match the
+         NATS.Net version in Tests/SkeinWeb.Tests.csproj. -->
+    <PackageReference Include="NATS.Net" Version="3.3.2" />
 
     <!-- [MetricInfo] / [MetricLabel] on custom Prometheus metrics, read by
          a metrics extractor. -->
-    <PackageReference Include="Metricy.Annotations" Version="0.4.0" />
+    <PackageReference Include="Metricy.Annotations" Version="0.4.2" />
 
     <!-- SignalR Redis backplane — required for multi-replica skein-web.
          Without it, a SignalR message published on pod A never reaches a
@@ -60,13 +53,6 @@
          transport that fanouts hub messages across replicas via Redis
          pub/sub. Version line matches the .NET 10 framework. -->
     <PackageReference Include="Microsoft.AspNetCore.SignalR.StackExchangeRedis" Version="10.0.15" />
-
-    <!-- MessagePack — direct pin to override the vulnerable 2.5.187 pulled in
-         transitively by SignalR.Protocols.MessagePack (via the Redis backplane).
-         2.5.187 is affected by CVE-2026-48109 (LZ4 decompress DoS) + related
-         advisories; NuGet audit fails the /warnaserror lint on it. 3.1.12 is the
-         latest patched release. Direct reference wins over the transitive. -->
-    <PackageReference Include="MessagePack" Version="3.1.12" />
 
     <!-- Native OIDC (KeycloakOidc: skein-api SSO mode + Authentication:Oidc:Authority set). Microsoft handler
          performs Authorization Code + PKCE against Keycloak, validates

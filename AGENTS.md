@@ -70,9 +70,12 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 - **Custom Prometheus metrics** carry `[MetricInfo]` and `[MetricLabel]`
   describing meaning, unit, where they change and every label (see
   `Hubs/HubMetrics.cs`).
-- **Package pins** in `SkeinWeb.csproj` (`MessagePack`, `Microsoft.OpenApi`)
-  override vulnerable transitive versions; NuGet audit fails the `/warnaserror`
-  build without them. Do not drop a pin without checking the advisory.
+- **NuGet audit** fails the `/warnaserror` build on a vulnerable package,
+  transitive ones included. When a transitive version is vulnerable, pin a
+  patched version directly in `SkeinWeb.csproj` with a comment naming the
+  advisory; drop the pin once the parent package brings a patched version.
+- **Microsoft.AspNetCore.\* and Microsoft.Extensions.\* packages** stay on the
+  servicing line of the target framework (10.0.x for `net10.0`).
 
 ## Testing
 

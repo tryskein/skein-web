@@ -292,14 +292,14 @@ public class SkeinServiceApiClient_CheckProjectAccessTest
 
         var call = sut.Client.CheckProjectAccessAsync(LiteralQueries, CancellationToken.None);
         // Hang guard only: the stub reports the moment the response stalls.
-        await stalled.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await stalled.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
 
         sut.Clock.Advance(TimeSpan.FromSeconds(15) - TimeSpan.FromTicks(1));
         Assert.False(call.IsCompleted);
 
         sut.Clock.Advance(TimeSpan.FromTicks(1));
         // Hang guard only: without the budget the call would never complete.
-        Assert.Same(call, await Task.WhenAny(call, Task.Delay(TimeSpan.FromSeconds(30))));
+        Assert.Same(call, await Task.WhenAny(call, Task.Delay(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken)));
         var ex = await Assert.ThrowsAsync<TimeoutException>(() => call);
         Assert.DoesNotContain(Secret, ex.ToString(), StringComparison.Ordinal);
     }
@@ -314,7 +314,7 @@ public class SkeinServiceApiClient_CheckProjectAccessTest
         using var caller = new CancellationTokenSource();
 
         var call = sut.Client.CheckProjectAccessAsync(LiteralQueries, caller.Token);
-        await stalled.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        await stalled.Task.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
         caller.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);

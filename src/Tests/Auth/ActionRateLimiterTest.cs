@@ -13,7 +13,7 @@ namespace SkeinWeb.Tests.Auth;
 public class ActionRateLimiterTest
 {
     private static RedisConnectionException Outage() =>
-        new(ConnectionFailureType.UnableToConnect, "Redis is down");
+        new(ConnectionFailureType.UnableToConnect, CommandFlags.None, "Redis is down");
 
     /// <summary>Redis broken at the given step of the counting call.</summary>
     private static IConnectionMultiplexer BrokenRedis(string where)

@@ -75,7 +75,7 @@ public class HubSessionRevocationTests
             {
                 return;
             }
-            await Task.Delay(5);
+            await Task.Delay(5, TestContext.Current.CancellationToken);
         }
         Assert.Fail("not reached: " + what);
     }
@@ -189,7 +189,7 @@ public class HubSessionRevocationTests
             clock.Advance(Period);
             for (var i = 0; i < 200 && !other.Aborted.Contains(revoked); i++)
             {
-                await Task.Delay(5);
+                await Task.Delay(5, TestContext.Current.CancellationToken);
             }
         }
         Assert.Contains(revoked, other.Aborted);

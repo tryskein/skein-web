@@ -56,7 +56,7 @@ public class RedisTicketStoreTest
                 if (setReadsFailed < failSetReads)
                 {
                     setReadsFailed++;
-                    return Task.FromException<RedisValue[]>(new RedisConnectionException(ConnectionFailureType.SocketFailure, "down"));
+                    return Task.FromException<RedisValue[]>(new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None, "down"));
                 }
                 return Task.FromResult(
                     sets.TryGetValue(k.ToString(), out var set) ? set.Select(x => (RedisValue)x).ToArray() : Array.Empty<RedisValue>());
@@ -120,7 +120,7 @@ public class RedisTicketStoreTest
         public void Remove(string key) => _inner.Remove(key);
         public Task RemoveAsync(string key, CancellationToken token = default) =>
             key == Poisoned
-                ? Task.FromException(new RedisConnectionException(ConnectionFailureType.SocketFailure, "down"))
+                ? Task.FromException(new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None, "down"))
                 : _inner.RemoveAsync(key, token);
     }
 
@@ -252,7 +252,7 @@ public class RedisTicketStoreTest
         var cache = new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions()));
         var store = Store(cache: cache);
         const string key = "skein:session:legacy";
-        await cache.SetAsync(key, TicketSerializer.Default.Serialize(Ticket(PreviousOwner)), new DistributedCacheEntryOptions());
+        await cache.SetAsync(key, TicketSerializer.Default.Serialize(Ticket(PreviousOwner)), new DistributedCacheEntryOptions(), TestContext.Current.CancellationToken);
 
         var read = await store.RetrieveAsync(key);
 

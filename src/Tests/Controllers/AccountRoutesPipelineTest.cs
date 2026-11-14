@@ -88,7 +88,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
     private WebApplication _app = null!;
     private Uri _base = null!;
 
-    public async Task InitializeAsync()
+    public async ValueTask InitializeAsync()
     {
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
         builder.WebHost.UseUrls("http://127.0.0.1:0");
@@ -133,7 +133,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         _base = new Uri(address);
     }
 
-    public async Task DisposeAsync() => await _app.DisposeAsync();
+    public ValueTask DisposeAsync() => _app.DisposeAsync();
 
     private HttpClient Browser(CookieContainer? cookies = null) =>
         new(new HttpClientHandler { CookieContainer = cookies ?? new CookieContainer(), UseCookies = true })
@@ -202,7 +202,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
 
         // The same cookie is a working session: the proxy forwards its identity.
         var mark = _api.Requests.Length;
-        using var proxied = await browser.GetAsync("/api/v1/projects");
+        using var proxied = await browser.GetAsync("/api/v1/projects", TestContext.Current.CancellationToken);
         Assert.Equal(HttpStatusCode.OK, proxied.StatusCode);
         Assert.True(CarriesIdentity(Assert.Single(_api.Requests[mark..])));
     }
@@ -212,7 +212,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
     {
         using var browser = Browser();
 
-        using var response = await browser.GetAsync("/api/v1/projects");
+        using var response = await browser.GetAsync("/api/v1/projects", TestContext.Current.CancellationToken);
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
         Assert.Empty(_api.Requests);

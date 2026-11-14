@@ -179,7 +179,7 @@ public class AgentProxyMiddlewareTest
         Assert.False(nextCalled);        // never falls into the cookie-gated /api/v1 pipeline
 
         ctx.Response.Body.Position = 0;
-        var body = await new StreamReader(ctx.Response.Body).ReadToEndAsync();
+        var body = await new StreamReader(ctx.Response.Body).ReadToEndAsync(TestContext.Current.CancellationToken);
         Assert.Contains("invalid_path", body);
     }
 
@@ -439,7 +439,7 @@ public class AgentProxyMiddlewareTest
         await mw.InvokeAsync(ctx, _ => Task.CompletedTask);
 
         ctx.Response.Body.Position = 0;
-        var body = await new StreamReader(ctx.Response.Body).ReadToEndAsync();
+        var body = await new StreamReader(ctx.Response.Body).ReadToEndAsync(TestContext.Current.CancellationToken);
         Assert.Equal(payload, body);
     }
 
@@ -462,7 +462,7 @@ public class AgentProxyMiddlewareTest
         await mw.InvokeAsync(ctx, _ => Task.CompletedTask);
 
         ctx.Response.Body.Position = 0;
-        var body = await new StreamReader(ctx.Response.Body).ReadToEndAsync();
+        var body = await new StreamReader(ctx.Response.Body).ReadToEndAsync(TestContext.Current.CancellationToken);
         Assert.Equal("event-1\nevent-2\nevent-3\n", body);
     }
 }

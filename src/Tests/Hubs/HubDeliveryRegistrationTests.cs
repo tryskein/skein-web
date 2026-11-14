@@ -75,7 +75,7 @@ public class HubDeliveryRegistrationTests
             var hosted = provider.GetServices<IHostedService>().ToArray();
             return (options, hub, hosted);
         });
-        var (options, hub, hosted) = await resolve.WaitAsync(DeadlockBound);
+        var (options, hub, hosted) = await resolve.WaitAsync(DeadlockBound, TestContext.Current.CancellationToken);
 
         Assert.NotNull(options.ConnectionFactory);
         Assert.NotNull(hub.Clients);

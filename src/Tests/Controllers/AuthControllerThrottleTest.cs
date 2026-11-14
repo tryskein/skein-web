@@ -203,9 +203,9 @@ public class AuthControllerThrottleTest
         // the attempt proceed to the API (here a 200), minting a session.
         var db = new Mock<IDatabase>();
         db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.UnableToConnect, "down"));
+            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.UnableToConnect, CommandFlags.None, "down"));
         db.Setup(d => d.StringIncrementAsync(It.IsAny<RedisKey>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.UnableToConnect, "down"));
+            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.UnableToConnect, CommandFlags.None, "down"));
         var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
 

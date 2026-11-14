@@ -81,7 +81,7 @@ public class AccessRecheckServiceTests
         var calls = world.AccessApi.Calls;
         clock.Advance(Period);
         await Eventually(() => world.AccessApi.Calls == calls + 4, "first failing check");
-        await Task.Delay(50);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
         Assert.Contains($"project:{P}", world.GroupsOf(conn));
 
         // t = 60 s: unconfirmed for 60 s → fail-closed.
@@ -183,7 +183,7 @@ public class AccessRecheckServiceTests
         await replica.DeclareAsync(connB, P);                               // B confirmed at t = 10
         world.AccessApi.HoldCalls = true;                                    // no re-check confirms anyone
         var gateA = replica.Registry.Get(connA)!.Gate;
-        await gateA.WaitAsync();
+        await gateA.WaitAsync(TestContext.Current.CancellationToken);
         try
         {
             clock.Advance(TimeSpan.FromSeconds(50));                        // t = 60: A expired, its gate held
@@ -216,11 +216,11 @@ public class AccessRecheckServiceTests
             id = 5, occurredAt = "2026-10-09T10:00:00Z", eventType = "issue.created",
             entityType = "issue", entityId = "sk-5", projectId = P,
         });
-        await Task.Delay(50);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
         Assert.False(dispatch.IsCompleted, "a project event must wait for the post-reconnect re-check");
 
         FakeNats.RaiseOpened(replica.Nats);
-        await dispatch.WaitAsync(TimeSpan.FromSeconds(10));
+        await dispatch.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
 
         Assert.DoesNotContain($"project:{P}", world.GroupsOf(conn));
         Assert.Empty(world.DeliveriesTo(conn, BrowserClientMethods.Event));

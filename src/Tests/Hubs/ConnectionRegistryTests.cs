@@ -44,12 +44,12 @@ public class ConnectionRegistryTests
             {
                 start.SignalAndWait();
                 replica.Registry.Remove(old);
-            });
+            }, TestContext.Current.CancellationToken);
             var connect = Task.Run(() =>
             {
                 start.SignalAndWait();
                 replica.Registry.Add(new ConnectionState(fresh, user, isExternal: false, isInternalAdmin: false));
-            });
+            }, TestContext.Current.CancellationToken);
             await Task.WhenAll(disconnect, connect);
             world.RemoveConnection(old);
 

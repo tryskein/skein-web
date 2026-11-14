@@ -73,7 +73,7 @@ public class OidcProvisioningRejectionTest
         Assert.Null(validated.Principal?.FindFirst(SessionPrincipal.SessionEpochClaim));
         Assert.False(context.Response.Headers.ContainsKey("Set-Cookie"));
         context.Response.Body.Position = 0;
-        using var body = await JsonDocument.ParseAsync(context.Response.Body);
+        using var body = await JsonDocument.ParseAsync(context.Response.Body, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal(expectedCode, body.RootElement.GetProperty("error").GetString());
     }
 }

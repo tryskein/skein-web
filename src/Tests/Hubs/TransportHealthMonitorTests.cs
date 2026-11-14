@@ -87,7 +87,7 @@ public class TransportHealthMonitorTests
         FakeNats.RaiseOpened(r1.Nats);
 
         await Eventually(() => Resyncs(world, a) == 1 && Resyncs(world, c) == 1, "resync on replica 1");
-        await Task.Delay(50);
+        await Task.Delay(50, TestContext.Current.CancellationToken);
         Assert.Equal(1, Resyncs(world, a));
         Assert.Equal(0, Resyncs(world, b));
     }

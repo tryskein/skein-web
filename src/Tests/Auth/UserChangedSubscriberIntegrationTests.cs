@@ -167,7 +167,10 @@ public sealed class UserChangedSubscriberIntegrationTests
 
     private sealed class InfrastructureTheoryAttribute : TheoryAttribute
     {
-        public InfrastructureTheoryAttribute()
+        public InfrastructureTheoryAttribute(
+            [System.Runtime.CompilerServices.CallerFilePath] string? sourceFilePath = null,
+            [System.Runtime.CompilerServices.CallerLineNumber] int sourceLineNumber = -1)
+            : base(sourceFilePath, sourceLineNumber)
         {
             if (new[] { "TEST_NATS_URL", "TEST_REDIS_URL", "TEST_NATS_MONITOR_URL" }
                 .Any(name => string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(name))))
