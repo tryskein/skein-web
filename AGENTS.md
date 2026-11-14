@@ -74,8 +74,19 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
   transitive ones included. When a transitive version is vulnerable, pin a
   patched version directly in `SkeinWeb.csproj` with a comment naming the
   advisory; drop the pin once the parent package brings a patched version.
-- **Microsoft.AspNetCore.\* and Microsoft.Extensions.\* packages** stay on the
-  servicing line of the target framework (10.0.x for `net10.0`).
+- **Packages released with ASP.NET Core** stay on the servicing line of the
+  target framework (10.0.x for `net10.0`) when their next major either has no
+  `net10.0` build or pulls a newer major of an assembly that ships in the
+  `Microsoft.AspNetCore.App` shared framework. Check the dependency groups in
+  the package's nuspec. In 11.0.0, `Microsoft.AspNetCore.Authentication.OpenIdConnect`
+  and `Microsoft.AspNetCore.SignalR.StackExchangeRedis` target only `net11.0`.
+  `Microsoft.AspNetCore.DataProtection.StackExchangeRedis`,
+  `Microsoft.Extensions.Caching.StackExchangeRedis` and
+  `Microsoft.Extensions.Http.Polly` bring in `Microsoft.AspNetCore.DataProtection`,
+  `Microsoft.Extensions.*.Abstractions`, `Microsoft.Extensions.Options` or
+  `Microsoft.Extensions.Http` 11.0.0. A package with a `net10.0` build and no
+  such dependency may take its latest major, for example
+  `Microsoft.Extensions.TimeProvider.Testing` 11.0.0.
 
 ## Testing
 
