@@ -10,7 +10,7 @@ namespace SkeinWeb.Auth;
 /// <remarks>
 /// <para>
 /// The authentication MODE is not configured here (D-7, plan K-12): skein-web
-/// takes it from skein-api's <c>GET /api/v1/internal/instance-config</c> at
+/// takes it from skein-api's <c>GET /ui/v1/internal/instance-config</c> at
 /// startup (<see cref="InstanceConfigBootstrap"/>) and maps it onto a web
 /// scheme with <see cref="WebAuthMode.FromApi"/>. What stays in this section
 /// is what only the BFF can know — the settings of its own OIDC client and the
@@ -318,7 +318,7 @@ public sealed record WebAuthMode(WebAuthKind Kind, bool Hybrid)
             ApiHybrid => new WebAuthMode(sso, Hybrid: true),
             _ => throw new InvalidOperationException(
                 $"skein-api reported authMode '{apiAuthMode}', expected one of " +
-                $"'{ApiLocal}', '{ApiKeycloak}', '{ApiHybrid}' (GET /api/v1/internal/instance-config). " +
+                $"'{ApiLocal}', '{ApiKeycloak}', '{ApiHybrid}' (GET /ui/v1/internal/instance-config). " +
                 "skein-web does not guess a mode."),
         };
     }

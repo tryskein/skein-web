@@ -78,7 +78,7 @@ public class SkeinServiceApiClient_CheckProjectAccessTest
 
         var req = Assert.Single(stub.Requests);
         Assert.Equal(HttpMethod.Post, req.Method);
-        Assert.Equal("/api/v1/hub/project-access", req.Path);
+        Assert.Equal("/ui/v1/hub/project-access", req.Path);
         Assert.True(JsonNode.DeepEquals(JsonNode.Parse(RequestLiteral), JsonNode.Parse(req.Body)),
             $"request body differs from the T028 literal: {req.Body}");
     }

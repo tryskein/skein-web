@@ -7,10 +7,11 @@ using SkeinWeb.Auth;
 namespace SkeinWeb.Middleware;
 
 /// <summary>
-/// Reverse-proxy middleware for everything under <c>/api/v1/*</c>: streams
-/// the browser's request to skein-api (adding internal-secret + identity
-/// forward headers) and streams the response back. Other paths are passed
-/// through to the next middleware (controllers, static files, SPA fallback).
+/// Reverse-proxy middleware for everything under the browser path
+/// <c>/api/v1/*</c>: streams the browser's request to skein-api's internal API
+/// <c>/ui/v1/*</c> (adding internal-secret + identity forward headers) and
+/// streams the response back. Other paths are passed through to the next
+/// middleware (controllers, static files, SPA fallback).
 /// </summary>
 /// <remarks>
 /// Why hand-rolled instead of YARP? YARP would do everything we need and
@@ -25,11 +26,20 @@ namespace SkeinWeb.Middleware;
 /// an authenticated cookie. The old POST /api/v1/auth/login passthrough was
 /// removed so external login can only go through the BFF's rate-limited
 /// POST /api/auth/login route, never directly to skein-api's login endpoint.
+///
+/// Prefix swap: the browser keeps <c>/api/v1</c> (open tabs and the SPA are
+/// unchanged), while on skein-api <c>/api/v1</c> is the public, key-authenticated
+/// API and the frontend's internal API lives under <c>/ui/v1</c>. Only the
+/// leading <c>/api/v1</c> segments are replaced; the rest of the path and the
+/// query string are forwarded verbatim.
 /// </remarks>
 public sealed class ApiProxyMiddleware : IMiddleware
 {
-    /// <summary>Path segment under which everything proxies to skein-api.</summary>
+    /// <summary>Browser path prefix under which everything proxies to skein-api.</summary>
     private const string ProxyPrefix = "/api/v1";
+
+    /// <summary>skein-api's internal API prefix that replaces <see cref="ProxyPrefix"/> upstream.</summary>
+    private const string UpstreamPrefix = "/ui/v1";
 
     /// <summary>Name of the <see cref="IHttpClientFactory"/> client this middleware proxies through.</summary>
     public const string ProxyClientName = "skein-api";
@@ -40,7 +50,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
     /// Polly (a streamed body cannot be replayed), and NO request logging of
     /// <see cref="IHttpClientFactory"/>: its default handlers write the full
     /// request URI at Information, and proxied paths carry secrets such as
-    /// <c>/api/v1/invitations/{token}</c> (CLAUDE_DEV "What NOT to log").
+    /// <c>/ui/v1/invitations/{token}</c> (CLAUDE_DEV "What NOT to log").
     /// </summary>
     /// <param name="services">Service collection.</param>
     /// <param name="skeinApiUrl"><c>SKEIN_API_URL</c>.</param>
@@ -88,8 +98,8 @@ public sealed class ApiProxyMiddleware : IMiddleware
 
     public async Task InvokeAsync(HttpContext context, RequestDelegate next)
     {
-        var path = context.Request.Path;
-        if (!path.StartsWithSegments(ProxyPrefix, StringComparison.OrdinalIgnoreCase))
+        if (!context.Request.Path.StartsWithSegments(
+                ProxyPrefix, StringComparison.OrdinalIgnoreCase, out var remainder))
         {
             await next(context);
             return;
@@ -104,7 +114,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
         // sk-163 S9 — NO unauthenticated allowlist. EVERY /api/v1/* request
         // (including /api/v1/auth/login) requires an authenticated cookie. The
         // former direct-login passthrough was removed: it let the browser reach
-        // skein-api's POST /api/v1/auth/login WITHOUT a cookie, bypassing the
+        // skein-api's login endpoint WITHOUT a cookie, bypassing the
         // BFF's LoginRateLimiter entirely. External password login now goes ONLY
         // through the BFF route POST /api/auth/login (AuthController), which is
         // throttled per-email AND per-IP. A browser hitting /api/v1/auth/login
@@ -119,7 +129,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
             return;
         }
 
-        await ProxyToApiAsync(context);
+        await ProxyToApiAsync(context, remainder);
     }
 
     /// <summary>
@@ -151,15 +161,22 @@ public sealed class ApiProxyMiddleware : IMiddleware
         }
     }
 
-    private async Task ProxyToApiAsync(HttpContext context)
+    /// <summary>Streams the request to skein-api's internal API and the response back.</summary>
+    /// <param name="context">The browser's request.</param>
+    /// <param name="remainder">The path after the leading <see cref="ProxyPrefix"/>
+    /// segments (empty or starting with <c>/</c>), forwarded under <see cref="UpstreamPrefix"/>.</param>
+    private async Task ProxyToApiAsync(HttpContext context, PathString remainder)
     {
         var ct = context.RequestAborted;
         var client = _httpFactory.CreateClient(ProxyClientName);
 
-        // Build the absolute upstream URL: <api-base>/<path><query>
+        // Build the absolute upstream URL: <api-base>/ui/v1<remainder><query>.
+        // Only the leading /api/v1 is swapped — a later "/api/v1" inside the
+        // remainder is part of the resource path and stays as it is.
         // QueryString already includes the leading '?' when present.
         var upstreamUrl = _options.Url.TrimEnd('/')
-                         + context.Request.Path.ToString()
+                         + UpstreamPrefix
+                         + remainder.ToString()
                          + context.Request.QueryString.ToString();
 
         using var upstream = new HttpRequestMessage(
@@ -277,7 +294,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
     /// <summary>
     /// Whether to forward a body to upstream. POST/PUT/PATCH always
     /// semantically carry one. DELETE usually does not — but skein-api's
-    /// Web Push contract (<c>DELETE /api/v1/push/subscriptions</c>) takes a
+    /// Web Push contract (<c>DELETE /ui/v1/push/subscriptions</c>) takes a
     /// JSON body <c>{ "endpoint": "..." }</c>, so a verb-only gate would
     /// silently strip it and the upstream would answer 400 invalid_json.
     /// We therefore forward a body for any request that actually carries

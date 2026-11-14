@@ -46,7 +46,7 @@ public sealed record LoginRequest(
     [Required, StringLength(200, MinimumLength = 1)] string Password);
 
 /// <summary>
-/// Outcome of a <c>POST /api/v1/auth/login</c> call as translated by
+/// Outcome of a <c>POST /ui/v1/auth/login</c> call as translated by
 /// <see cref="SkeinApiClient.LoginAsync"/> (sk-163 S4b). Distinguishes the
 /// status codes the controller must branch on per auth-mode, so the
 /// controller never has to inspect raw <see cref="System.Net.HttpStatusCode"/>.
@@ -102,7 +102,7 @@ public sealed record LoginResult(LoginOutcome Outcome, UserDto? User, long? Sess
 
 /// <summary>
 /// A user skein-api has just authenticated — OIDC provisioning
-/// (<c>POST /api/v1/auth/oidc/provision</c>) — together with the
+/// (<c>POST /ui/v1/auth/oidc/provision</c>) — together with the
 /// <c>sessionEpoch</c> of the authentication response (sk-674.18 K-16).
 /// </summary>
 /// <param name="User">The user.</param>
@@ -143,7 +143,7 @@ public sealed record LogoutResponse(string? RedirectTo);
 /// <para>
 /// sk-674.18 (US-18, D-7, K-14): the six behaviour fields above are NOT
 /// kept by skein-web. Every <c>GET /api/auth/config</c> reads them from
-/// skein-api (<c>GET /api/v1/internal/instance-config</c>,
+/// skein-api (<c>GET /ui/v1/internal/instance-config</c>,
 /// <c>internal/accounts/contract.go#InstanceConfig</c>), so a restart of
 /// skein-api alone with a new value changes this response without a
 /// restart of skein-web; skein-api unavailable → 503 instead of a stale or

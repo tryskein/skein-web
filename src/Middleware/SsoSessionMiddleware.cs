@@ -35,7 +35,7 @@ namespace SkeinWeb.Middleware;
 ///         <c>X-Auth-Request-User</c> are present — the request never
 ///         traversed oauth2-proxy. Subsequent middleware will enforce
 ///         auth (e.g. ApiProxyMiddleware returns 401).</item>
-///   <item>Otherwise: call <c>POST /api/v1/auth/oidc/provision</c> on
+///   <item>Otherwise: call <c>POST /ui/v1/auth/oidc/provision</c> on
 ///         skein-api with {email, username, name} and
 ///         <c>HttpContext.SignInAsync</c> to mint the same cookie + Redis
 ///         ticket as the local-password login flow.</item>

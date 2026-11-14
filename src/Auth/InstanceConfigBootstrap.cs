@@ -6,7 +6,7 @@ using System.Text.Json;
 namespace SkeinWeb.Auth;
 
 /// <summary>
-/// 200 body of skein-api <c>GET /api/v1/internal/instance-config</c> — the
+/// 200 body of skein-api <c>GET /ui/v1/internal/instance-config</c> — the
 /// installation settings skein-web takes from skein-api instead of keeping
 /// copies (D-7, US-18). Mirrors <c>internal/accounts/contract.go#InstanceConfig</c>
 /// (T012): every key is always present, null means "not configured". Read with
@@ -71,7 +71,7 @@ public sealed class InstanceConfigUnavailableException : Exception
 /// </summary>
 /// <remarks>
 /// <para>
-/// Algorithm: <c>GET /api/v1/internal/instance-config</c> with
+/// Algorithm: <c>GET /ui/v1/internal/instance-config</c> with
 /// <c>X-Skein-Internal-Secret</c> only (no identity). A connection failure, a
 /// per-attempt timeout or a non-2xx status other than 401/404 is treated as
 /// "not yet" — skein-api may still be starting next to us — and retried with exponential backoff
@@ -89,7 +89,7 @@ public sealed class InstanceConfigUnavailableException : Exception
 public static class InstanceConfigBootstrap
 {
     /// <summary>skein-api route of the installation settings (T012).</summary>
-    public const string Path = "/api/v1/internal/instance-config";
+    public const string Path = "/ui/v1/internal/instance-config";
 
     /// <summary>
     /// Environment variable bounding the whole load, in whole seconds.

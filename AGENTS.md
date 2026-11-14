@@ -2,7 +2,8 @@
 
 .NET 10 BFF of Skein: cookie sessions with the ticket in Redis, login and
 account flows (`/api/auth/*`), the SignalR hub (`/hub`, fed from NATS), and a
-reverse proxy to skein-api for `/api/v1/*`, `/mcp`, `/agent/v1/*` and
+reverse proxy to skein-api for `/api/v1/*` (forwarded to skein-api's internal
+API `/ui/v1/*`), `/mcp`, `/agent/v1/*` and
 `/.well-known/oauth-protected-resource*`. It does not serve the SPA
 (skein-frontend does).
 
@@ -47,7 +48,7 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 - **`docs/env-reference.md` is the only list of settings.** Adding, renaming or
   dropping a setting changes that file in the same commit. Do not keep a copy
   of the list in `README.md` or anywhere else.
-- **The auth mode comes from skein-api** (`GET /api/v1/internal/instance-config`,
+- **The auth mode comes from skein-api** (`GET /ui/v1/internal/instance-config`,
   read before the host is built). skein-web has no mode setting; it maps the
   answer in `WebAuthMode.FromApi`. Behaviour flags are read from skein-api per
   request, not cached here.

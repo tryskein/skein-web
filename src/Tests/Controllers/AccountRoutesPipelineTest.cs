@@ -65,15 +65,16 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
             var post = request.Method == HttpMethod.Post;
             return Task.FromResult(path switch
             {
-                "/api/v1/auth/signup" when post => Json(AuthResponseU1),
-                "/api/v1/auth/username-suggestions" => Json("""{"suggestions":["dev","dev2"]}"""),
-                "/api/v1/auth/password-reset" when post => new HttpResponseMessage(HttpStatusCode.NoContent),
-                _ when post && path.StartsWith("/api/v1/auth/password-reset/") => Json(AuthResponseU1),
-                _ when post && path.StartsWith("/api/v1/auth/confirm-email/") => new HttpResponseMessage(HttpStatusCode.NoContent),
-                _ when post && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
-                _ when path.StartsWith("/api/v1/auth/invitations/") => Json(
+                "/ui/v1/auth/signup" when post => Json(AuthResponseU1),
+                "/ui/v1/auth/username-suggestions" => Json("""{"suggestions":["dev","dev2"]}"""),
+                "/ui/v1/auth/password-reset" when post => new HttpResponseMessage(HttpStatusCode.NoContent),
+                _ when post && path.StartsWith("/ui/v1/auth/password-reset/") => Json(AuthResponseU1),
+                _ when post && path.StartsWith("/ui/v1/auth/confirm-email/") => new HttpResponseMessage(HttpStatusCode.NoContent),
+                _ when post && path.StartsWith("/ui/v1/auth/invitations/") && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
+                _ when path.StartsWith("/ui/v1/auth/invitations/") => Json(
                     """{"status":"invalid","space":null,"inviterUsername":null,"email":null,"hasAccount":null}"""),
-                _ => Json("""{"ok":true}"""),
+                "/ui/v1/projects" => Json("""{"ok":true}"""),
+                _ => new HttpResponseMessage(HttpStatusCode.NotFound),
             });
         }
 

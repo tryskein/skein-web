@@ -2,7 +2,7 @@ namespace SkeinWeb.Auth;
 
 /// <summary>
 /// Header names that flow between skein-web (BFF) and skein-api on every
-/// request to /api/v1/*. Centralising them here mirrors the equivalent
+/// request to skein-api's internal API /ui/v1/*. Centralising them here mirrors the equivalent
 /// constants in skein-api (internal/auth/headers.go) so the two services
 /// can never disagree on capitalisation or punctuation.
 /// </summary>

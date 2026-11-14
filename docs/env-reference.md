@@ -57,7 +57,7 @@ spellings are shown below; the environment form is the one used in deployments.
 #### `SKEIN_API_URL`
 
 - **Purpose:** base URL of skein-api. Used by the typed `SkeinApiClient`, by the
-  `/api/v1/*` reverse proxy, by the `/mcp` proxy and by the `/agent/v1` proxy.
+  `/api/v1/*` reverse proxy (upstream `/ui/v1/*`), by the `/mcp` proxy and by the `/agent/v1` proxy.
 - **Required:** **yes** · **Default:** none · **Format:** absolute URL, e.g.
   `http://skein-api:5100`.
 - **If unset:** startup throws `SKEIN_API_URL is not set`.
@@ -77,7 +77,7 @@ spellings are shown below; the environment form is the one used in deployments.
 #### `SKEIN_API_STARTUP_TIMEOUT_SECONDS`
 
 - **Purpose:** how long startup waits for skein-api to answer
-  `GET /api/v1/internal/instance-config` — the installation settings, among them
+  `GET /ui/v1/internal/instance-config` — the installation settings, among them
   the authentication mode, which must be known before the host is built (plan
   K-12). Failed attempts (connection refused, no answer within 10 s, a non-2xx
   status other than 401/404) are retried with backoff from 0.5 s doubling to 5 s
@@ -253,7 +253,7 @@ spellings are shown below; the environment form is the one used in deployments.
 ## Authentication
 
 The authentication **mode** is not a skein-web setting. skein-web reads skein-api's
-`SKEIN_AUTH_MODE` from `GET /api/v1/internal/instance-config` at startup (see
+`SKEIN_AUTH_MODE` from `GET /ui/v1/internal/instance-config` at startup (see
 `SKEIN_API_STARTUP_TIMEOUT_SECONDS`) and maps it onto a web scheme
 (`src/Auth/SsoOptions.cs#FromApi`, plan K-13):
 

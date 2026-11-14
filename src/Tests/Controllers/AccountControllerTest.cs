@@ -123,13 +123,13 @@ public class AccountControllerTest
             var post = request.Method == HttpMethod.Post;
             return Task.FromResult(path switch
             {
-                "/api/v1/auth/signup" when post => Json(AuthResponseU1),
-                "/api/v1/auth/username-suggestions" => Json("""{"suggestions":["dev","dev2","dev-client"]}"""),
-                "/api/v1/auth/password-reset" when post => new HttpResponseMessage(HttpStatusCode.NoContent),
-                _ when post && path.StartsWith("/api/v1/auth/password-reset/") => Json(ResetCompleteBody),
-                _ when post && path.StartsWith("/api/v1/auth/confirm-email/") => new HttpResponseMessage(HttpStatusCode.NoContent),
-                _ when post && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
-                _ when path.StartsWith("/api/v1/auth/invitations/") => Json(PreviewLiteral),
+                "/ui/v1/auth/signup" when post => Json(AuthResponseU1),
+                "/ui/v1/auth/username-suggestions" => Json("""{"suggestions":["dev","dev2","dev-client"]}"""),
+                "/ui/v1/auth/password-reset" when post => new HttpResponseMessage(HttpStatusCode.NoContent),
+                _ when post && path.StartsWith("/ui/v1/auth/password-reset/") => Json(ResetCompleteBody),
+                _ when post && path.StartsWith("/ui/v1/auth/confirm-email/") => new HttpResponseMessage(HttpStatusCode.NoContent),
+                _ when post && path.StartsWith("/ui/v1/auth/invitations/") && path.EndsWith("/signup") => Json(InvitationSignupLiteral),
+                _ when path.StartsWith("/ui/v1/auth/invitations/") => Json(PreviewLiteral),
                 _ => new HttpResponseMessage(HttpStatusCode.NotFound),
             });
         }
