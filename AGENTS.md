@@ -21,6 +21,8 @@ src/
 ├── Auth/                  sessions (RedisTicketStore), SkeinApiClient, instance-config bootstrap, SSO, rate limiters
 ├── Controllers/           /api/auth/* — AuthController, AccountController, AuthConfigController
 ├── Hubs/                  SkeinHub, NatsBridge, access control, delivery, HubMetrics
+├── Health/                readiness probe (/ready)
+├── Logging/               console formatter (logfmt, JSON errors, secret masking), LoggablePath
 ├── Middleware/            ApiProxy, McpProxy, AgentProxy, SsoSession, ServiceWorker
 ├── appsettings*.json      logging and OIDC client defaults only — no addresses
 └── Tests/                 SkeinWeb.Tests.csproj (xUnit + Moq)
