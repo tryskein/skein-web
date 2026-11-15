@@ -521,8 +521,8 @@ app.MapMetrics();
 // navigates to in the legacy trust-headers Keycloak mode ("/oauth2/start"
 // was the oauth2-proxy challenge URL); in native OIDC mode skein-web
 // owns this path itself so the front-end need not change. `rd` is the
-// return-to URL (full origin) — we accept only same-origin paths under
-// the request origin to block open-redirect attacks. Active only in
+// return-to target (a local path or a same-origin URL) — only a local
+// path is ever used, to block open-redirect attacks. Active only in
 // KeycloakOidc mode; the legacy Keycloak mode still expects the path
 // to be served by the oauth2-proxy reverse-proxy, so we 404 there to
 // avoid intercepting traffic that wasn't meant for us.
@@ -533,27 +533,10 @@ app.MapGet("/oauth2/start", (HttpContext http, string? rd) =>
         return Results.NotFound();
     }
 
-    // Whitelist same-origin, single-slash paths. `rd` can come from
-    // anywhere on the URL — defence-in-depth against a redirect chain
-    // that hops the user off-site after Keycloak.
-    var returnPath = "/";
-    if (!string.IsNullOrEmpty(rd))
-    {
-        if (Uri.TryCreate(rd, UriKind.Absolute, out var abs))
-        {
-            // Absolute URL accepted only if it matches the request origin
-            // (host + scheme). Anything else collapses to "/".
-            var origin = $"{http.Request.Scheme}://{http.Request.Host.Value}";
-            if (string.Equals(abs.GetLeftPart(UriPartial.Authority), origin, StringComparison.OrdinalIgnoreCase))
-            {
-                returnPath = abs.PathAndQuery.StartsWith('/') ? abs.PathAndQuery : "/";
-            }
-        }
-        else if (rd.StartsWith('/') && !rd.StartsWith("//", StringComparison.Ordinal))
-        {
-            returnPath = rd;
-        }
-    }
+    // Only a local path on this site is accepted — `rd` can come from
+    // anywhere on the URL, and an off-site target would hop the user away
+    // right after the identity provider. See OidcReturnPath.
+    var returnPath = OidcReturnPath.Resolve(rd, http.Request.Scheme, http.Request.Host.Value ?? string.Empty);
 
     return Results.Challenge(
         new AuthenticationProperties { RedirectUri = returnPath },
