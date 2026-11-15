@@ -16,7 +16,8 @@
 #   1. backend-build  — mcr.microsoft.com/dotnet/sdk:10.0-alpine,
 #                       restores and publishes SkeinWeb in Release.
 #   2. runtime        — mcr.microsoft.com/dotnet/aspnet:10.0-alpine
-#                       with diagnostic utilities, non-root user, and
+#                       with diagnostic utilities, the base image's
+#                       non-root user (numeric APP_UID), and
 #                       the published backend. No wwwroot/ — SPA lives
 #                       in the skein-frontend image.
 
@@ -51,11 +52,6 @@ RUN apk add --no-cache \
     ca-certificates \
     tzdata
 
-# Non-root user — running as root inside containers is forbidden by org policy
-# and breaks Kubernetes PodSecurity restricted profiles.
-RUN addgroup -g 1000 appgroup && \
-    adduser -u 1000 -G appgroup -D appuser
-
 WORKDIR /app
 
 COPY --from=backend-build /app/publish ./
@@ -63,7 +59,10 @@ COPY --from=backend-build /app/publish ./
 # The license text travels with every copy of the image (BSL 1.1 requires it).
 COPY LICENSE /licenses/LICENSE
 
-USER appuser
+# Non-root, by numeric id: the base image's own `app` user (APP_UID, 1654).
+# A numeric USER lets the kubelet verify runAsNonRoot without a runAsUser
+# override; a user name cannot be checked and the pod would not start.
+USER $APP_UID
 
 # Default port; can be overridden via the PORT env var without rebuilding.
 ENV PORT=8080
