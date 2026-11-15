@@ -57,18 +57,26 @@ wait_for() {
     return 1
 }
 
+# Every container: no capabilities, no privilege gain through setuid binaries,
+# and a process limit, so a runaway test cannot exhaust the host's process
+# table. NATS and Redis keep no state here and get a read-only root.
+hardening=(--cap-drop ALL --security-opt no-new-privileges)
+
 docker network create "$run_name" >/dev/null
 docker run -d --name "$run_name-nats" --network "$run_name" --network-alias nats \
     --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
+    "${hardening[@]}" --pids-limit 128 --read-only \
     nats:2.10-alpine -m 8222 >/dev/null
 docker run -d --name "$run_name-redis" --network "$run_name" --network-alias redis \
     --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
+    "${hardening[@]}" --pids-limit 128 --read-only \
     redis:7-alpine redis-server --save '' --appendonly no >/dev/null
 wait_for docker exec "$run_name-redis" redis-cli ping
 wait_for docker exec "$run_name-nats" wget -q -O /dev/null http://127.0.0.1:8222/healthz
 
 docker run --rm --name "$run_name-runner" --network "$run_name" \
     --user "$(id -u):$(id -g)" --cpus "$runner_cpus" --memory "$runner_memory" \
+    "${hardening[@]}" --pids-limit 2048 \
     -e HOME=/tmp -e DOTNET_CLI_HOME=/tmp -e NUGET_PACKAGES=/tmp/nuget \
     -e TEST_NATS_URL=nats://nats:4222 -e TEST_NATS_MONITOR_URL=http://nats:8222/ \
     -e TEST_REDIS_URL=redis:6379 \
