@@ -68,4 +68,13 @@ USER $APP_UID
 ENV PORT=8080
 EXPOSE 8080
 
+# Liveness for runtimes that read the image healthcheck (plain docker,
+# compose without its own `healthcheck:`). /healthz checks no dependency
+# (Program.cs), so an outage of Redis or NATS does not mark the
+# container unhealthy; readiness stays with /ready. The shell form reads
+# PORT at check time, the same variable the app binds to, with the same
+# 8080 fallback.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS -o /dev/null "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
+
 ENTRYPOINT ["dotnet", "SkeinWeb.dll"]
