@@ -82,6 +82,17 @@ public sealed class ApiProxyMiddleware : IMiddleware
         "Host",
     };
 
+    /// <summary>
+    /// Whether a browser request header stays at the BFF: the session cookie,
+    /// <c>Authorization</c>, every <c>X-Forwarded-*</c> header and
+    /// <c>X-Real-IP</c>. Header names are compared case-insensitively.
+    /// </summary>
+    private static bool IsBrowserOnlyHeader(string name) =>
+        name.Equals("Cookie", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ||
+        name.StartsWith("X-Forwarded-", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("X-Real-IP", StringComparison.OrdinalIgnoreCase);
+
     private readonly IHttpClientFactory _httpFactory;
     private readonly ILogger<ApiProxyMiddleware> _logger;
     private readonly SkeinApiOptions _options;
@@ -202,11 +213,19 @@ public sealed class ApiProxyMiddleware : IMiddleware
         }
 
         // Forward request headers, dropping hop-by-hop and X-Skein-* (the
-        // latter are re-added by InternalApiHandler from the cookie principal).
+        // latter are re-added by InternalApiHandler from the cookie principal),
+        // and the browser's credentials and client-address claims. skein-api
+        // identifies the caller only by the X-Skein-* headers this BFF mints,
+        // so the session cookie and any Authorization header have no consumer
+        // upstream and would only carry the BFF's session handle into the
+        // internal channel and its logs. X-Forwarded-* and X-Real-IP are
+        // client-controlled; the client address skein-api may rely on is
+        // X-Skein-Client-Ip, set by InternalApiHandler from the trusted chain.
         foreach (var (name, values) in context.Request.Headers)
         {
             if (HopByHopHeaders.Contains(name)) continue;
             if (name.StartsWith(SkeinHeaders.Prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            if (IsBrowserOnlyHeader(name)) continue;
             // Content-* headers belong to upstream.Content, not upstream.Headers.
             // We've already mapped Content-Type / Content-Length above; skip them
             // here so HttpClient doesn't refuse to add them on the wrong bag.
