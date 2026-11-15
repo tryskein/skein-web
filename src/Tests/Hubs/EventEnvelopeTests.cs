@@ -172,6 +172,8 @@ public class EventEnvelopeTests
         // serialises THAT to the browser. The regression sk-27 closed — sk-21
         // enrichment silently dropped on the way out — must stay closed
         // through the projection.
+        // The row places the issue in the event's project: without it an
+        // issue title is withheld (INV-17, BrowserEnvelopeProjector).
         var inputJson = """
         {
           "id": 1234,
@@ -184,7 +186,8 @@ public class EventEnvelopeTests
           "actorType": "agent",
           "actorUserId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
           "entityTitle": "core-api: enforce alias recreation delay",
-          "projectIdPrefix": "demo"
+          "projectIdPrefix": "demo",
+          "row": { "id": "demo-6.12", "projectId": "11111111-2222-3333-4444-555555555555", "rowSeq": 1 }
         }
         """;
         var env = JsonSerializer.Deserialize<EventEnvelope>(inputJson, JsonOpts);
