@@ -22,7 +22,8 @@ namespace SkeinWeb.Hubs;
 ///         replica's <see cref="ConnectionRegistry"/> and joins the
 ///         connection-independent groups: <see cref="OrgBroadcastGroup"/>
 ///         (internal connections) and <see cref="HubGroups.InternalAdmins"/>
-///         (internal admins; user events only). No project group yet — project
+///         (internal admins; user events only — joined when skein-api confirms
+///         the admin role the cookie claims). No project group yet — project
 ///         events reach a connection only after it declares projects, admins
 ///         included. The connection remembers the session ticket it was
 ///         opened with (<see cref="SessionPrincipal.SessionKeyClaim"/>): when
@@ -133,12 +134,13 @@ public sealed class SkeinHub : Hub, ISkeinHubDeclarations
                 await Groups.AddToGroupAsync(
                     Context.ConnectionId, OrgBroadcastGroup, Context.ConnectionAborted);
             }
-            // Audience of user events (sk-622.21 K18 "User events").
+            // Audience of user events (sk-622.21 K18 "User events"). The role
+            // in the cookie may be stale (a demotion reaches the ticket only
+            // through a best-effort event), so it only decides whether to ask:
+            // the group is joined on skein-api's answer.
             if (isInternalAdmin)
             {
-                await Groups.AddToGroupAsync(
-                    Context.ConnectionId, HubGroups.InternalAdmins, Context.ConnectionAborted);
-                state.InInternalAdminsGroup = true;
+                await JoinInternalAdminsIfConfirmedAsync(state);
             }
         }
         catch (OperationCanceledException) when (Context.ConnectionAborted.IsCancellationRequested)
@@ -148,6 +150,55 @@ public sealed class SkeinHub : Hub, ISkeinHubDeclarations
         }
 
         await base.OnConnectedAsync();
+    }
+
+    /// <summary>
+    /// Puts a connection whose cookie names an internal admin into
+    /// <see cref="HubGroups.InternalAdmins"/> once skein-api confirms the role
+    /// (<see cref="ProjectAccessResult.InternalAdmin"/>, read from the
+    /// database). A failed check leaves the connection out; the next access
+    /// re-check (<see cref="AccessRecheckService"/>) applies the role then. An
+    /// access change applied while the check was in flight wins: the answer
+    /// may predate it.
+    /// </summary>
+    private async Task JoinInternalAdminsIfConfirmedAsync(ConnectionState state)
+    {
+        var ct = Context.ConnectionAborted;
+        var generation = state.AccessGeneration;
+        ProjectAccessResult answer;
+        try
+        {
+            var results = await _access.CheckProjectAccessAsync(
+                [new ProjectAccessQuery(state.UserId, ProjectIds: [])], ct);
+            answer = results[0];
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TimeoutException
+                                   || (ex is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            _logger.LogWarning(ex,
+                "hub connect: admin role check failed, admins group left to the access re-check userId={UserId} connectionId={ConnectionId}",
+                state.UserId, state.ConnectionId);
+            return;
+        }
+
+        await state.Gate.WaitAsync(ct);
+        try
+        {
+            if (generation != state.AccessGeneration || state.InInternalAdminsGroup)
+            {
+                return;
+            }
+            state.IsInternalAdmin = answer.InternalAdmin;
+            if (answer.InternalAdmin)
+            {
+                await Groups.AddToGroupAsync(state.ConnectionId, HubGroups.InternalAdmins, ct);
+                state.InInternalAdminsGroup = true;
+            }
+        }
+        finally
+        {
+            state.Gate.Release();
+        }
     }
 
     /// <summary>

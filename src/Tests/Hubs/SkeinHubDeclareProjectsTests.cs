@@ -302,17 +302,45 @@ public class SkeinHubDeclareProjectsTests
         Assert.DoesNotContain($"project:{P1}", groups);
     }
 
+    /// <summary>
+    /// The admins group is joined only when both the cookie and skein-api name
+    /// an internal admin: a role the database no longer holds (a demotion whose
+    /// event never reached the ticket) does not put the connection there.
+    /// </summary>
     [Theory]
-    [InlineData("admin", false, true)]
-    [InlineData("admin", true, false)]
-    [InlineData("user", false, false)]
-    public async Task Connect_PutsOnlyInternalAdminsIntoAdminsInternal(string role, bool external, bool expected)
+    [InlineData("admin", false, true, true)]
+    [InlineData("admin", false, false, false)]
+    [InlineData("admin", true, true, false)]
+    [InlineData("user", false, true, false)]
+    [InlineData("user", false, false, false)]
+    public async Task Connect_PutsOnlyConfirmedInternalAdminsIntoAdminsInternal(
+        string cookieRole, bool external, bool internalAdminInDatabase, bool expected)
     {
         var (replica, world, _) = Build();
         using var _r = replica;
-        var conn = await replica.ConnectAsync(Guid.NewGuid(), role: role, isExternal: external);
+        var user = Guid.NewGuid();
+        world.AccessApi.SetUser(user, internalAdmin: internalAdminInDatabase, external: external);
+
+        var conn = await replica.ConnectAsync(user, role: cookieRole, isExternal: external);
 
         Assert.Equal(expected, world.GroupsOf(conn).Contains("admins:internal"));
+    }
+
+    [Fact]
+    public async Task Connect_AdminRoleCheckFails_NotInAdminsInternalUntilTheReCheck()
+    {
+        var (replica, world, _) = Build();
+        using var _r = replica;
+        world.AccessApi.FailWith = HttpStatusCode.InternalServerError;
+
+        var conn = await replica.ConnectAsync(Admin, role: "admin");
+
+        Assert.DoesNotContain("admins:internal", world.GroupsOf(conn));
+
+        world.AccessApi.FailWith = null;
+        await replica.Recheck.RecheckUserAsync(Admin, "recheck");
+
+        Assert.Contains("admins:internal", world.GroupsOf(conn));
     }
 
     private static async Task Eventually(Func<bool> condition, string what)
