@@ -391,7 +391,8 @@ public sealed class AuthController : ControllerBase
     }
 
     /// <summary>
-    /// Sign out: clear the session cookie and revoke the Redis ticket.
+    /// Sign out: clear the session cookie, revoke the Redis ticket and close
+    /// the session's hub connections.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -421,7 +422,8 @@ public sealed class AuthController : ControllerBase
     [SwaggerOperation(
         Summary = "Logout",
         Description =
-            "Clears the skein.sid cookie and deletes the Redis session row. " +
+            "Clears the skein.sid cookie, deletes the Redis session row and closes " +
+            "the SignalR connections opened with that session. " +
             "Response body carries a redirectTo URL the SPA should navigate to so " +
             "the upstream session is also terminated: the configured " +
             "Authentication:LogoutRedirectUrl in legacy Keycloak mode (null when it " +
@@ -443,7 +445,12 @@ public sealed class AuthController : ControllerBase
         // point of no return: cancelling here would abandon the teardown
         // half-done, which is exactly the case the .NET guidelines carve out
         // from "always forward the CancellationToken".
-        await HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+        // Signs out of the cookie scheme (cookie deleted, Redis ticket removed)
+        // and closes this replica's hub connections opened with the session, so
+        // an open tab stops receiving hub frames at logout rather than at the
+        // next access re-check. Other replicas close theirs when that re-check
+        // finds the ticket gone.
+        await SessionRevocation.EndSessionAsync(HttpContext);
         _logger.LogInformation("logout for {UserId}", userId);
 
         // The cookie above is only half the story when SSO is in play —

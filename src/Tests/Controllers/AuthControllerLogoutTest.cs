@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 using Moq;
 using SkeinWeb.Auth;
 using SkeinWeb.Controllers;
+using SkeinWeb.Hubs;
 using StackExchange.Redis;
 
 namespace SkeinWeb.Tests.Controllers;
@@ -24,7 +25,8 @@ namespace SkeinWeb.Tests.Controllers;
 /// </summary>
 public class AuthControllerLogoutTest
 {
-    private static AuthController Build(string mode, string logoutRedirectUrl)
+    private static AuthController Build(
+        string mode, string logoutRedirectUrl, ConnectionRegistry? registry = null, string? sessionKey = null)
     {
         var http = new HttpClient(new NoopHandler())
         {
@@ -60,12 +62,20 @@ public class AuthControllerLogoutTest
 
         var services = new ServiceCollection();
         services.AddSingleton(authService.Object);
+        if (registry is not null)
+        {
+            services.AddSingleton(registry);
+        }
 
+        var claims = new List<Claim> { new(ClaimTypes.NameIdentifier, "u-1") };
+        if (sessionKey is not null)
+        {
+            claims.Add(new Claim(SessionPrincipal.SessionKeyClaim, sessionKey));
+        }
         var ctx = new DefaultHttpContext
         {
             RequestServices = services.BuildServiceProvider(),
-            User = new ClaimsPrincipal(new ClaimsIdentity(
-                new[] { new Claim(ClaimTypes.NameIdentifier, "u-1") }, "test")),
+            User = new ClaimsPrincipal(new ClaimsIdentity(claims, "test")),
         };
 
         controller.ControllerContext = new ControllerContext { HttpContext = ctx };
@@ -148,5 +158,25 @@ public class AuthControllerLogoutTest
         var r = await Logout(mode, "");
         Assert.True(r.RedirectTo is null || r.RedirectTo.StartsWith('/'),
             $"mode {mode} produced an absolute redirect with no configuration: {r.RedirectTo}");
+    }
+
+    /// <summary>
+    /// Regression: logout closes this replica's hub connections opened with the
+    /// session, so an open tab receives no more hub frames after it — the
+    /// connections of another session stay open.
+    /// </summary>
+    [Fact]
+    public async Task Logout_ClosesHubConnectionsOfTheSession()
+    {
+        var registry = new ConnectionRegistry(TimeProvider.System);
+        var user = Guid.NewGuid();
+        var closed = new List<string>();
+        registry.Add(new ConnectionState("c-mine-1", user, false, false, "sess-mine", () => closed.Add("c-mine-1")));
+        registry.Add(new ConnectionState("c-mine-2", user, false, false, "sess-mine", () => closed.Add("c-mine-2")));
+        registry.Add(new ConnectionState("c-other", user, false, false, "sess-other", () => closed.Add("c-other")));
+
+        await Build("Local", "", registry, sessionKey: "sess-mine").Logout(CancellationToken.None);
+
+        Assert.Equal(["c-mine-1", "c-mine-2"], closed.Order());
     }
 }

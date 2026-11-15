@@ -52,7 +52,8 @@ public static class SessionRevocation
     /// tearing a session down is past the point of no return (same reasoning
     /// as logout).
     /// </summary>
-    /// <param name="context">The request whose session skein-api revoked.</param>
+    /// <param name="context">The request whose session ends: revoked by
+    /// skein-api, or signed out by the user (<c>POST /api/auth/logout</c>).</param>
     public static async Task EndSessionAsync(HttpContext context)
     {
         var sessionKey = SessionPrincipal.SessionKeyOf(context.User);
