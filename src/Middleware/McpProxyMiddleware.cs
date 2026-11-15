@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 using SkeinWeb.Auth;
+using SkeinWeb.Logging;
 
 namespace SkeinWeb.Middleware;
 
@@ -373,6 +374,10 @@ public sealed class McpProxyMiddleware : IMiddleware
             new HttpMethod(context.Request.Method),
             upstreamUrl);
 
+        // Failure log lines carry this path, never upstreamUrl: possible link
+        // tokens masked and no query string (see LoggablePath).
+        var upstreamPath = LoggablePath.From(context.Request.Path.Value);
+
         // Body: stream straight through. JSON-RPC bodies are small but
         // pre-buffering would also defeat any future MCP variant that
         // streams a request body.
@@ -489,11 +494,11 @@ public sealed class McpProxyMiddleware : IMiddleware
             {
                 ["mcpSessionId"] = context.Request.Headers[SkeinHeaders.McpSessionId].ToString(),
                 ["method"]       = context.Request.Method,
-                ["upstreamUrl"]  = upstreamUrl,
+                ["upstreamPath"] = upstreamPath,
                 ["timeoutSeconds"] = _options.McpUpstreamHeadersTimeout.TotalSeconds,
             }))
             {
-                _logger.LogWarning(ex, "mcp proxy: upstream headers timeout at {Url}", upstreamUrl);
+                _logger.LogWarning(ex, "mcp proxy: upstream headers timeout at {Path}", upstreamPath);
             }
             LogAccess(context, credentials, StatusCodes.Status504GatewayTimeout);
             if (!context.Response.HasStarted)
@@ -510,7 +515,7 @@ public sealed class McpProxyMiddleware : IMiddleware
             {
                 ["mcpSessionId"] = context.Request.Headers[SkeinHeaders.McpSessionId].ToString(),
                 ["method"]       = context.Request.Method,
-                ["upstreamUrl"]  = upstreamUrl,
+                ["upstreamPath"] = upstreamPath,
             }))
             {
                 _logger.LogError(ex, "mcp proxy: failed to reach skein-api");
@@ -575,10 +580,10 @@ public sealed class McpProxyMiddleware : IMiddleware
                 {
                     ["mcpSessionId"] = context.Request.Headers[SkeinHeaders.McpSessionId].ToString(),
                         ["method"]       = context.Request.Method,
-                    ["upstreamUrl"]  = upstreamUrl,
+                    ["upstreamPath"] = upstreamPath,
                 }))
                 {
-                    _logger.LogWarning(ex, "mcp proxy: upstream stream cancelled at {Url}", upstreamUrl);
+                    _logger.LogWarning(ex, "mcp proxy: upstream stream cancelled at {Path}", upstreamPath);
                 }
             }
         }

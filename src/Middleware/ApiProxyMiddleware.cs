@@ -3,6 +3,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Http.Extensions;
 using Microsoft.Extensions.Options;
 using SkeinWeb.Auth;
+using SkeinWeb.Logging;
 
 namespace SkeinWeb.Middleware;
 
@@ -246,7 +247,13 @@ public sealed class ApiProxyMiddleware : IMiddleware
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "proxy: failed to reach skein-api at {Url}", upstreamUrl);
+            // Never upstreamUrl: the path may carry a link token and the query
+            // anything, so only the masked path is logged (see LoggablePath).
+            _logger.LogError(
+                ex,
+                "proxy: failed to reach skein-api for {Method} {Path}",
+                context.Request.Method,
+                LoggablePath.From(UpstreamPrefix + remainder.Value));
             context.Response.StatusCode = StatusCodes.Status502BadGateway;
             context.Response.ContentType = "application/json";
             await context.Response.WriteAsync(

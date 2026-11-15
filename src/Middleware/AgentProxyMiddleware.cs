@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 using SkeinWeb.Auth;
+using SkeinWeb.Logging;
 
 namespace SkeinWeb.Middleware;
 
@@ -222,6 +223,10 @@ public sealed class AgentProxyMiddleware : IMiddleware
             new HttpMethod(context.Request.Method),
             upstreamUrl);
 
+        // Failure log lines carry this path, never upstreamUrl: possible link
+        // tokens masked and no query string (see LoggablePath).
+        var upstreamPath = LoggablePath.From(context.Request.Path.Value);
+
         if (HasRequestBody(context.Request.Method))
         {
             upstream.Content = new StreamContent(context.Request.Body);
@@ -282,10 +287,10 @@ public sealed class AgentProxyMiddleware : IMiddleware
             using (_logger.BeginScope(new Dictionary<string, object?>
             {
                 ["method"]      = context.Request.Method,
-                ["upstreamUrl"] = upstreamUrl,
+                ["upstreamPath"] = upstreamPath,
             }))
             {
-                _logger.LogWarning(ex, "agent proxy: upstream headers timeout at {Url}", upstreamUrl);
+                _logger.LogWarning(ex, "agent proxy: upstream headers timeout at {Path}", upstreamPath);
             }
             if (!context.Response.HasStarted)
             {
@@ -302,7 +307,7 @@ public sealed class AgentProxyMiddleware : IMiddleware
             using (_logger.BeginScope(new Dictionary<string, object?>
             {
                 ["method"]      = context.Request.Method,
-                ["upstreamUrl"] = upstreamUrl,
+                ["upstreamPath"] = upstreamPath,
             }))
             {
                 _logger.LogError(ex, "agent proxy: failed to reach skein-api");
@@ -348,10 +353,10 @@ public sealed class AgentProxyMiddleware : IMiddleware
                 using (_logger.BeginScope(new Dictionary<string, object?>
                 {
                     ["method"]      = context.Request.Method,
-                    ["upstreamUrl"] = upstreamUrl,
+                    ["upstreamPath"] = upstreamPath,
                 }))
                 {
-                    _logger.LogWarning(ex, "agent proxy: upstream stream cancelled at {Url}", upstreamUrl);
+                    _logger.LogWarning(ex, "agent proxy: upstream stream cancelled at {Path}", upstreamPath);
                 }
             }
         }
