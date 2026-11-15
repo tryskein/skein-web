@@ -73,8 +73,12 @@ EXPOSE 8080
 # (Program.cs), so an outage of Redis or NATS does not mark the
 # container unhealthy; readiness stays with /ready. The shell form reads
 # PORT at check time, the same variable the app binds to, with the same
-# 8080 fallback.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+# 8080 fallback. The port opens only after skein-api answers the
+# instance-config request, which waits up to SKEIN_API_STARTUP_TIMEOUT_SECONDS
+# (60 s by default); start-period covers that default. A deployment that
+# raises the timeout must raise start-period with it, or the container is
+# reported unhealthy while it is still legitimately waiting.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS -o /dev/null "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
 
 ENTRYPOINT ["dotnet", "SkeinWeb.dll"]
