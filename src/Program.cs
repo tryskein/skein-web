@@ -11,6 +11,7 @@ using Prometheus;
 using Prometheus.DotNetRuntime;
 using Prometheus.SystemMetrics;
 using SkeinWeb.Auth;
+using SkeinWeb.Health;
 using SkeinWeb.Hubs;
 using SkeinWeb.Logging;
 using SkeinWeb.Middleware;
@@ -501,20 +502,7 @@ app.UseAuthorization();
 // is on skein-api, not directly on us.
 app.MapGet("/healthz", () => Results.Json(new { status = "ok" }))
    .AllowAnonymous();
-app.MapGet("/ready", async (IConnectionMultiplexer redis) =>
-{
-    try
-    {
-        await redis.GetDatabase().PingAsync();
-        return Results.Json(new { status = "ready" });
-    }
-    catch (Exception ex)
-    {
-        return Results.Json(
-            new { status = "not ready", error = ex.Message },
-            statusCode: StatusCodes.Status503ServiceUnavailable);
-    }
-}).AllowAnonymous();
+app.MapGet("/ready", ReadinessEndpoint.CheckAsync).AllowAnonymous();
 app.MapMetrics();
 
 // sk-9 — Native OIDC challenge endpoint. Same path the SPA already
