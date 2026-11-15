@@ -12,6 +12,7 @@ using Prometheus.DotNetRuntime;
 using Prometheus.SystemMetrics;
 using SkeinWeb.Auth;
 using SkeinWeb.Hubs;
+using SkeinWeb.Logging;
 using SkeinWeb.Middleware;
 using StackExchange.Redis;
 
@@ -26,6 +27,11 @@ DotNetRuntimeStatsBuilder
     .StartCollecting();
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Console output: logfmt below Error, JSON for Error and Critical, secret-named
+// fields masked and request paths passed through LoggablePath — see
+// SkeinConsoleFormatter.
+SkeinConsoleFormatter.AddTo(builder.Logging);
 
 // ---- Required env (no fallbacks) ------------------
 // Configuration sources are layered: env vars > appsettings.{Env}.json >
@@ -110,9 +116,10 @@ builder.Services.AddSingleton<ISessionTicketProbe>(sp => sp.GetRequiredService<R
 var apiStartupTimeout = InstanceConfigBootstrap.ParseStartupTimeout(
     builder.Configuration["SKEIN_API_STARTUP_TIMEOUT_SECONDS"]);
 InstanceConfig instanceConfig;
-// Bootstrap logger: the host's logging is not built yet. Console defaults
-// (Information and up) carry the per-attempt warnings and the Critical exit line.
-using (var bootstrapLogging = LoggerFactory.Create(logging => logging.AddConsole()))
+// Bootstrap logger: the host's logging is not built yet. The same console
+// format at the default level (Information and up) carries the per-attempt
+// warnings and the Critical exit line.
+using (var bootstrapLogging = LoggerFactory.Create(logging => SkeinConsoleFormatter.AddTo(logging)))
 using (var bootstrapHttp = InstanceConfigBootstrap.CreateHttpClient(skeinApiUrl, internalSecret))
 {
     var bootstrapLogger = bootstrapLogging.CreateLogger("InstanceConfigBootstrap");
