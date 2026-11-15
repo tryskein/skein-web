@@ -111,6 +111,36 @@ public class NatsBridgeProjectDeliveryTests
         Assert.Single(world.DeliveriesTo(onR2, BrowserClientMethods.Event));
     }
 
+    /// <summary>
+    /// The group comes from the subject, the content from the envelope: an
+    /// event whose envelope names another project, or none, is not sent to the
+    /// readers of the subject's project.
+    /// </summary>
+    [Fact]
+    public async Task ProjectEvent_WhoseEnvelopeNamesAnotherProject_IsNotDelivered()
+    {
+        var (world, r1, r2) = TwoReplicas();
+        using var _1 = r1;
+        using var _2 = r2;
+        var readerOfP = await r1.ConnectAsync(Alice);
+        var readerOfQ = await r1.ConnectAsync(Bob);
+        await r1.DeclareAsync(readerOfP, P);
+        await r1.DeclareAsync(readerOfQ, Q);
+
+        await r1.DispatchAsync($"skein.events.project.{P}.issue.updated.sk-1", IssueEvent(4, Q));
+        await r1.DispatchAsync($"skein.events.project.{P}.issue.updated.sk-1", new
+        {
+            id = 5L,
+            occurredAt = "2026-10-09T10:00:00Z",
+            eventType = "issue.updated",
+            entityType = "issue",
+            entityId = "sk-1",
+        });
+
+        Assert.Empty(world.DeliveriesTo(readerOfP));
+        Assert.Empty(world.DeliveriesTo(readerOfQ));
+    }
+
     [Fact]
     public async Task UserEvent_ToTheUserAndInternalAdmins_NotToAnExternalAdmin()
     {

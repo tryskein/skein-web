@@ -34,6 +34,9 @@ namespace SkeinWeb.Hubs;
 ///         the old parents whose project is confirmed equal to the event's
 ///         project (R19; today none, see <see cref="BrowserReparent"/>); the phase-2
 ///         <see cref="EventEnvelope.Row"/> is forwarded unchanged.</item>
+///   <item>An issue's <see cref="BrowserEnvelope.EntityTitle"/> on a project
+///         event is carried only when the row confirms the issue is in the
+///         event's project.</item>
 /// </list>
 /// </remarks>
 public static class BrowserEnvelopeProjector
@@ -42,6 +45,7 @@ public static class BrowserEnvelopeProjector
     private const string UpdatedSuffix = ".updated";
     private const string ReminderPrefix = "reminder.";
     private const string DepEntity = "dep";
+    private const string IssueEntity = "issue";
     private const string DepIdSeparator = "::";
 
     /// <summary>
@@ -75,7 +79,7 @@ public static class BrowserEnvelopeProjector
             Actor: envelope.Actor,
             ActorType: envelope.ActorType,
             ActorUserId: envelope.ActorUserId,
-            EntityTitle: envelope.EntityTitle,
+            EntityTitle: EntityTitleOf(envelope),
             ProjectIdPrefix: envelope.ProjectIdPrefix,
             IssueId: IssueIdOf(envelope),
             ChangedFields: ChangedFieldsOf(envelope),
@@ -83,6 +87,26 @@ public static class BrowserEnvelopeProjector
             Reparent: ReparentOf(envelope),
             CommitHashes: CommitHashesOf(envelope),
             Row: envelope.Row);
+    }
+
+    /// <summary>
+    /// The entity title, except that the title of an issue on a project event
+    /// is carried only when the event's <see cref="EventEnvelope.Row"/> confirms
+    /// that the issue belongs to the event's project (INV-17): skein-api puts
+    /// the row only onto an event of the issue's own project, while the title
+    /// comes from a lookup by issue id alone. Without that confirmation the
+    /// title is null — the tab still gets the event and its ids.
+    /// </summary>
+    private static string? EntityTitleOf(EventEnvelope envelope)
+    {
+        if (!string.Equals(envelope.EntityType, IssueEntity, StringComparison.Ordinal)
+            || envelope.ProjectId is not { } eventProject)
+        {
+            return envelope.EntityTitle;
+        }
+        return Guid.TryParse(StringProp(envelope.Row, "projectId"), out var rowProject) && rowProject == eventProject
+            ? envelope.EntityTitle
+            : null;
     }
 
     private static string? IssueIdOf(EventEnvelope envelope)

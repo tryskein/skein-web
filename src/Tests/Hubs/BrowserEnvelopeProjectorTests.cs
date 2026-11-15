@@ -184,4 +184,43 @@ public class BrowserEnvelopeProjectorTests
 
         Assert.Null(BrowserEnvelopeProjector.Project(env));
     }
+
+    /// <summary>
+    /// INV-17: an issue's title reaches the readers of a project event only when
+    /// the event's row puts the issue in that project; the title is looked up by
+    /// issue id alone, the row only for an event of the issue's own project.
+    /// </summary>
+    [Theory]
+    [InlineData($$"""
+        ,"row":{"id":"sk-7","projectId":"{{P1}}","title":"Title","rowSeq":5}
+        """, "Title")]
+    [InlineData($$"""
+        ,"row":{"id":"sk-7","projectId":"{{P2}}","title":"Title","rowSeq":5}
+        """, null)]
+    [InlineData("", null)]
+    public void IssueTitle_OnlyWhenTheRowIsInTheEventProject(string row, string? expectedTitle)
+    {
+        var env = Nats($$$"""
+        {"id":40,"occurredAt":"2026-10-09T10:00:00Z","eventType":"issue.updated","entityType":"issue",
+         "entityId":"sk-7","projectId":"{{{P1}}}","entityTitle":"Title"{{{row}}}}
+        """);
+
+        var browser = BrowserEnvelopeProjector.Project(env);
+
+        Assert.NotNull(browser);
+        Assert.Equal(expectedTitle, browser!.EntityTitle);
+        Assert.Equal("sk-7", browser.EntityId);
+    }
+
+    [Fact]
+    public void CommentTitle_IsCarriedAsBefore()
+    {
+        var env = Nats($$$"""
+        {"id":41,"occurredAt":"2026-10-09T10:00:00Z","eventType":"comment.created","entityType":"comment",
+         "entityId":"0199a1b2-0000-7000-8000-00000000c002","projectId":"{{{P1}}}","entityTitle":"Parent title",
+         "payload":{"issueId":"sk-7"}}
+        """);
+
+        Assert.Equal("Parent title", BrowserEnvelopeProjector.Project(env)!.EntityTitle);
+    }
 }

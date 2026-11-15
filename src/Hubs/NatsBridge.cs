@@ -301,6 +301,17 @@ public sealed class NatsBridge : IHostedService
         {
             return;
         }
+        // The subject names the group; the envelope names the project its
+        // content belongs to. They are written together by skein-api and must
+        // agree — an event whose body is about another project (or none) is
+        // not sent to this project's readers.
+        if (envelope.ProjectId != parsed.ProjectId)
+        {
+            _logger.LogWarning(
+                "NatsBridge project event dropped: envelope project differs from subject eventId={EventId} subjectProjectId={SubjectProjectId} envelopeProjectId={EnvelopeProjectId}",
+                envelope.Id, parsed.ProjectId, envelope.ProjectId);
+            return;
+        }
         if (_gate is not null)
         {
             await _gate.WaitOpenAsync(ct);
