@@ -162,7 +162,7 @@ public class BrowserEnvelopeProjectorTests
         var env = Nats($$$"""
         {"id":16,"occurredAt":"2026-10-09T10:00:00Z","eventType":"issue.updated","entityType":"issue",
          "entityId":"sk-7","projectId":"{{{P1}}}","payload":{"changes":[{"field":"status"}]},
-         "row":{"id":"sk-7","status":"closed","rowSeq":9001}}
+         "row":{"id":"sk-7","projectId":"{{{P1}}}","status":"closed","rowSeq":9001}}
         """);
 
         var browser = BrowserEnvelopeProjector.Project(env);
@@ -186,30 +186,50 @@ public class BrowserEnvelopeProjectorTests
     }
 
     /// <summary>
-    /// INV-17: an issue's title reaches the readers of a project event only when
-    /// the event's row puts the issue in that project; the title is looked up by
-    /// issue id alone, the row only for an event of the issue's own project.
+    /// INV-17: an issue's title and row reach the readers of a project event
+    /// only when the event's row puts the issue in that project; the title is
+    /// looked up by issue id alone, the row only for an event of the issue's
+    /// own project. Otherwise neither the title nor any byte of the row is on
+    /// the wire, while the event and its ids still are.
     /// </summary>
-    [Theory]
-    [InlineData($$"""
-        ,"row":{"id":"sk-7","projectId":"{{P1}}","title":"Title","rowSeq":5}
-        """, "Title")]
-    [InlineData($$"""
-        ,"row":{"id":"sk-7","projectId":"{{P2}}","title":"Title","rowSeq":5}
-        """, null)]
-    [InlineData("", null)]
-    public void IssueTitle_OnlyWhenTheRowIsInTheEventProject(string row, string? expectedTitle)
+    [Fact]
+    public void IssueTitleAndRow_CarriedWhenTheRowIsInTheEventProject()
     {
         var env = Nats($$$"""
         {"id":40,"occurredAt":"2026-10-09T10:00:00Z","eventType":"issue.updated","entityType":"issue",
-         "entityId":"sk-7","projectId":"{{{P1}}}","entityTitle":"Title"{{{row}}}}
+         "entityId":"sk-7","projectId":"{{{P1}}}","entityTitle":"ISSUE-TITLE-TEXT",
+         "row":{"id":"sk-7","projectId":"{{{P1}}}","title":"ISSUE-TITLE-TEXT","rowSeq":5}}
+        """);
+
+        var browser = BrowserEnvelopeProjector.Project(env);
+
+        Assert.Equal("ISSUE-TITLE-TEXT", browser!.EntityTitle);
+        using var wire = JsonDocument.Parse(Wire(browser));
+        Assert.Equal(5, wire.RootElement.GetProperty("row").GetProperty("rowSeq").GetInt64());
+    }
+
+    [Theory]
+    [InlineData($$"""
+        ,"row":{"id":"sk-7","projectId":"{{P2}}","title":"ISSUE-TITLE-TEXT","rowSeq":5}
+        """)]
+    [InlineData("""
+        ,"row":{"id":"sk-7","title":"ISSUE-TITLE-TEXT","rowSeq":5}
+        """)]
+    [InlineData("")]
+    public void IssueTitleAndRow_DroppedUnlessTheRowIsInTheEventProject(string row)
+    {
+        var env = Nats($$$"""
+        {"id":39,"occurredAt":"2026-10-09T10:00:00Z","eventType":"issue.updated","entityType":"issue",
+         "entityId":"sk-7","projectId":"{{{P1}}}","entityTitle":"ISSUE-TITLE-TEXT"{{{row}}}}
         """);
 
         var browser = BrowserEnvelopeProjector.Project(env);
 
         Assert.NotNull(browser);
-        Assert.Equal(expectedTitle, browser!.EntityTitle);
-        Assert.Equal("sk-7", browser.EntityId);
+        Assert.Equal("sk-7", browser!.EntityId);
+        Assert.Null(browser.EntityTitle);
+        Assert.Null(browser.Row);
+        Assert.DoesNotContain("ISSUE-TITLE-TEXT", Wire(browser), StringComparison.Ordinal);
     }
 
     [Fact]

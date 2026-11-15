@@ -32,11 +32,12 @@ namespace SkeinWeb.Hubs;
 ///         <c>issue.reparented</c> carries
 ///         <see cref="BrowserEnvelope.Reparent"/> — the new parent and only
 ///         the old parents whose project is confirmed equal to the event's
-///         project (R19; today none, see <see cref="BrowserReparent"/>); the phase-2
-///         <see cref="EventEnvelope.Row"/> is forwarded unchanged.</item>
-///   <item>An issue's <see cref="BrowserEnvelope.EntityTitle"/> on a project
-///         event is carried only when the row confirms the issue is in the
-///         event's project.</item>
+///         project (R19; today none, see <see cref="BrowserReparent"/>).</item>
+///   <item>On a project event of an issue, the
+///         <see cref="BrowserEnvelope.EntityTitle"/> and the phase-2
+///         <see cref="EventEnvelope.Row"/> are carried only when the row
+///         confirms the issue is in the event's project; the row is then
+///         forwarded unchanged. Otherwise both are dropped.</item>
 /// </list>
 /// </remarks>
 public static class BrowserEnvelopeProjector
@@ -62,6 +63,7 @@ public static class BrowserEnvelopeProjector
             return null;
         }
 
+        var issueConfirmed = IssueInEventProject(envelope);
         var entityId = envelope.EntityId;
         BrowserDependency? dep = null;
         if (string.Equals(envelope.EntityType, DepEntity, StringComparison.Ordinal))
@@ -79,34 +81,34 @@ public static class BrowserEnvelopeProjector
             Actor: envelope.Actor,
             ActorType: envelope.ActorType,
             ActorUserId: envelope.ActorUserId,
-            EntityTitle: EntityTitleOf(envelope),
+            EntityTitle: issueConfirmed ? envelope.EntityTitle : null,
             ProjectIdPrefix: envelope.ProjectIdPrefix,
             IssueId: IssueIdOf(envelope),
             ChangedFields: ChangedFieldsOf(envelope),
             Dep: dep,
             Reparent: ReparentOf(envelope),
             CommitHashes: CommitHashesOf(envelope),
-            Row: envelope.Row);
+            Row: issueConfirmed ? envelope.Row : null);
     }
 
     /// <summary>
-    /// The entity title, except that the title of an issue on a project event
-    /// is carried only when the event's <see cref="EventEnvelope.Row"/> confirms
-    /// that the issue belongs to the event's project (INV-17): skein-api puts
-    /// the row only onto an event of the issue's own project, while the title
-    /// comes from a lookup by issue id alone. Without that confirmation the
-    /// title is null — the tab still gets the event and its ids.
+    /// Whether the issue-derived values of the event — its title and its row —
+    /// may go to the readers of the event's project (INV-17). True for any
+    /// event that is not an issue event of a project. For an issue event of a
+    /// project, true only when <see cref="EventEnvelope.Row"/> names that same
+    /// project: skein-api puts the row only onto an event of the issue's own
+    /// project, while the title comes from a lookup by issue id alone. Without
+    /// that confirmation neither the title nor the row is carried — the tab
+    /// still gets the event and its ids.
     /// </summary>
-    private static string? EntityTitleOf(EventEnvelope envelope)
+    private static bool IssueInEventProject(EventEnvelope envelope)
     {
         if (!string.Equals(envelope.EntityType, IssueEntity, StringComparison.Ordinal)
             || envelope.ProjectId is not { } eventProject)
         {
-            return envelope.EntityTitle;
+            return true;
         }
-        return Guid.TryParse(StringProp(envelope.Row, "projectId"), out var rowProject) && rowProject == eventProject
-            ? envelope.EntityTitle
-            : null;
+        return Guid.TryParse(StringProp(envelope.Row, "projectId"), out var rowProject) && rowProject == eventProject;
     }
 
     private static string? IssueIdOf(EventEnvelope envelope)

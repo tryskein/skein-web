@@ -229,7 +229,7 @@ public static class DeclareRejectReason
 /// <param name="Dep">Dependency type and the ends lying in the event's project; omitted on non-dependency events.</param>
 /// <param name="Reparent">Old and new parents of a re-parent event; omitted on other events.</param>
 /// <param name="CommitHashes">Commit hashes linked by a commit-attach event (the commit race counts them); omitted on other events.</param>
-/// <param name="Row">Phase 2: the issue's neutral list row as produced by skein-api (opaque here, forwarded unchanged; carries <c>rowSeq</c> — substitute only if greater than the shown one); omitted when absent.</param>
+/// <param name="Row">Phase 2: the issue's neutral list row as produced by skein-api (opaque here, forwarded unchanged; carries <c>rowSeq</c> — substitute only if greater than the shown one); omitted when absent, and on an issue event of a project unless the row names that project.</param>
 public sealed record BrowserEnvelope(
     [property: JsonPropertyName("id")] long Id,
     [property: JsonPropertyName("occurredAt")] DateTimeOffset OccurredAt,
