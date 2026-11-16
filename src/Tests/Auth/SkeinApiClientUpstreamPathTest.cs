@@ -7,11 +7,14 @@ using SkeinWeb.Auth;
 namespace SkeinWeb.Tests.Auth;
 
 /// <summary>
-/// The BFF's own service calls go to skein-api's internal API under
-/// <c>/ui/v1/*</c> (on skein-api <c>/api/v1</c> is the public, key-authenticated
-/// API): login, the session's user, OIDC provisioning, the hub's project-access
-/// check and the installation settings — both from the per-request client and
-/// from <see cref="InstanceConfigBootstrap"/> before the host is built. The
+/// The BFF's own calls go to skein-api's internal API under <c>/ui/v1/*</c>
+/// (on skein-api <c>/api/v1</c> is the public, key-authenticated API): the
+/// service calls — login, OIDC provisioning, the hub's project-access check and
+/// the installation settings, both from the per-request client and from
+/// <see cref="InstanceConfigBootstrap"/> before the host is built — and the
+/// user route <c>GET auth/me</c> (the session's user). Login and provisioning
+/// carry the service-call marker <c>X-Skein-Service-Call: 1</c>;
+/// <c>GET auth/me</c> does not. The
 /// expected paths are literals of the internal API contract, not the constants
 /// of the code under test. The stand-in answers only the expected route, so a
 /// call to any other path fails instead of passing on a generic 200.
