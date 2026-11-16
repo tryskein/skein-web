@@ -257,6 +257,56 @@ public class TrustedProxyConfigTest
         Assert.Empty(opts.KnownIPNetworks);
     }
 
+    // ---- Parse: the raw SKEIN_TRUSTED_PROXIES value from the environment ----
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(",,")]
+    [InlineData(" , ")]
+    public void Parse_UnsetEmptyOrBlankValue_IsTheEmptyList(string? raw)
+    {
+        var config = TrustedProxyConfig.Parse(raw);
+
+        Assert.True(config.IsEmpty);
+        Assert.False(config.Contains(IPAddress.Parse("10.0.0.1")));
+    }
+
+    [Theory]
+    [InlineData("10.0.0.1")]
+    [InlineData("  10.0.0.1  ")]
+    [InlineData("10.0.0.1, ")]
+    [InlineData(",10.0.0.1,,")]
+    [InlineData("192.0.2.9 , 10.0.0.1 ,")]
+    public void Parse_IgnoresSpacesAndEmptyEntries_AroundAListedIp(string raw)
+    {
+        var config = TrustedProxyConfig.Parse(raw);
+
+        Assert.False(config.IsEmpty);
+        Assert.True(config.Contains(IPAddress.Parse("10.0.0.1")));
+        Assert.False(config.Contains(IPAddress.Parse("10.0.0.2")));
+    }
+
+    [Fact]
+    public void Parse_ReadsEveryListedNetworkAndIp()
+    {
+        var config = TrustedProxyConfig.Parse("10.0.0.0/8, 192.0.2.9 ,");
+
+        Assert.True(config.Contains(IPAddress.Parse("10.200.3.4")));
+        Assert.True(config.Contains(IPAddress.Parse("192.0.2.9")));
+        Assert.False(config.Contains(IPAddress.Parse("11.0.0.1")));
+    }
+
+    [Fact]
+    public void Parse_EntryThatIsNeitherAnIpNorANetwork_StopsTheStart_NamingTheSettingAndTheEntry()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => TrustedProxyConfig.Parse("10.0.0.1, proxy.example"));
+
+        Assert.Contains("SKEIN_TRUSTED_PROXIES", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("proxy.example", ex.Message, StringComparison.Ordinal);
+    }
+
     // ---- Contains: one definition of a trusted transport peer (US-4, K7) ----
 
     [Theory]
