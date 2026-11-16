@@ -492,6 +492,17 @@ public sealed class EdgePipelineTest
     }
 
     [Fact]
+    public async Task TrustedPeer_WithoutForwardedHost_LiteralHostInTheList_Passes()
+    {
+        var world = new World("keycloak", ["10.0.0.1"], allowedHosts: "skein.example.com");
+
+        var outcome = await world.Send("10.0.0.1", ctx => ctx.Request.Host = new HostString("skein.example.com"));
+
+        Assert.True(outcome.Reached);
+        Assert.Equal(StatusCodes.Status200OK, outcome.Status);
+    }
+
+    [Fact]
     public async Task TrustedPeer_ForwardedHostInTheList_PassesWhateverTheLiteralHost()
     {
         var world = new World("keycloak", ["10.0.0.1"], allowedHosts: "skein.example.com");
