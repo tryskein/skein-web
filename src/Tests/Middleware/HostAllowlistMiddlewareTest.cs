@@ -16,11 +16,11 @@ namespace SkeinWeb.Tests.Middleware;
 /// </summary>
 public class HostAllowlistMiddlewareTest
 {
-    private sealed record Outcome(int Status, bool NextCalled, string? Error);
+    private sealed record Outcome(int Status, bool NextCalled, string? Error, string? ContentType);
 
     private static async Task<Outcome> Run(
         string allowedHosts, string? host, string path = "/projects",
-        string protocol = "HTTP/1.1", bool ambiguousForwardedHost = false)
+        string protocol = "HTTP/1.1", bool ambiguousForwardedHost = false, bool edgeSnapshot = true)
     {
         var nextCalled = false;
         var middleware = new HostAllowlistMiddleware(
@@ -34,7 +34,10 @@ public class HostAllowlistMiddlewareTest
         {
             ctx.Request.Host = new HostString(host);
         }
-        ctx.Features.Set(new EdgeSnapshot(IPAddress.Parse("10.0.0.1"), ambiguousForwardedHost));
+        if (edgeSnapshot)
+        {
+            ctx.Features.Set(new EdgeSnapshot(IPAddress.Parse("10.0.0.1"), ambiguousForwardedHost));
+        }
         ctx.Response.Body = new MemoryStream();
 
         await middleware.InvokeAsync(ctx);
@@ -46,7 +49,7 @@ public class HostAllowlistMiddlewareTest
             using var doc = await JsonDocument.ParseAsync(ctx.Response.Body);
             error = doc.RootElement.GetProperty("error").GetString();
         }
-        return new Outcome(ctx.Response.StatusCode, nextCalled, error);
+        return new Outcome(ctx.Response.StatusCode, nextCalled, error, ctx.Response.ContentType);
     }
 
     private const string List = "skein.example.com, [2001:db8::1], [::ffff:192.0.2.1]";
@@ -58,6 +61,7 @@ public class HostAllowlistMiddlewareTest
 
         Assert.Equal(StatusCodes.Status400BadRequest, outcome.Status);
         Assert.Equal("invalid_host", outcome.Error);
+        Assert.Equal("application/json", outcome.ContentType);
         Assert.False(outcome.NextCalled);
     }
 
@@ -76,6 +80,19 @@ public class HostAllowlistMiddlewareTest
 
         Assert.True(outcome.NextCalled);
         Assert.Equal(StatusCodes.Status200OK, outcome.Status);
+    }
+
+    // A request that never went through the edge snapshot has nothing ambiguous
+    // about its host: the list decides alone.
+    [Theory]
+    [InlineData("skein.example.com", StatusCodes.Status200OK, true)]
+    [InlineData("evil.example", StatusCodes.Status400BadRequest, false)]
+    public async Task RequestWithoutAnEdgeSnapshot_IsDecidedByTheListAlone(string host, int status, bool goesOn)
+    {
+        var outcome = await Run(List, host, edgeSnapshot: false);
+
+        Assert.Equal(status, outcome.Status);
+        Assert.Equal(goesOn, outcome.NextCalled);
     }
 
     [Fact]

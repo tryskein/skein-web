@@ -36,6 +36,11 @@ public class AllowedHostsConfigTest
     [InlineData("exa mple.com", "exa mple.com")]
     [InlineData(",,", ",,")]
     [InlineData(" , ", " , ")]
+    // A bracketed entry that is not a bracketed IPv6 literal.
+    [InlineData("[::1", "[::1")]
+    [InlineData("[example]", "[example]")]
+    [InlineData("[1.2.3.4]", "[1.2.3.4]")]
+    [InlineData("[fe80::1%2]", "[fe80::1%2]")]
     public void InvalidValue_StopsTheStart_NamingTheSettingAndTheEntry(string raw, string entry)
     {
         var ex = Assert.Throws<InvalidOperationException>(() => AllowedHostsConfig.Parse(raw));
@@ -85,6 +90,7 @@ public class AllowedHostsConfigTest
         "a-.example.com",
         "256.0.0.1",
         "1.2.3.999",
+        "999.1.1.1",
     };
 
     [Theory]
@@ -105,6 +111,45 @@ public class AllowedHostsConfigTest
         var config = AllowedHostsConfig.Parse(raw);
 
         Assert.True(config.IsEmpty);
+    }
+
+    // FR-005: an empty list allows any host, including a missing or malformed one.
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("anything.example.com")]
+    [InlineData("exa mple.com")]
+    public void EmptyList_AllowsEveryHost(string? host)
+    {
+        Assert.True(AllowedHostsConfig.Parse(null).Allows(host));
+        Assert.True(AllowedHostsConfig.Parse("").Allows(host));
+    }
+
+    // With a non-empty list, a missing, empty or malformed host is never listed.
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("exa mple.com")]
+    [InlineData("*.example.com")]
+    [InlineData("[::1")]
+    [InlineData("[example]")]
+    [InlineData("[1.2.3.4]")]
+    [InlineData("[fe80::1%2]")]
+    [InlineData("999.1.1.1")]
+    public void NonEmptyList_DoesNotAllow_AMissingOrMalformedHost(string? host)
+    {
+        var config = AllowedHostsConfig.Parse("skein.example.com");
+
+        Assert.True(config.Allows("skein.example.com"));
+        Assert.False(config.Allows(host));
+    }
+
+    [Fact]
+    public void NonEmptyList_DoesNotAllow_ANameOverTheLengthLimit()
+    {
+        var config = AllowedHostsConfig.Parse("skein.example.com");
+
+        Assert.False(config.Allows(Name(63, 63, 63, 62)));
     }
 
     /// <summary>Records level and formatted message of every entry.</summary>
