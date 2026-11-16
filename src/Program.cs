@@ -183,7 +183,6 @@ builder.Services.AddHttpContextAccessor();
 // single definition of a trusted peer: the ForwardedHeaders options below and
 // the trust-header session bootstrap read the same parsed list.
 var trustedProxies = TrustedProxyConfig.Parse(builder.Configuration[TrustedProxyConfig.SettingName]);
-builder.Services.AddSingleton(trustedProxies);
 var clientIpTrusted = trustedProxies.PerIpThrottleEnabled;
 
 // sk-608 — /mcp upstream headers timeout. Optional (a duration, not an
@@ -317,8 +316,9 @@ builder.Services.AddSingleton<ActionRateLimiter>();
 // image is safe to deploy under the current configmap (env flag still set) AND
 // after it's removed, with no window where the env flag's defaults override
 // Apply's Proto/Host + trusted-proxy gating. (sk-163.17)
-builder.Services.PostConfigure<ForwardedHeadersOptions>(o =>
-    trustedProxies.Apply(o));
+// AddSkeinEdge registers the parsed list and that PostConfigure; UseSkeinEdge
+// below runs the matching links.
+builder.Services.AddSkeinEdge(trustedProxies);
 
 // ---- Reverse-proxy middleware ----------------------------------------------
 builder.Services.AddTransient<ApiProxyMiddleware>();
@@ -444,7 +444,10 @@ if (authMode.IsKeycloakMode && string.IsNullOrWhiteSpace(ssoSnapshot.LogoutRedir
 // ASPNETCORE_FORWARDEDHEADERS_ENABLED. When SKEIN_TRUSTED_PROXIES is empty,
 // only Proto is applied: Host and XFF are not (Request.Host stays the literal
 // Host header, RemoteIpAddress stays the peer) — sk-194.6.52.
-app.UseForwardedHeaders();
+// UseSkeinEdge records the transport peer and the arriving X-Forwarded-Host
+// shape (EdgeSnapshot) BEFORE ForwardedHeaders rewrites the request, then runs
+// ForwardedHeaders; trust decisions read the peer from that snapshot.
+app.UseSkeinEdge();
 
 app.UseRouting();
 
