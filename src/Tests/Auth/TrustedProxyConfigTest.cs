@@ -275,6 +275,29 @@ public class TrustedProxyConfigTest
     }
 
     [Theory]
+    // A mapped list entry is the same peer as the plain IPv4 connection.
+    [InlineData("::ffff:10.0.0.1", "10.0.0.1", true)]
+    // An IPv6 list entry matches that IPv6 peer.
+    [InlineData("2001:db8::1", "2001:db8::1", true)]
+    // A plain IPv6 peer whose low 32 bits spell a listed IPv4 address is another peer.
+    [InlineData("10.0.0.1", "2001:db8::a00:1", false)]
+    [InlineData("10.0.0.1", "::a00:1", false)]
+    public void Contains_ComparesAddresses_NotTheirLow32Bits(string listed, string peer, bool expected)
+    {
+        var config = TrustedProxyConfig.FromEntries([listed]);
+
+        Assert.Equal(expected, config.Contains(IPAddress.Parse(peer)));
+    }
+
+    [Fact]
+    public void Contains_NullPeer_IsNotTrusted_EvenWithANonEmptyList()
+    {
+        var config = TrustedProxyConfig.FromEntries(["10.0.0.1"]);
+
+        Assert.False(config.Contains(null));
+    }
+
+    [Theory]
     [InlineData("127.0.0.1")]
     [InlineData("::1")]
     public void Contains_EmptyList_TrustsNoPeer(string peer)
