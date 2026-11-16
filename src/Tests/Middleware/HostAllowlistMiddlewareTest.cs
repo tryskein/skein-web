@@ -49,7 +49,7 @@ public class HostAllowlistMiddlewareTest
         return new Outcome(ctx.Response.StatusCode, nextCalled, error);
     }
 
-    private const string List = "skein.example.com, [2001:db8::1]";
+    private const string List = "skein.example.com, [2001:db8::1], [::ffff:192.0.2.1]";
 
     [Fact]
     public async Task HostOutsideTheList_Is400InvalidHost_AndStops()
@@ -66,6 +66,10 @@ public class HostAllowlistMiddlewareTest
     [InlineData("skein.example.com:8443")]
     [InlineData("skein.example.com.")]
     [InlineData("[2001:db8::1]:8080")]
+    // The listed bracketed IPv6 address, written without brackets.
+    [InlineData("2001:db8::1")]
+    // The listed IPv4-mapped address, as plain IPv4.
+    [InlineData("192.0.2.1")]
     public async Task ListedHost_IgnoringCasePortTrailingDotAndBrackets_GoesOn(string host)
     {
         var outcome = await Run(List, host);
