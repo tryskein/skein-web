@@ -44,6 +44,59 @@ public class AllowedHostsConfigTest
         Assert.Contains(entry, ex.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A DNS name built from labels of <paramref name="labelLengths"/> letters
+    /// each, joined by dots: <c>[63, 63, 63, 61]</c> is 253 characters.
+    /// </summary>
+    private static string Name(params int[] labelLengths) =>
+        string.Join('.', labelLengths.Select(n => new string('a', n)));
+
+    // RFC 1035 limits (FR-005: an entry is a DNS name or an IP literal): a
+    // label is 1-63 characters and does not start or end with '-'; a name is
+    // at most 253 characters without the trailing dot. Four dot-separated
+    // labels that are not all numeric are a name, not an IPv4 literal.
+    public static TheoryData<string> NamesAtTheLimits => new()
+    {
+        Name(63),
+        Name(63, 63, 63, 61),
+        "1.a.b.c",
+        "1a.2.3.4",
+        "1234.5.6.7",
+        "a-b.example.com",
+    };
+
+    [Theory]
+    [MemberData(nameof(NamesAtTheLimits))]
+    public void NameAtTheLimit_IsAccepted_AndAllowed(string name)
+    {
+        var config = AllowedHostsConfig.Parse(name);
+
+        Assert.True(config.Allows(name));
+        Assert.False(config.Allows("other.example.com"));
+    }
+
+    // Past the limits, or a dotted quad that is not an IPv4 address.
+    public static TheoryData<string> EntriesPastTheLimits => new()
+    {
+        Name(64),
+        Name(64, 3),
+        Name(63, 63, 63, 62),
+        "-a.example.com",
+        "a-.example.com",
+        "256.0.0.1",
+        "1.2.3.999",
+    };
+
+    [Theory]
+    [MemberData(nameof(EntriesPastTheLimits))]
+    public void EntryPastTheLimit_StopsTheStart_NamingTheSettingAndTheEntry(string entry)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => AllowedHostsConfig.Parse(entry));
+
+        Assert.Contains("SKEIN_ALLOWED_HOSTS", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(entry, ex.Message, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(null)]
     [InlineData("")]
