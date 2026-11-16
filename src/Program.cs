@@ -228,7 +228,8 @@ builder.Services.AddHttpClient<SkeinApiClient>(client =>
 builder.Services.AddSkeinServiceApiClient(skeinApiUrl);
 
 // Public account routes (plan K-17, AccountController): skein-api
-// /ui/v1/auth/* with the service secret and the trusted client IP only — NO
+// /ui/v1/auth/* with the service secret, the service-call marker
+// (X-Skein-Service-Call: 1) and the trusted client IP, no identity — NO
 // InternalApiHandler (a logged-in tab must not put its identity on them),
 // retry on GET only (a replayed signup would turn into email_taken).
 SkeinAccountsApiClient.Register(builder.Services, skeinApiUrl);

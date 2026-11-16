@@ -49,7 +49,8 @@ public sealed class AuthConfigController : ControllerBase
     /// Algorithm:
     /// <list type="number">
     ///   <item>Read skein-api's installation settings
-    ///         (<c>GET /ui/v1/internal/instance-config</c>, service secret only,
+    ///         (<c>GET /ui/v1/internal/instance-config</c>, service secret and
+    ///         the service-call marker <c>X-Skein-Service-Call: 1</c>, no identity,
     ///         <see cref="SkeinServiceApiClient.GetInstanceConfigAsync"/>) — on
     ///         EVERY call, no cache (plan K-14): a restart of skein-api alone
     ///         with a new value changes the next response without a restart of

@@ -71,8 +71,9 @@ public sealed class InstanceConfigUnavailableException : Exception
 /// </summary>
 /// <remarks>
 /// <para>
-/// Algorithm: <c>GET /ui/v1/internal/instance-config</c> with
-/// <c>X-Skein-Internal-Secret</c> only (no identity). A connection failure, a
+/// Algorithm: <c>GET /ui/v1/internal/instance-config</c> with the channel
+/// secret <c>X-Skein-Internal-Secret</c> and the service-call marker
+/// <c>X-Skein-Service-Call: 1</c>, no identity. A connection failure, a
 /// per-attempt timeout or a non-2xx status other than 401/404 is treated as
 /// "not yet" — skein-api may still be starting next to us — and retried with exponential backoff
 /// (<see cref="FirstRetryDelay"/> doubling up to <see cref="MaxRetryDelay"/>)

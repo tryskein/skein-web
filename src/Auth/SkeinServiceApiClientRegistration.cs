@@ -15,7 +15,8 @@ public static class SkeinServiceApiClientRegistration
     /// <c>X-Skein-Internal-Secret</c> header redacted from HttpClient logging,
     /// and NO <see cref="InternalApiHandler"/> — that handler forwards the
     /// identity of an ambient <see cref="HttpContext"/>, and a service call
-    /// must carry no user identity (the client sets only the service secret).
+    /// must carry no user identity (the client sets the service secret and the
+    /// service-call marker <c>X-Skein-Service-Call: 1</c>, nothing else).
     /// </summary>
     /// <remarks>
     /// <see cref="HttpClient.Timeout"/> is infinite on purpose: the call
