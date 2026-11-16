@@ -185,6 +185,12 @@ builder.Services.AddHttpContextAccessor();
 var trustedProxies = TrustedProxyConfig.Parse(builder.Configuration[TrustedProxyConfig.SettingName]);
 var clientIpTrusted = trustedProxies.PerIpThrottleEnabled;
 
+// SKEIN_ALLOWED_HOSTS — the host names this deployment answers to (checked at
+// the edge by HostAllowlistMiddleware, after forwarded headers apply). Optional:
+// empty allows any host, as before, and logs a Warning at startup. A malformed
+// value — or a non-empty one without a single entry — stops the start here.
+var allowedHosts = AllowedHostsConfig.Parse(builder.Configuration[AllowedHostsConfig.SettingName]);
+
 // sk-608 — /mcp upstream headers timeout. Optional (a duration, not an
 // address or a secret), so it has a default; a set-but-invalid value throws
 // here, before the server binds a port. See docs/env-reference.md.
@@ -318,7 +324,7 @@ builder.Services.AddSingleton<ActionRateLimiter>();
 // Apply's Proto/Host + trusted-proxy gating. (sk-163.17)
 // AddSkeinEdge registers the parsed list and that PostConfigure; UseSkeinEdge
 // below runs the matching links.
-builder.Services.AddSkeinEdge(trustedProxies);
+builder.Services.AddSkeinEdge(trustedProxies, allowedHosts);
 
 // ---- Reverse-proxy middleware ----------------------------------------------
 builder.Services.AddTransient<ApiProxyMiddleware>();
@@ -410,6 +416,9 @@ if (!trustedProxies.ForwardedHostHonoured)
 // exists for does not happen. Its own Warning, apart from the one above.
 trustedProxies.WarnIfTrustHeadersRefused(authMode, app.Logger);
 
+// Empty SKEIN_ALLOWED_HOSTS: any host name is answered, as before — say so.
+allowedHosts.WarnIfEmpty(app.Logger);
+
 // sk-303.42 — same shape of decision, one layer up. In legacy trust-headers
 // mode an authenticating proxy owns the session that actually lets a user in;
 // clearing only our own cookie leaves that session alive, so the next request
@@ -451,7 +460,8 @@ if (authMode.IsKeycloakMode && string.IsNullOrWhiteSpace(ssoSnapshot.LogoutRedir
 // Host header, RemoteIpAddress stays the peer) — sk-194.6.52.
 // UseSkeinEdge records the transport peer and the arriving X-Forwarded-Host
 // shape (EdgeSnapshot) BEFORE ForwardedHeaders rewrites the request, then runs
-// ForwardedHeaders; trust decisions read the peer from that snapshot.
+// ForwardedHeaders, then checks the actual host against SKEIN_ALLOWED_HOSTS;
+// trust decisions read the peer from that snapshot.
 app.UseSkeinEdge();
 
 app.UseRouting();

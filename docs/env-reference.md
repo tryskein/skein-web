@@ -39,6 +39,7 @@ spellings are shown below; the environment form is the one used in deployments.
 | `REDIS_URL` | Backs the session store, the cookie-encryption key ring, the login throttle and the SignalR backplane. Required. |
 | `NATS_URL` | Source of the live event feed pushed to browsers. Required. |
 | `SKEIN_TRUSTED_PROXIES` | Not required to start, but **empty is a functional default, not a safe-for-every-topology one**: behind an ingress it must list the proxy addresses, or `X-Forwarded-*` is ignored and every per-IP limit (login throttle, IP buckets of the public account routes) stays off. In the legacy trust-headers mode it must list the proxy that sets `X-Auth-Request-*`, or nobody can sign in through it. |
+| `SKEIN_ALLOWED_HOSTS` | Not required to start (empty keeps the old behaviour and logs a Warning), but a deployment reachable by name must list its host names: with it empty skein-web answers a request for any host name. |
 <!-- prod-required:end -->
 
 ---
@@ -266,6 +267,37 @@ spellings are shown below; the environment form is the one used in deployments.
   logged at startup. The local and native OIDC modes do not read trust headers
   at all.
 
+#### `SKEIN_ALLOWED_HOSTS`
+
+- **Purpose:** the host names skein-web answers to. With a non-empty list, a
+  request whose **actual host** is not in it answers `400`
+  `{"error":"invalid_host",…}` before any other processing. The actual host is
+  `X-Forwarded-Host` of a trusted peer (see `SKEIN_TRUSTED_PROXIES`), otherwise
+  the literal `Host` header. A trusted peer's `X-Forwarded-Host` with more than
+  one value (comma-separated or on repeated lines) or an empty value is refused
+  the same way: it means a hop passed on what the visitor sent. A request that
+  reaches the check without a host (HTTP/1.0) is refused with `invalid_host`; an
+  HTTP/1.1 request without `Host` is refused by the server before the
+  application, with a plain `400`. `/healthz`, `/ready` and `/metrics` never go
+  through the check — probes reach the pod by its address.
+- **Required:** no · **Default:** empty · **Format:** comma-separated host
+  names, e.g. `skein.example.com,skein.internal.example.com`. Spaces around
+  entries are dropped and empty entries between commas are ignored. An entry is
+  a DNS name or an IP literal, an IPv6 literal in square brackets
+  (`[2001:db8::1]`). Comparison ignores letter case, the port and a trailing dot;
+  an IPv6 entry in brackets and the same address in a request are one name.
+- **If unset (empty):** any host is answered, as before, and a Warning naming
+  this setting is logged at startup.
+- **Invalid value:** an entry with a scheme, a port, a path, `*` or another
+  wildcard, or any character outside a host name, stops the start with an
+  `InvalidOperationException` naming the setting and the entry. So does a
+  non-empty value without a single entry (for example `,,`): it never turns
+  silently into the empty list.
+- **Careful:** a wrong list keeps the pods Ready (the probe paths skip the
+  check) while every application request answers `400 invalid_host`. Check a
+  request by the real host name after changing it. This is not the framework's
+  `AllowedHosts`, which stays `*`.
+
 ## Authentication
 
 The authentication **mode** is not a skein-web setting. skein-web reads skein-api's
@@ -389,6 +421,8 @@ operator will come across them anyway.
   configuration, present in `appsettings.json`. Overridable by environment
   variable in the usual `Logging__LogLevel__<Category>` form.
 - **`AllowedHosts`** — framework-owned host filtering, `*` in `appsettings.json`.
+  It stays `*`: it is not `SKEIN_ALLOWED_HOSTS`, which is skein-web's own host
+  check.
 - **`ASPNETCORE_URLS`** — not read by application code; the listen address is
   built from `PORT` and applied with `UseUrls`. Use `PORT`.
 - **`ASPNETCORE_FORWARDEDHEADERS_ENABLED`** — a framework hosting-startup flag

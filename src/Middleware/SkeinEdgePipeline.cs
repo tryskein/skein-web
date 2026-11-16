@@ -10,8 +10,9 @@ namespace SkeinWeb.Middleware;
 public static class SkeinEdgePipeline
 {
     /// <summary>
-    /// Registers what the edge reads: the parsed trusted proxy list as a
-    /// singleton, and the forwarded-headers options taken from it.
+    /// Registers what the edge reads: the parsed trusted proxy list and the
+    /// parsed allowed host list as singletons, and the forwarded-headers options
+    /// taken from the trusted proxy list.
     /// </summary>
     /// <remarks>
     /// The options are set in <c>PostConfigure</c>, which runs after every
@@ -22,13 +23,19 @@ public static class SkeinEdgePipeline
     /// </remarks>
     /// <param name="services">Service collection.</param>
     /// <param name="trustedProxies">The parsed <c>SKEIN_TRUSTED_PROXIES</c>.</param>
+    /// <param name="allowedHosts">The parsed <c>SKEIN_ALLOWED_HOSTS</c>.</param>
     /// <returns>The service collection.</returns>
-    public static IServiceCollection AddSkeinEdge(this IServiceCollection services, TrustedProxyConfig trustedProxies)
+    public static IServiceCollection AddSkeinEdge(
+        this IServiceCollection services,
+        TrustedProxyConfig trustedProxies,
+        AllowedHostsConfig allowedHosts)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(trustedProxies);
+        ArgumentNullException.ThrowIfNull(allowedHosts);
 
         services.AddSingleton(trustedProxies);
+        services.AddSingleton(allowedHosts);
         services.PostConfigure<ForwardedHeadersOptions>(trustedProxies.Apply);
         return services;
     }
@@ -37,7 +44,9 @@ public static class SkeinEdgePipeline
     /// Adds the edge links in order: the <see cref="EdgeSnapshotMiddleware"/>
     /// (transport peer and the arriving shape of <c>X-Forwarded-Host</c>), then
     /// <c>UseForwardedHeaders</c> (scheme, host and visitor address from a
-    /// trusted peer).
+    /// trusted peer), then the <see cref="HostAllowlistMiddleware"/> (the actual
+    /// host against <c>SKEIN_ALLOWED_HOSTS</c>, before any processing of the
+    /// application).
     /// </summary>
     /// <param name="app">Application builder whose services were registered with
     /// <see cref="AddSkeinEdge"/>.</param>
@@ -48,6 +57,7 @@ public static class SkeinEdgePipeline
 
         app.UseMiddleware<EdgeSnapshotMiddleware>();
         app.UseForwardedHeaders();
+        app.UseMiddleware<HostAllowlistMiddleware>();
         return app;
     }
 }
