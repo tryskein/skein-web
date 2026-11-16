@@ -119,7 +119,8 @@ process in the umbrella's
 | POST | `/api/auth/confirm-email/{token}` | Confirm an email address |
 | GET / POST | `/api/auth/invitations/{token}`, `/api/auth/invitations/{token}/signup` | Preview an invitation / register by invitation |
 | GET | `/oauth2/start?rd=<path>` | OIDC challenge (native OIDC only) |
-| `*` | `/api/v1/*`, `/mcp`, `/agent/v1/*` | Proxied to skein-api (`/api/v1/*` as `/ui/v1/*`) |
+| `*` | `/api/v1/*` | Proxied to skein-api as `/ui/v1/*`; needs a session cookie (401 without). The service path class — everything under `/api/v1/auth/` except `GET /api/v1/auth/me`, and everything under `/api/v1/hub/` and `/api/v1/internal/`, in any equivalent path form (letter case, repeated or trailing slashes, plain or encoded dot segments, encoded `/`, backslash) — answers 404 with or without a cookie and is never proxied |
+| `*` | `/mcp`, `/agent/v1/*` | Proxied to skein-api |
 | GET | `/.well-known/oauth-protected-resource[/mcp]` | Proxied to skein-api (RFC 9728 metadata, unauthenticated) |
 | WS | `/hub` | SignalR hub (live events, authenticated) |
 

@@ -28,6 +28,13 @@ namespace SkeinWeb.Middleware;
 /// removed so external login can only go through the BFF's rate-limited
 /// POST /api/auth/login route, never directly to skein-api's login endpoint.
 ///
+/// Service path class (<see cref="ServicePathClass"/>): skein-api routes that
+/// only the BFF itself calls — everything under <c>auth/</c> except
+/// <c>GET auth/me</c>, and everything under <c>hub/</c> and <c>internal/</c> —
+/// are answered 404 in any equivalent path form, with or without a cookie, and
+/// never reach skein-api. The order is: strip <c>X-Skein-*</c>, classify (404),
+/// check the cookie (401), proxy.
+///
 /// Prefix swap: the browser keeps <c>/api/v1</c> (open tabs and the SPA are
 /// unchanged), while on skein-api <c>/api/v1</c> is the public, key-authenticated
 /// API and the frontend's internal API lives under <c>/ui/v1</c>. Only the
@@ -98,6 +105,10 @@ public sealed class ApiProxyMiddleware : IMiddleware
     private readonly ILogger<ApiProxyMiddleware> _logger;
     private readonly SkeinApiOptions _options;
 
+    /// <summary>Absolute path of <see cref="UpstreamPrefix"/> on skein-api, including any
+    /// base path of <c>SKEIN_API_URL</c>; the root <see cref="ServicePathClass"/> checks against.</summary>
+    private readonly string _upstreamRootPath;
+
     public ApiProxyMiddleware(
         IHttpClientFactory httpFactory,
         IOptions<SkeinApiOptions> options,
@@ -106,6 +117,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
         _httpFactory = httpFactory;
         _options = options.Value;
         _logger = logger;
+        _upstreamRootPath = new Uri(_options.Url.TrimEnd('/') + UpstreamPrefix, UriKind.Absolute).AbsolutePath;
     }
 
     public async Task InvokeAsync(HttpContext context, RequestDelegate next)
@@ -123,14 +135,33 @@ public sealed class ApiProxyMiddleware : IMiddleware
         // cookie principal AFTER we've stripped the inbound copies.
         StripSpoofableHeaders(context.Request);
 
+        // The upstream URI is built once: the same object is classified here
+        // and sent below, so the class is decided on the path skein-api would
+        // actually receive, after every transformation of building it.
+        var upstreamUri = BuildUpstreamUri(context.Request, remainder);
+
+        // Service path class (ServicePathClass): routes only the BFF itself
+        // calls, in any equivalent form, or a path that left the internal-API
+        // prefix. Answered 404 before the cookie check, so the answer is the
+        // same with and without a session, and skein-api is never called.
+        if (ServicePathClass.Refuses(context.Request.Method, upstreamUri, _upstreamRootPath))
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(
+                "{\"error\":\"not_found\",\"message\":\"no such route under /api/v1\"}",
+                context.RequestAborted);
+            return;
+        }
+
         // sk-163 S9 — NO unauthenticated allowlist. EVERY /api/v1/* request
         // (including /api/v1/auth/login) requires an authenticated cookie. The
         // former direct-login passthrough was removed: it let the browser reach
         // skein-api's login endpoint WITHOUT a cookie, bypassing the
         // BFF's LoginRateLimiter entirely. External password login now goes ONLY
         // through the BFF route POST /api/auth/login (AuthController), which is
-        // throttled per-email AND per-IP. A browser hitting /api/v1/auth/login
-        // here is therefore unauthenticated → 401.
+        // throttled per-email AND per-IP. /api/v1/auth/login itself is in the
+        // service path class and was already answered 404 above.
         if (context.User.Identity is not { IsAuthenticated: true })
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
@@ -141,7 +172,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
             return;
         }
 
-        await ProxyToApiAsync(context, remainder);
+        await ProxyToApiAsync(context, remainder, upstreamUri);
     }
 
     /// <summary>
@@ -173,27 +204,37 @@ public sealed class ApiProxyMiddleware : IMiddleware
         }
     }
 
+    /// <summary>
+    /// The absolute upstream URI <c>&lt;api-base&gt;/ui/v1&lt;remainder&gt;&lt;query&gt;</c>.
+    /// Only the leading <c>/api/v1</c> is swapped — a later <c>/api/v1</c> inside
+    /// the remainder is part of the resource path and stays as it is.
+    /// </summary>
+    /// <param name="request">The browser's request (its query string is appended as is,
+    /// including the leading <c>?</c> when present).</param>
+    /// <param name="remainder">The path after the leading <see cref="ProxyPrefix"/>
+    /// segments (empty or starting with <c>/</c>).</param>
+    private Uri BuildUpstreamUri(HttpRequest request, PathString remainder) =>
+        new(_options.Url.TrimEnd('/')
+            + UpstreamPrefix
+            + remainder.ToString()
+            + request.QueryString.ToString(),
+            UriKind.Absolute);
+
     /// <summary>Streams the request to skein-api's internal API and the response back.</summary>
     /// <param name="context">The browser's request.</param>
     /// <param name="remainder">The path after the leading <see cref="ProxyPrefix"/>
-    /// segments (empty or starting with <c>/</c>), forwarded under <see cref="UpstreamPrefix"/>.</param>
-    private async Task ProxyToApiAsync(HttpContext context, PathString remainder)
+    /// segments (empty or starting with <c>/</c>), forwarded under <see cref="UpstreamPrefix"/>;
+    /// used only for the masked path in the failure log.</param>
+    /// <param name="upstreamUri">The URI built by <see cref="BuildUpstreamUri"/> and
+    /// already classified by <see cref="ServicePathClass"/>.</param>
+    private async Task ProxyToApiAsync(HttpContext context, PathString remainder, Uri upstreamUri)
     {
         var ct = context.RequestAborted;
         var client = _httpFactory.CreateClient(ProxyClientName);
 
-        // Build the absolute upstream URL: <api-base>/ui/v1<remainder><query>.
-        // Only the leading /api/v1 is swapped — a later "/api/v1" inside the
-        // remainder is part of the resource path and stays as it is.
-        // QueryString already includes the leading '?' when present.
-        var upstreamUrl = _options.Url.TrimEnd('/')
-                         + UpstreamPrefix
-                         + remainder.ToString()
-                         + context.Request.QueryString.ToString();
-
         using var upstream = new HttpRequestMessage(
             new HttpMethod(context.Request.Method),
-            upstreamUrl);
+            upstreamUri);
 
         // Body: stream straight through. Pre-buffering would defeat the
         // point of streaming uploads; HttpClient handles chunked transfer
@@ -247,7 +288,7 @@ public sealed class ApiProxyMiddleware : IMiddleware
         }
         catch (HttpRequestException ex)
         {
-            // Never upstreamUrl: the path may carry a link token and the query
+            // Never upstreamUri: the path may carry a link token and the query
             // anything, so only the masked path is logged (see LoggablePath).
             _logger.LogError(
                 ex,
