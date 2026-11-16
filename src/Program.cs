@@ -179,9 +179,12 @@ builder.Services.AddHttpContextAccessor();
 // X-Skein-Client-Ip forward are enabled ONLY when at least one trusted proxy
 // is configured (otherwise RemoteIpAddress is the constant ingress IP and a
 // per-IP bucket would be a global lockout vector). See TrustedProxyConfig.
-var trustedProxies = (builder.Configuration["SKEIN_TRUSTED_PROXIES"] ?? "")
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-var clientIpTrusted = TrustedProxyConfig.PerIpThrottleEnabled(trustedProxies);
+// Parsed ONCE here (a malformed entry stops the start) and registered as the
+// single definition of a trusted peer: the ForwardedHeaders options below and
+// the trust-header session bootstrap read the same parsed list.
+var trustedProxies = TrustedProxyConfig.Parse(builder.Configuration[TrustedProxyConfig.SettingName]);
+builder.Services.AddSingleton(trustedProxies);
+var clientIpTrusted = trustedProxies.PerIpThrottleEnabled;
 
 // sk-608 — /mcp upstream headers timeout. Optional (a duration, not an
 // address or a secret), so it has a default; a set-but-invalid value throws
@@ -315,7 +318,7 @@ builder.Services.AddSingleton<ActionRateLimiter>();
 // after it's removed, with no window where the env flag's defaults override
 // Apply's Proto/Host + trusted-proxy gating. (sk-163.17)
 builder.Services.PostConfigure<ForwardedHeadersOptions>(o =>
-    TrustedProxyConfig.Apply(o, trustedProxies));
+    trustedProxies.Apply(o));
 
 // ---- Reverse-proxy middleware ----------------------------------------------
 builder.Services.AddTransient<ApiProxyMiddleware>();
@@ -391,7 +394,7 @@ var app = builder.Build();
 // throttle that never fires. WARN, not fail: running with no proxy in front
 // is a legitimate deployment (local compose, direct exposure), and killing
 // the pod over it would turn a degraded mode into an outage.
-if (!TrustedProxyConfig.ForwardedHostHonoured(trustedProxies))
+if (!trustedProxies.ForwardedHostHonoured)
 {
     app.Logger.LogWarning(
         "SKEIN_TRUSTED_PROXIES is empty — X-Forwarded-Host and X-Forwarded-For are " +

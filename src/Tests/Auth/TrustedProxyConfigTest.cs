@@ -28,7 +28,7 @@ public class TrustedProxyConfigTest
         string[] trustedProxies, string peer, string? xff)
     {
         var opts = new ForwardedHeadersOptions();
-        TrustedProxyConfig.Apply(opts, trustedProxies);
+        TrustedProxyConfig.FromEntries(trustedProxies).Apply(opts);
 
         var mw = new ForwardedHeadersMiddleware(
             next: _ => Task.CompletedTask,
@@ -49,8 +49,8 @@ public class TrustedProxyConfigTest
     [Fact]
     public void EmptyConfig_PerIpThrottleDisabled()
     {
-        Assert.False(TrustedProxyConfig.PerIpThrottleEnabled([]));
-        Assert.True(TrustedProxyConfig.PerIpThrottleEnabled(["10.0.0.1"]));
+        Assert.False(TrustedProxyConfig.FromEntries([]).PerIpThrottleEnabled);
+        Assert.True(TrustedProxyConfig.FromEntries(["10.0.0.1"]).PerIpThrottleEnabled);
     }
 
     [Fact]
@@ -59,8 +59,8 @@ public class TrustedProxyConfigTest
         // sk-194.6.52 — the predicate Program.cs reports at startup: no trusted
         // proxy ⇒ X-Forwarded-Host is not honoured (Request.Host is the literal
         // Host header). One trusted proxy ⇒ honoured, gated on that proxy.
-        Assert.False(TrustedProxyConfig.ForwardedHostHonoured([]));
-        Assert.True(TrustedProxyConfig.ForwardedHostHonoured(["10.0.0.1"]));
+        Assert.False(TrustedProxyConfig.FromEntries([]).ForwardedHostHonoured);
+        Assert.True(TrustedProxyConfig.FromEntries(["10.0.0.1"]).ForwardedHostHonoured);
     }
 
     [Fact]
@@ -119,7 +119,7 @@ public class TrustedProxyConfigTest
         string requestHost = "skein.example.com")
     {
         var opts = new ForwardedHeadersOptions();
-        TrustedProxyConfig.Apply(opts, trustedProxies);
+        TrustedProxyConfig.FromEntries(trustedProxies).Apply(opts);
 
         var mw = new ForwardedHeadersMiddleware(
             next: _ => Task.CompletedTask,
@@ -148,7 +148,7 @@ public class TrustedProxyConfigTest
         // accepted from ANY client. Only Proto may be, and it carries no
         // authority; Host and For (the throttle key) must not.
         var opts = new ForwardedHeadersOptions();
-        TrustedProxyConfig.Apply(opts, []);
+        TrustedProxyConfig.FromEntries([]).Apply(opts);
 
         Assert.Equal(ForwardedHeaders.XForwardedProto, opts.ForwardedHeaders);
         Assert.Empty(opts.KnownProxies);
@@ -229,7 +229,7 @@ public class TrustedProxyConfigTest
         var opts = new ForwardedHeadersOptions();
 
         var ex = Assert.Throws<InvalidOperationException>(
-            () => TrustedProxyConfig.Apply(opts, ["10.244.0.0/16", "not-an-ip"]));
+            () => TrustedProxyConfig.FromEntries(["10.244.0.0/16", "not-an-ip"]).Apply(opts));
 
         Assert.Contains("not-an-ip", ex.Message);
         Assert.Contains("SKEIN_TRUSTED_PROXIES", ex.Message);
@@ -249,7 +249,7 @@ public class TrustedProxyConfigTest
         opts.KnownProxies.Add(sentinel);
 
         Assert.Throws<InvalidOperationException>(
-            () => TrustedProxyConfig.Apply(opts, ["10.0.0.1", "garbage/99"]));
+            () => TrustedProxyConfig.FromEntries(["10.0.0.1", "garbage/99"]).Apply(opts));
 
         Assert.Equal(ForwardedHeaders.None, opts.ForwardedHeaders);
         Assert.Equal([sentinel], opts.KnownProxies);
