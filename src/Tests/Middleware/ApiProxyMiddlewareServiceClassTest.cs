@@ -187,6 +187,11 @@ public class ApiProxyMiddlewareServiceClassTest
     [InlineData("OPTIONS", "/api/v1/auth/me", false)]
     [InlineData("GET", "/api/v1/auth/me/../login", true)]
     [InlineData("GET", "/api/v1/auth/me/../login", false)]
+    // The GET exception is auth/me only: "me" under hub/ or internal/ is in the class.
+    [InlineData("GET", "/api/v1/hub/me", true)]
+    [InlineData("GET", "/api/v1/hub/me", false)]
+    [InlineData("GET", "/api/v1/internal/me", true)]
+    [InlineData("GET", "/api/v1/internal/me", false)]
     public async Task OtherPathInTheClass_Is404_AndNeverProxied(string method, string path, bool cookie)
     {
         var (status, calls, _) = await Send(method, path, "", cookie);
