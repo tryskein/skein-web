@@ -173,6 +173,19 @@ public class SkeinApiClientUpstreamPathTest
         Assert.Empty(marker);
     }
 
+    // Row 10: the marker carries exactly one value even when a request is
+    // marked twice (skein-api accepts only a single "1").
+    [Fact]
+    public void MarkServiceCall_Twice_LeavesExactlyOneMarker()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/ui/v1/auth/login");
+
+        SkeinHeaders.MarkServiceCall(request.Headers);
+        SkeinHeaders.MarkServiceCall(request.Headers);
+
+        Assert.Equal(["1"], request.Headers.GetValues("X-Skein-Service-Call"));
+    }
+
     [Fact]
     public async Task ProjectAccess_PostsToUiV1HubProjectAccess()
     {
