@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -50,6 +51,14 @@ public class SsoSessionMiddlewareTest
     // WITHOUT an OIDC authority (keycloak or hybrid).
     private static readonly WebAuthMode KeycloakMode = WebAuthMode.FromApi("keycloak", null);
 
+    // Trust headers count only from a trusted transport peer (US-4): every
+    // request here comes from a peer in the list, so the flows below are the
+    // ones the peer check lets through.
+    private static readonly TrustedProxyConfig TrustedProxies = TrustedProxyConfig.FromEntries(["10.0.0.1"]);
+
+    private static void WithTrustedPeer(HttpContext ctx) =>
+        ctx.Features.Set(new EdgeSnapshot(IPAddress.Parse("10.0.0.1"), AmbiguousForwardedHost: false));
+
     [Theory]
     [InlineData("local", null)]
     [InlineData("local", Authority)]
@@ -69,11 +78,13 @@ public class SsoSessionMiddlewareTest
 
         var mw = new SsoSessionMiddleware(
             WebAuthMode.FromApi(apiAuthMode, authority),
+            TrustedProxies,
             sp,
             NullLogger<SsoSessionMiddleware>.Instance);
 
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = "/";
+        WithTrustedPeer(ctx);
         // Even with trust headers set the middleware should ignore them
         // entirely — local mode is a hard short-circuit.
         ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
@@ -110,11 +121,13 @@ public class SsoSessionMiddlewareTest
 
         var mw = new SsoSessionMiddleware(
             KeycloakMode,
+            TrustedProxies,
             sp,
             NullLogger<SsoSessionMiddleware>.Instance);
 
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = "/some/page";
+        WithTrustedPeer(ctx);
         // No trust headers. No cookie principal either.
 
         var nextCalled = false;
@@ -149,10 +162,12 @@ public class SsoSessionMiddlewareTest
         });
         var mw = new SsoSessionMiddleware(
             WebAuthMode.FromApi(apiAuthMode, null),
+            TrustedProxies,
             services.BuildServiceProvider(),
             NullLogger<SsoSessionMiddleware>.Instance);
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = "/";
+        WithTrustedPeer(ctx);
         ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
         ctx.Request.Headers["X-Auth-Request-User"] = "u";
         ctx.Response.Body = new MemoryStream();
@@ -178,12 +193,14 @@ public class SsoSessionMiddlewareTest
 
         var mw = new SsoSessionMiddleware(
             KeycloakMode,
+            TrustedProxies,
             sp,
             NullLogger<SsoSessionMiddleware>.Instance);
 
         // Only email, no user.
         var ctx1 = new DefaultHttpContext();
         ctx1.Request.Path = "/";
+        WithTrustedPeer(ctx1);
         ctx1.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
         var called1 = false;
         await mw.InvokeAsync(ctx1, _ => { called1 = true; return Task.CompletedTask; });
@@ -192,6 +209,7 @@ public class SsoSessionMiddlewareTest
         // Only user, no email.
         var ctx2 = new DefaultHttpContext();
         ctx2.Request.Path = "/";
+        WithTrustedPeer(ctx2);
         ctx2.Request.Headers["X-Auth-Request-User"] = "u";
         var called2 = false;
         await mw.InvokeAsync(ctx2, _ => { called2 = true; return Task.CompletedTask; });
@@ -216,11 +234,13 @@ public class SsoSessionMiddlewareTest
 
         var mw = new SsoSessionMiddleware(
             KeycloakMode,
+            TrustedProxies,
             sp,
             NullLogger<SsoSessionMiddleware>.Instance);
 
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = "/";
+        WithTrustedPeer(ctx);
         ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
         ctx.Request.Headers["X-Auth-Request-User"] = "u";
         ctx.User = new ClaimsPrincipal(
@@ -265,11 +285,13 @@ public class SsoSessionMiddlewareTest
 
         var mw = new SsoSessionMiddleware(
             KeycloakMode,
+            TrustedProxies,
             sp,
             NullLogger<SsoSessionMiddleware>.Instance);
 
         var ctx = new DefaultHttpContext();
         ctx.Request.Path = "/";
+        WithTrustedPeer(ctx);
         // No trust headers. The principal has NO refreshed-at claim
         // either — refresh would be due, but the missing headers force
         // a skip.
@@ -310,6 +332,7 @@ public class SsoSessionMiddlewareTest
 
         var mw = new SsoSessionMiddleware(
             KeycloakMode,
+            TrustedProxies,
             sp,
             NullLogger<SsoSessionMiddleware>.Instance);
 
@@ -317,6 +340,7 @@ public class SsoSessionMiddlewareTest
         {
             var ctx = new DefaultHttpContext();
             ctx.Request.Path = path;
+            WithTrustedPeer(ctx);
             // Even with trust headers, bypass paths short-circuit
             // before reaching the upstream.
             ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
@@ -372,6 +396,7 @@ public class SsoSessionMiddlewareTest
 
         var ctx = new DefaultHttpContext { RequestServices = sp };
         ctx.Request.Path = "/";
+        WithTrustedPeer(ctx);
         ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
         ctx.Request.Headers["X-Auth-Request-User"] = "u";
         var stale = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
@@ -389,7 +414,7 @@ public class SsoSessionMiddlewareTest
             authenticationType: "Cookies"));
 
         var nextCalled = false;
-        var mw = new SsoSessionMiddleware(KeycloakMode, sp, NullLogger<SsoSessionMiddleware>.Instance);
+        var mw = new SsoSessionMiddleware(KeycloakMode, TrustedProxies, sp, NullLogger<SsoSessionMiddleware>.Instance);
         await mw.InvokeAsync(ctx, _ => { nextCalled = true; return Task.CompletedTask; });
         return new RefreshRun(ctx, signIns, signOuts, nextCalled);
     }

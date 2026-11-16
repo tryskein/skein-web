@@ -405,6 +405,11 @@ if (!trustedProxies.ForwardedHostHonoured)
         "(sk-194.6.52).");
 }
 
+// Legacy trust-headers mode with an empty SKEIN_TRUSTED_PROXIES: the trust
+// headers are accepted from no peer (fail-closed), so the SSO sign-in this mode
+// exists for does not happen. Its own Warning, apart from the one above.
+trustedProxies.WarnIfTrustHeadersRefused(authMode, app.Logger);
+
 // sk-303.42 — same shape of decision, one layer up. In legacy trust-headers
 // mode an authenticating proxy owns the session that actually lets a user in;
 // clearing only our own cookie leaves that session alive, so the next request

@@ -58,8 +58,11 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
   from the cookie principal; every inbound `X-Skein-*` header is stripped first
   (`Middleware/ApiProxyMiddleware.cs`). Never derive a
   privilege decision from a client-controlled header such as `Host` (rationale
-  in `Middleware/McpProxyMiddleware.cs`). `SKEIN_TRUSTED_PROXIES` governs only
-  `X-Forwarded-*`.
+  in `Middleware/McpProxyMiddleware.cs`). `SKEIN_TRUSTED_PROXIES` governs
+  `X-Forwarded-*` and, in the legacy trust-headers mode, which transport peers
+  may send `X-Auth-Request-*` (`Middleware/SsoSessionMiddleware.cs`); the peer
+  is the connection address recorded before forwarded headers apply
+  (`Middleware/EdgeSnapshotMiddleware.cs`), never a header.
 - **Redis holds shared state**: session tickets, the DataProtection key ring,
   login throttling and the SignalR backplane. Anything per-replica in memory
   breaks multi-replica deployments.

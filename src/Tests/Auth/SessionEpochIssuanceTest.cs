@@ -199,8 +199,13 @@ public class SessionEpochIssuanceTest
         ctx.Request.Path = "/";
         ctx.Request.Headers["X-Auth-Request-Email"] = "dev@client.io";
         ctx.Request.Headers["X-Auth-Request-User"] = "dev";
+        // Trust headers count only from a trusted transport peer (US-4).
+        ctx.Features.Set(new EdgeSnapshot(System.Net.IPAddress.Parse("10.0.0.1"), AmbiguousForwardedHost: false));
         var middleware = new SsoSessionMiddleware(
-            new WebAuthMode(WebAuthKind.Keycloak, Hybrid: false), ctx.RequestServices, Logger<SsoSessionMiddleware>(log));
+            new WebAuthMode(WebAuthKind.Keycloak, Hybrid: false),
+            TrustedProxyConfig.FromEntries(["10.0.0.1"]),
+            ctx.RequestServices,
+            Logger<SsoSessionMiddleware>(log));
 
         await middleware.InvokeAsync(ctx, _ => Task.CompletedTask);
         return new Outcome(signIns, log.Levels);

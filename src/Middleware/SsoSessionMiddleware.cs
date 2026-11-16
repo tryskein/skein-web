@@ -28,6 +28,12 @@ namespace SkeinWeb.Middleware;
 /// <list type="number">
 ///   <item>Skip unless <see cref="WebAuthMode.IsKeycloakMode"/> (legacy trust-headers).</item>
 ///   <item>Skip bypass paths (health checks, metrics, MCP, auth/config).</item>
+///   <item>Trust headers (either one) from a transport peer outside
+///         <c>SKEIN_TRUSTED_PROXIES</c> — or with no
+///         <see cref="EdgeSnapshot"/> — are ignored: a Warning without
+///         personal data or addresses is written and the request goes on as
+///         it came, with no provisioning, no new session and no TTL refresh or
+///         epoch check of an existing one. An empty list trusts no peer.</item>
 ///   <item>Skip if the request already carries an authenticated cookie principal —
 ///         except that on every authenticated request we ALSO run the TTL
 ///         refresh below.</item>
@@ -102,15 +108,18 @@ public sealed class SsoSessionMiddleware : IMiddleware
     private static readonly TimeSpan SessionRefreshTtl = TimeSpan.FromMinutes(5);
 
     private readonly WebAuthMode _mode;
+    private readonly TrustedProxyConfig _trustedProxies;
     private readonly IServiceProvider _services;
     private readonly ILogger<SsoSessionMiddleware> _logger;
 
     public SsoSessionMiddleware(
         WebAuthMode mode,
+        TrustedProxyConfig trustedProxies,
         IServiceProvider services,
         ILogger<SsoSessionMiddleware> logger)
     {
         _mode = mode;
+        _trustedProxies = trustedProxies;
         _services = services;
         _logger = logger;
     }
@@ -135,7 +144,24 @@ public sealed class SsoSessionMiddleware : IMiddleware
             }
         }
 
-        // 3) Already authenticated via the cookie? Run the TTL refresh
+        // 3) Trust headers count only from a trusted TRANSPORT peer — the
+        //    connection address EdgeSnapshotMiddleware recorded before
+        //    ForwardedHeaders rewrote RemoteIpAddress to the visitor. No
+        //    header (X-Forwarded-For, X-Original-For, …) takes part in this
+        //    decision. Checked before the TTL refresh and the epoch check, so
+        //    a foreign identity never refreshes, re-signs or ends a session.
+        if (HasTrustHeaders(context.Request) &&
+            !_trustedProxies.Contains(context.Features.Get<EdgeSnapshot>()?.TransportPeer))
+        {
+            _logger.LogWarning(
+                "sso: trust headers from a transport peer outside {Setting} ignored; " +
+                "no session is created, refreshed or ended by this request",
+                TrustedProxyConfig.SettingName);
+            await next(context);
+            return;
+        }
+
+        // 4) Already authenticated via the cookie? Run the TTL refresh
         //    fallback path — re-fetch claims from skein-api when the
         //    last sync is older than SessionRefreshTtl. Defends against
         //    missed NATS events (lag, pod restart, queue-group drop).
@@ -146,7 +172,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return;
         }
 
-        // 4) Read trust headers. Both must be present — username alone
+        // 5) Read trust headers. Both must be present — username alone
         //    can't drive provisioning (skein-api needs the email key)
         //    and email alone can't populate the canonical handle.
         var email = context.Request.Headers[EmailHeader].FirstOrDefault();
@@ -168,7 +194,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
         // an absent claim on every page load.
         var name = string.Empty;
 
-        // 5) Provision via skein-api.
+        // 6) Provision via skein-api.
         AuthenticatedUser provisioned;
         try
         {
@@ -241,7 +267,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return;
         }
 
-        // 6) sk-674.18 K-16: the session carries the epoch of THIS answer;
+        // 7) sk-674.18 K-16: the session carries the epoch of THIS answer;
         //    without it no session is issued (no default, no older value).
         if (provisioned.SessionEpoch is not { } sessionEpoch)
         {
@@ -256,7 +282,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return;
         }
 
-        // 7) Mint the cookie + Redis ticket. Mirror AuthController.Login
+        // 8) Mint the cookie + Redis ticket. Mirror AuthController.Login
         //    so /api/auth/me and the proxy handler treat both flows
         //    identically.
         await SignInWithUserAsync(context, provisioned.User, sessionEpoch);
@@ -264,6 +290,10 @@ public sealed class SsoSessionMiddleware : IMiddleware
 
         await next(context);
     }
+
+    /// <summary>Whether the request carries either trust header, whatever its value.</summary>
+    private static bool HasTrustHeaders(HttpRequest request) =>
+        request.Headers.ContainsKey(EmailHeader) || request.Headers.ContainsKey(UserHeader);
 
     /// <summary>
     /// TTL refresh fallback. Called on every authenticated request; only

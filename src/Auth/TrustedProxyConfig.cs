@@ -146,6 +146,34 @@ public sealed class TrustedProxyConfig
     }
 
     /// <summary>
+    /// Startup Warning for the legacy trust-headers mode (SSO without an OIDC
+    /// authority, skein-api <c>keycloak</c> or <c>hybrid</c>) with an empty list:
+    /// trust headers are then accepted from no peer, so no trust-header session
+    /// can be created or refreshed. Written as its own entry, apart from the
+    /// Warning about <c>X-Forwarded-*</c>. Nothing is written in the other modes,
+    /// which do not read trust headers, or with a non-empty list.
+    /// </summary>
+    /// <param name="mode">The mode this process runs.</param>
+    /// <param name="logger">Where the Warning goes.</param>
+    public void WarnIfTrustHeadersRefused(WebAuthMode mode, ILogger logger)
+    {
+        ArgumentNullException.ThrowIfNull(mode);
+        ArgumentNullException.ThrowIfNull(logger);
+
+        if (!mode.IsKeycloakMode || !IsEmpty)
+        {
+            return;
+        }
+
+        logger.LogWarning(
+            "{Setting} is empty in the legacy trust-headers mode (skein-api SKEIN_AUTH_MODE=keycloak|hybrid, " +
+            "no Authentication__Oidc__Authority) — X-Auth-Request-User/X-Auth-Request-Email are accepted " +
+            "from NO peer, so no SSO session is created or refreshed and users cannot sign in through the " +
+            "authenticating proxy. Set {Setting} to the address(es) of the proxy that sets these headers.",
+            SettingName, SettingName);
+    }
+
+    /// <summary>
     /// Configure <see cref="ForwardedHeadersOptions"/> as the BFF's SINGLE source
     /// of truth for forwarded-header handling (replacing the framework's
     /// ASPNETCORE_FORWARDEDHEADERS_ENABLED path — two configs on the same DI

@@ -38,7 +38,7 @@ spellings are shown below; the environment form is the one used in deployments.
 | `SKEIN_INTERNAL_SECRET` | Shared secret authenticating this BFF to skein-api. A default would be a published credential. Required, and must match skein-api's value exactly. |
 | `REDIS_URL` | Backs the session store, the cookie-encryption key ring, the login throttle and the SignalR backplane. Required. |
 | `NATS_URL` | Source of the live event feed pushed to browsers. Required. |
-| `SKEIN_TRUSTED_PROXIES` | Not required to start, but **empty is a functional default, not a safe-for-every-topology one**: behind an ingress it must list the proxy addresses, or `X-Forwarded-*` is ignored and every per-IP limit (login throttle, IP buckets of the public account routes) stays off. |
+| `SKEIN_TRUSTED_PROXIES` | Not required to start, but **empty is a functional default, not a safe-for-every-topology one**: behind an ingress it must list the proxy addresses, or `X-Forwarded-*` is ignored and every per-IP limit (login throttle, IP buckets of the public account routes) stays off. In the legacy trust-headers mode it must list the proxy that sets `X-Auth-Request-*`, or nobody can sign in through it. |
 <!-- prod-required:end -->
 
 ---
@@ -227,7 +227,8 @@ spellings are shown below; the environment form is the one used in deployments.
   `/password-reset`, `/password-reset/{token}`, `/confirm-email/{token}`,
   `/invitations/{token}`, `/invitations/{token}/signup`) — and the
   `X-Skein-Client-Ip` value forwarded to skein-api, which keys skein-api's own
-  per-IP limits.
+  per-IP limits. In the legacy trust-headers mode it is also the list of peers
+  whose trust headers are accepted (see "Legacy trust-headers mode" below).
 - **Required:** no, but see below · **Default:** empty · **Format:**
   comma-separated IP addresses and/or CIDR networks, e.g.
   `10.244.0.0/16,192.168.1.5`. Whitespace around entries is trimmed.
@@ -249,6 +250,21 @@ spellings are shown below; the environment form is the one used in deployments.
   this. Leaving it empty there does not fail loudly; it silently disables every
   per-IP limit (login and public account routes) and makes `Request.Host` the
   client's own `Host` header — which the OIDC same-origin return-URL check reads.
+- **Legacy trust-headers mode** (skein-api `SKEIN_AUTH_MODE` is `keycloak` or
+  `hybrid` and `Authentication__Oidc__Authority` is not set): the trust headers
+  `X-Auth-Request-User` and `X-Auth-Request-Email` are accepted only when the
+  **transport peer** — the address of the TCP connection that reached skein-web,
+  recorded before `X-Forwarded-For` is applied — is in this list. No header,
+  `X-Forwarded-For` and `X-Original-For` included, takes part in that decision;
+  an IPv4 address and its IPv4-mapped IPv6 form are the same peer. From any
+  other peer the trust headers are ignored and a Warning without personal data
+  or addresses is logged: no provisioning, no new session; a request without a
+  session goes on unauthenticated, and an existing cookie session goes on
+  unchanged — it is neither refreshed nor ended by that request. **Empty in
+  this mode accepts trust headers from no one (fail-closed)**, so nobody can
+  sign in through the authenticating proxy; a Warning naming this setting is
+  logged at startup. The local and native OIDC modes do not read trust headers
+  at all.
 
 ## Authentication
 
