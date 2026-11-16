@@ -143,7 +143,7 @@ public static class InstanceConfigBootstrap
     /// runs out (see the type remarks for the algorithm).
     /// </summary>
     /// <param name="http">Client whose base address is skein-api and which sends
-    /// <c>X-Skein-Internal-Secret</c> (see <see cref="CreateHttpClient"/>).</param>
+    /// <c>X-Skein-Internal-Secret</c> and the service-call marker (see <see cref="CreateHttpClient"/>).</param>
     /// <param name="window">Total time allowed, measured on <paramref name="time"/>; must be positive.</param>
     /// <param name="time">Clock for the window, the per-attempt timeout and the backoff.</param>
     /// <param name="logger">Receives one warning per failed attempt.</param>
@@ -225,8 +225,9 @@ public static class InstanceConfigBootstrap
     }
 
     /// <summary>
-    /// Builds the bootstrap client: skein-api base address, the channel secret,
-    /// no Polly (the retry and its window are <see cref="LoadAsync"/>'s) and no
+    /// Builds the bootstrap client: skein-api base address, the channel secret
+    /// and the service-call marker (the installation settings are a service
+    /// route), no Polly (the retry and its window are <see cref="LoadAsync"/>'s) and no
     /// client-level timeout (each attempt carries its own).
     /// </summary>
     /// <param name="skeinApiUrl"><c>SKEIN_API_URL</c>.</param>
@@ -239,6 +240,7 @@ public static class InstanceConfigBootstrap
             Timeout = Timeout.InfiniteTimeSpan,
         };
         http.DefaultRequestHeaders.Add(SkeinHeaders.InternalSecret, internalSecret);
+        SkeinHeaders.MarkServiceCall(http.DefaultRequestHeaders);
         return http;
     }
 

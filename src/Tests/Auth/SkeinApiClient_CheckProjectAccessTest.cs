@@ -84,10 +84,11 @@ public class SkeinServiceApiClient_CheckProjectAccessTest
     }
 
     [Fact]
-    public async Task Request_CarriesOnlyTheServiceSecret_EvenWithAnAmbientAuthenticatedUser()
+    public async Task Request_CarriesOnlyTheServiceSecretAndMarker_EvenWithAnAmbientAuthenticatedUser()
     {
         // An authenticated user is ambient (as inside a hub invocation); the
-        // service call must still carry no identity of its own caller.
+        // service call must still carry no identity of its own caller, only the
+        // channel secret and the service-call marker (X-Skein-Service-Call: 1).
         var stub = new StubHandler(_ => Json(HttpStatusCode.OK, ResponseLiteral));
         using var sut = Sut.Create(stub);
         var accessor = sut.Services.GetRequiredService<IHttpContextAccessor>();
@@ -107,10 +108,12 @@ public class SkeinServiceApiClient_CheckProjectAccessTest
 
             var req = Assert.Single(stub.Requests);
             Assert.Equal(new[] { Secret }, req.Headers[SkeinHeaders.InternalSecret]);
+            Assert.Equal(new[] { "1" }, req.Headers["X-Skein-Service-Call"]);
             var skeinHeaders = req.Headers.Keys
                 .Where(h => h.StartsWith("X-Skein-", StringComparison.OrdinalIgnoreCase))
+                .Order(StringComparer.Ordinal)
                 .ToArray();
-            Assert.Equal(new[] { SkeinHeaders.InternalSecret }, skeinHeaders);
+            Assert.Equal(new[] { "X-Skein-Internal-Secret", "X-Skein-Service-Call" }, skeinHeaders);
         }
         finally
         {

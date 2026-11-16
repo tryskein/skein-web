@@ -1,3 +1,5 @@
+using System.Net.Http.Headers;
+
 namespace SkeinWeb.Auth;
 
 /// <summary>
@@ -99,6 +101,42 @@ public static class SkeinHeaders
     /// <c>CodeSessionRevoked</c>, internal/auth/headers.go).
     /// </summary>
     public const string SessionRevokedCode = "session_revoked";
+
+    /// <summary>
+    /// Service-call marker. skein-api runs its service routes (everything the
+    /// BFF calls on its own: login, provision, the hub access check, the
+    /// installation settings, the public account routes) only when this header
+    /// carries exactly one value, <see cref="ServiceCallMarker"/>; without it
+    /// they answer 403 <c>service_call_required</c>. Only the BFF's own calls
+    /// set it, through <see cref="MarkServiceCall"/>; a channel that forwards
+    /// a browser request (the <c>/api/v1</c> proxy) never does, and like the
+    /// rest of the <see cref="Prefix"/> family an inbound copy is stripped.
+    /// Must match the constant <c>HeaderServiceCall</c> in skein-api
+    /// (internal/auth/headers.go).
+    /// </summary>
+    public const string ServiceCall = "X-Skein-Service-Call";
+
+    /// <summary>
+    /// The only <see cref="ServiceCall"/> value that marks a service call.
+    /// Must match <c>ServiceCallMarker</c> in skein-api
+    /// (internal/auth/headers.go) byte-for-byte.
+    /// </summary>
+    public const string ServiceCallMarker = "1";
+
+    /// <summary>
+    /// Marks an outgoing request (or every request of a client, through its
+    /// <c>DefaultRequestHeaders</c>) as the BFF's own service call: sets
+    /// <see cref="ServiceCall"/> to <see cref="ServiceCallMarker"/>. Called by
+    /// each own call to a service route, never on a pipeline that forwards
+    /// browser requests.
+    /// </summary>
+    /// <param name="headers">Headers of the request or the client's default headers.</param>
+    public static void MarkServiceCall(HttpRequestHeaders headers)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+        headers.Remove(ServiceCall);
+        headers.Add(ServiceCall, ServiceCallMarker);
+    }
 
     /// <summary>
     /// Common prefix used by <see cref="System.String.StartsWith(string)"/>

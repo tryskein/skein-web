@@ -56,7 +56,11 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
   request, not cached here.
 - **Trust boundary.** Identity reaches skein-api only as headers this BFF sets
   from the cookie principal; every inbound `X-Skein-*` header is stripped first
-  (`Middleware/ApiProxyMiddleware.cs`). Never derive a
+  (`Middleware/ApiProxyMiddleware.cs`). The service-call marker
+  `X-Skein-Service-Call: 1` (`Auth/SkeinHeaders.cs#MarkServiceCall`) is set
+  only by the BFF's own calls to skein-api, per request or per own client;
+  a channel that forwards someone else's request (the `/api/v1` proxy, its
+  shared `InternalApiHandler`) never sets it. Never derive a
   privilege decision from a client-controlled header such as `Host` (rationale
   in `Middleware/McpProxyMiddleware.cs`). `SKEIN_TRUSTED_PROXIES` governs
   `X-Forwarded-*` and, in the legacy trust-headers mode, which transport peers

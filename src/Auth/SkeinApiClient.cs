@@ -18,6 +18,11 @@ namespace SkeinWeb.Auth;
 /// is added automatically. <c>X-Skein-User-*</c> headers are NOT added on
 /// login because the user is not yet authenticated; on the post-login
 /// flows (which we do not call from here) they would be.
+/// <see cref="LoginAsync"/> and <see cref="OidcProvisionAsync"/> call service
+/// routes and mark each request with <see cref="SkeinHeaders.ServiceCall"/>;
+/// <see cref="MeAsync"/> is a user route and does not. The marker is set per
+/// request, not on the client or in <see cref="InternalApiHandler"/>, because
+/// that handler also serves the browser proxy, which must never carry it.
 /// </remarks>
 public sealed class SkeinApiClient
 {
@@ -73,6 +78,7 @@ public sealed class SkeinApiClient
         {
             Content = JsonContent.Create(new { email, password }, options: JsonOpts),
         };
+        SkeinHeaders.MarkServiceCall(req.Headers);
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
 
@@ -220,6 +226,7 @@ public sealed class SkeinApiClient
                 new { email, username, name },
                 options: JsonOpts),
         };
+        SkeinHeaders.MarkServiceCall(req.Headers);
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
 
@@ -372,7 +379,8 @@ public static class SkeinApiRetryPolicy
 /// <c>X-Skein-User-*</c> identity of whatever <see cref="HttpContext"/> is
 /// ambient. A service call must not depend on, or leak, an ambient user — so
 /// this client has no <see cref="IHttpContextAccessor"/> in its dependency
-/// graph and sets <c>X-Skein-Internal-Secret</c> itself on each request. The
+/// graph and sets <c>X-Skein-Internal-Secret</c> and the service-call marker
+/// (<see cref="SkeinHeaders.ServiceCall"/>) itself on each request. The
 /// secret is never written to a log or an exception message.
 /// </remarks>
 public sealed class SkeinServiceApiClient
@@ -530,6 +538,7 @@ public sealed class SkeinServiceApiClient
     {
         using var req = new HttpRequestMessage(HttpMethod.Get, InstanceConfigBootstrap.Path);
         req.Headers.TryAddWithoutValidation(SkeinHeaders.InternalSecret, _internalSecret);
+        SkeinHeaders.MarkServiceCall(req.Headers);
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         if (resp.StatusCode != HttpStatusCode.OK)
@@ -579,6 +588,7 @@ public sealed class SkeinServiceApiClient
             Content = JsonContent.Create(new ProjectAccessRequest(queries), options: JsonOpts),
         };
         req.Headers.TryAddWithoutValidation(SkeinHeaders.InternalSecret, _internalSecret);
+        SkeinHeaders.MarkServiceCall(req.Headers);
 
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
         if (resp.StatusCode != HttpStatusCode.OK)
@@ -708,8 +718,9 @@ public sealed record AccountApiResult(HttpStatusCode Status, string Body);
 /// <see cref="InternalApiHandler"/>, so a logged-in tab calling a public route
 /// (a password reset, say) never puts its <c>X-Skein-User-*</c> on these
 /// calls. Each request is built fresh — nothing the browser sent is copied —
-/// and carries only <c>X-Skein-Internal-Secret</c> and, when the controller
-/// supplies a trusted client address, <c>X-Skein-Client-Ip</c>.</para>
+/// and carries only <c>X-Skein-Internal-Secret</c>, the service-call marker
+/// (<see cref="SkeinHeaders.ServiceCall"/>) and, when the controller supplies
+/// a trusted client address, <c>X-Skein-Client-Ip</c>.</para>
 /// <para>Retries (<see cref="SkeinApiRetryPolicy"/>) apply to the GET routes
 /// only, wired in <see cref="Register"/>: a POST that reached skein-api and
 /// failed after committing (signup) must not be replayed into a misleading
@@ -796,6 +807,7 @@ public sealed class SkeinAccountsApiClient
             req.Content = JsonContent.Create(body, body.GetType(), options: JsonOpts);
         }
         req.Headers.TryAddWithoutValidation(SkeinHeaders.InternalSecret, _internalSecret);
+        SkeinHeaders.MarkServiceCall(req.Headers);
         if (!string.IsNullOrEmpty(clientIp))
         {
             req.Headers.TryAddWithoutValidation(SkeinHeaders.ClientIp, clientIp);
