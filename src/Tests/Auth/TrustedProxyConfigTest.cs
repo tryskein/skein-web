@@ -2,6 +2,7 @@ using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using SkeinWeb.Auth;
@@ -254,5 +255,78 @@ public class TrustedProxyConfigTest
         Assert.Equal(ForwardedHeaders.None, opts.ForwardedHeaders);
         Assert.Equal([sentinel], opts.KnownProxies);
         Assert.Empty(opts.KnownIPNetworks);
+    }
+
+    // ---- Contains: one definition of a trusted transport peer (US-4, K7) ----
+
+    [Theory]
+    [InlineData("10.0.0.1", true)]
+    [InlineData("::ffff:10.0.0.1", true)]
+    [InlineData("10.244.3.4", true)]
+    [InlineData("::ffff:10.244.3.4", true)]
+    [InlineData("10.0.0.2", false)]
+    [InlineData("::ffff:10.0.0.2", false)]
+    [InlineData("203.0.113.7", false)]
+    public void Contains_ListedIpOrNetwork_InEitherAddressForm(string peer, bool expected)
+    {
+        var config = TrustedProxyConfig.FromEntries(["10.0.0.1", "10.244.0.0/16"]);
+
+        Assert.Equal(expected, config.Contains(IPAddress.Parse(peer)));
+    }
+
+    [Theory]
+    [InlineData("127.0.0.1")]
+    [InlineData("::1")]
+    public void Contains_EmptyList_TrustsNoPeer(string peer)
+    {
+        var config = TrustedProxyConfig.FromEntries([]);
+
+        Assert.False(config.Contains(IPAddress.Parse(peer)));
+    }
+
+    // ---- Startup Warning: empty list in the legacy trust-headers mode (K12, SC-007) ----
+
+    private const string Authority = "https://keycloak.example.com/realms/skein";
+
+    /// <summary>Records level and formatted message of every entry.</summary>
+    private sealed class RecordingLogger : ILogger
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
+    }
+
+    private static bool WarnsNamingTheSetting(string apiAuthMode, string? authority, string[] trustedProxies)
+    {
+        var logger = new RecordingLogger();
+
+        TrustedProxyConfig.FromEntries(trustedProxies)
+            .WarnIfTrustHeadersRefused(WebAuthMode.FromApi(apiAuthMode, authority), logger);
+
+        return logger.Entries.Any(e =>
+            e.Level == LogLevel.Warning && e.Message.Contains("SKEIN_TRUSTED_PROXIES", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    // Legacy trust-headers mode, both arms: SSO without an OIDC authority.
+    [InlineData("keycloak", null, new string[0], true)]
+    [InlineData("hybrid", null, new string[0], true)]
+    // Modes that never read trust headers.
+    [InlineData("local", null, new string[0], false)]
+    [InlineData("keycloak", Authority, new string[0], false)]
+    [InlineData("hybrid", Authority, new string[0], false)]
+    // A non-empty list in the legacy mode.
+    [InlineData("keycloak", null, new[] { "10.0.0.1" }, false)]
+    [InlineData("hybrid", null, new[] { "10.0.0.1" }, false)]
+    public void StartupWarning_EmptyListInLegacyTrustHeadersMode_NamesTheSetting(
+        string apiAuthMode, string? authority, string[] trustedProxies, bool expected)
+    {
+        Assert.Equal(expected, WarnsNamingTheSetting(apiAuthMode, authority, trustedProxies));
     }
 }
