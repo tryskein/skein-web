@@ -174,10 +174,12 @@ public sealed class TrustedProxyConfig
     }
 
     /// <summary>
-    /// Configure <see cref="ForwardedHeadersOptions"/> as the BFF's SINGLE source
-    /// of truth for forwarded-header handling (replacing the framework's
-    /// ASPNETCORE_FORWARDEDHEADERS_ENABLED path — two configs on the same DI
-    /// options would fight and double-register the middleware).
+    /// Fill the <see cref="ForwardedHeadersOptions"/> of the BFF's one
+    /// forwarded-headers pass, the one <c>SkeinEdgePipeline.UseSkeinEdge</c> runs
+    /// after the transport peer is recorded. That pass uses its own options
+    /// object, filled here from this list; the DI options, read only by a pass
+    /// the host may add itself, are set to apply nothing in
+    /// <c>SkeinEdgePipeline.AddSkeinEdge</c>.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -220,7 +222,7 @@ public sealed class TrustedProxyConfig
     /// SKEIN_TRUSTED_PROXIES and gets the header gated like the other two.
     /// </para>
     /// </remarks>
-    /// <param name="o">The options the ForwardedHeaders middleware reads.</param>
+    /// <param name="o">The options object of the edge's forwarded-headers pass.</param>
     public void Apply(ForwardedHeadersOptions o)
     {
         // Drop the framework's loopback defaults: the allowlist below is the

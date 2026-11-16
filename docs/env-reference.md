@@ -425,15 +425,16 @@ operator will come across them anyway.
   check.
 - **`ASPNETCORE_URLS`** — not read by application code; the listen address is
   built from `PORT` and applied with `UseUrls`. Use `PORT`.
-- **`ASPNETCORE_FORWARDEDHEADERS_ENABLED`** — a framework flag that **no
-  longer has any effect** on skein-web. A trusted proxy is declared only through
+- **`ASPNETCORE_FORWARDEDHEADERS_ENABLED`** — a framework flag that has **no
+  effect** on skein-web. A trusted proxy is declared only through
   `SKEIN_TRUSTED_PROXIES`: `X-Forwarded-*` are applied exactly once, at the edge
   of skein-web's pipeline, after the transport peer is recorded, by the rules of
   that setting. The forwarded-headers pass the flag makes the default web host
-  add in front of the pipeline is configured to apply nothing. An installation
-  that set the flag and left `SKEIN_TRUSTED_PROXIES` empty does not get the
-  client address or the host from `X-Forwarded-*` (see
-  `SKEIN_TRUSTED_PROXIES`, "If unset"): set the list to the proxy address(es).
+  add in front of the pipeline is configured to apply nothing. The flag never
+  granted trust: before, its extra pass used the same `SKEIN_TRUSTED_PROXIES`
+  rules. The only change for an installation that sets it is behind a chain of
+  trusted proxies: the client address is now taken from one hop of
+  `X-Forwarded-For`, where the extra pass could peel a second one.
 - **`Authentication:Keycloak:Issuer` / `:Audience` / `:JwksUri` /
   `:JwksCacheDuration`** — present in `appsettings.json` but **dead**: no class
   binds them (`SsoOptions` has no `Keycloak` member) and no code reads them. In
