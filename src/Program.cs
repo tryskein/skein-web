@@ -315,15 +315,13 @@ builder.Services.AddSingleton<ActionRateLimiter>();
 // and the OIDC callback needs the https scheme (sk-163.17). Operators putting
 // skein-web behind a proxy (S10) MUST populate this with the proxy's
 // address(es) — it is required, not optional, for a public surface.
-// PostConfigure (NOT Configure): runs AFTER every IConfigureOptions callback,
-// including the one the ASPNETCORE_FORWARDEDHEADERS_ENABLED hosting-startup
-// registers. This guarantees Apply is the final word on ForwardedHeadersOptions
-// regardless of that env flag's presence or registration order — so the sk-163
-// image is safe to deploy under the current configmap (env flag still set) AND
-// after it's removed, with no window where the env flag's defaults override
-// Apply's Proto/Host + trusted-proxy gating. (sk-163.17)
-// AddSkeinEdge registers the parsed list and that PostConfigure; UseSkeinEdge
-// below runs the matching links.
+// Forwarded headers are processed exactly ONCE, inside UseSkeinEdge below,
+// after the transport peer is recorded, with options built from this list.
+// ASPNETCORE_FORWARDEDHEADERS_ENABLED does not change that: with the flag set
+// the default web host puts its own UseForwardedHeaders() in front of the whole
+// pipeline, but AddSkeinEdge sets the DI ForwardedHeadersOptions that pass reads
+// to process nothing (PostConfigure, after the host's own Configure), so it
+// leaves the request as it came. AddSkeinEdge also registers the parsed lists.
 builder.Services.AddSkeinEdge(trustedProxies, allowedHosts);
 
 // ---- Reverse-proxy middleware ----------------------------------------------

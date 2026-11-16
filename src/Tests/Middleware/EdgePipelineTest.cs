@@ -5,6 +5,7 @@ using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -123,10 +124,25 @@ public sealed class EdgePipelineTest
         public RecordingApi Api { get; }
         public CapturingLogs Logs { get; } = new();
 
-        public World(string apiAuthMode, string[] trustedProxies, string allowedHosts = "", long apiEpoch = 3)
+        /// <param name="apiAuthMode">skein-api <c>authMode</c>; no OIDC authority (legacy trust headers).</param>
+        /// <param name="trustedProxies">Entries of <c>SKEIN_TRUSTED_PROXIES</c>.</param>
+        /// <param name="allowedHosts">Raw <c>SKEIN_ALLOWED_HOSTS</c>.</param>
+        /// <param name="apiEpoch">Session epoch the skein-api stand-in answers with.</param>
+        /// <param name="likeTheHost">Build the pipeline the way the web host does when
+        /// it starts: the application's links wrapped by every registered
+        /// <see cref="IStartupFilter"/>, the default host's included.</param>
+        /// <param name="forwardedHeadersFlag">Run with <c>ForwardedHeaders_Enabled=true</c>
+        /// (what <c>ASPNETCORE_FORWARDEDHEADERS_ENABLED=true</c> sets).</param>
+        public World(
+            string apiAuthMode, string[] trustedProxies, string allowedHosts = "", long apiEpoch = 3,
+            bool likeTheHost = false, bool forwardedHeadersFlag = false)
         {
             Api = new RecordingApi(apiEpoch);
-            var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
+            var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+            {
+                EnvironmentName = "Testing",
+                Args = forwardedHeadersFlag ? ["--ForwardedHeaders_Enabled=true"] : [],
+            });
             builder.Logging.ClearProviders();
             builder.Logging.SetMinimumLevel(LogLevel.Trace);
             builder.Logging.AddProvider(Logs);
@@ -157,17 +173,37 @@ public sealed class EdgePipelineTest
             services.AddTransient<SsoSessionMiddleware>();
 
             _app = builder.Build();
-            _app.UseSkeinEdge();
-            _app.UseAuthentication();
-            _app.UseMiddleware<SsoSessionMiddleware>();
-            _app.Run(ctx =>
+            if (!likeTheHost)
+            {
+                Configure(_app);
+                _pipeline = ((IApplicationBuilder)_app).Build();
+                return;
+            }
+
+            // As the web host composes it on start: the startup filters wrap the
+            // application's configuration, the last registered innermost.
+            Action<IApplicationBuilder> configure = Configure;
+            foreach (var filter in _app.Services.GetServices<IStartupFilter>().Reverse())
+            {
+                configure = filter.Configure(configure);
+            }
+            var hostBuilder = new ApplicationBuilder(_app.Services);
+            configure(hostBuilder);
+            _pipeline = hostBuilder.Build();
+        }
+
+        private void Configure(IApplicationBuilder app)
+        {
+            app.UseSkeinEdge();
+            app.UseAuthentication();
+            app.UseMiddleware<SsoSessionMiddleware>();
+            app.Run(ctx =>
             {
                 _reached = true;
                 _seenUser = ctx.User;
                 _seenRemoteIp = ctx.Connection.RemoteIpAddress;
                 return Task.CompletedTask;
             });
-            _pipeline = ((IApplicationBuilder)_app).Build();
         }
 
         public async Task<Outcome> Send(string peer, Action<HttpContext> arrange)
@@ -501,6 +537,72 @@ public sealed class EdgePipelineTest
 
         Assert.Equal(StatusCodes.Status400BadRequest, outcome.Status);
         Assert.Equal("invalid_host", outcome.Error);
+        Assert.False(outcome.Reached);
+    }
+
+    // ---- One pass of forwarded headers, after the snapshot, whatever the host flag ----
+
+    public static TheoryData<bool, string> HostFlagByPeerForm()
+    {
+        var data = new TheoryData<bool, string>();
+        foreach (var flag in new[] { true, false })
+        {
+            data.Add(flag, "10.0.0.1");
+            data.Add(flag, "::ffff:10.0.0.1");
+        }
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(HostFlagByPeerForm))]
+    public async Task HostComposedPipeline_TrustedPeer_GetsASession_WhateverTheForwardedHeadersFlag(
+        bool forwardedHeadersFlag, string peer)
+    {
+        var world = new World("keycloak", ["10.0.0.1"], likeTheHost: true, forwardedHeadersFlag: forwardedHeadersFlag);
+
+        var outcome = await world.Send(peer, ctx =>
+        {
+            TrustHeaders(ctx);
+            ctx.Request.Headers["X-Forwarded-For"] = "198.51.100.23";
+        });
+
+        var provision = Assert.Single(outcome.Provisions);
+        Assert.True(outcome.SetCookie);
+        Assert.Equal(IPAddress.Parse("198.51.100.23"), outcome.RemoteIp);
+        Assert.True(provision.Headers.TryGetValues(SkeinHeaders.ClientIp, out var clientIp));
+        Assert.Equal(["198.51.100.23"], clientIp);
+    }
+
+    public static TheoryData<bool, string[]> HostFlagByAmbiguousForwardedHost()
+    {
+        var data = new TheoryData<bool, string[]>();
+        foreach (var flag in new[] { true, false })
+        {
+            data.Add(flag, ["skein.example.com, skein.example.com"]);
+            data.Add(flag, ["skein.example.com", "skein.example.com"]);
+            data.Add(flag, [""]);
+        }
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(HostFlagByAmbiguousForwardedHost))]
+    public async Task HostComposedPipeline_AmbiguousForwardedHostFromATrustedPeer_Is400InvalidHost_WhateverTheFlag(
+        bool forwardedHeadersFlag, string[] forwardedHost)
+    {
+        var world = new World(
+            "keycloak", ["10.0.0.1"], allowedHosts: "skein.example.com",
+            likeTheHost: true, forwardedHeadersFlag: forwardedHeadersFlag);
+
+        var outcome = await world.Send("10.0.0.1", ctx =>
+        {
+            TrustHeaders(ctx);
+            ctx.Request.Headers["X-Forwarded-Host"] = new StringValues(forwardedHost);
+        });
+
+        Assert.Equal(StatusCodes.Status400BadRequest, outcome.Status);
+        Assert.Equal("invalid_host", outcome.Error);
+        Assert.Empty(outcome.Provisions);
         Assert.False(outcome.Reached);
     }
 }
