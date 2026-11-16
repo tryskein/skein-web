@@ -55,6 +55,9 @@ public class AuthConfigControllerTest
 
         public int Calls { get; private set; }
 
+        /// <summary>Values of <c>X-Skein-Service-Call</c> on each call, empty when absent.</summary>
+        public List<string[]> Markers { get; } = [];
+
         public static HttpResponseMessage Ok(string body) => new(HttpStatusCode.OK)
         {
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
@@ -63,6 +66,7 @@ public class AuthConfigControllerTest
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             Calls++;
+            Markers.Add(request.Headers.TryGetValues("X-Skein-Service-Call", out var values) ? values.ToArray() : []);
             Assert.Equal(InstanceConfigBootstrap.Path, request.RequestUri!.AbsolutePath);
             return Task.FromResult(Answer());
         }
@@ -106,6 +110,19 @@ public class AuthConfigControllerTest
         string logoutRedirectUrl = "",
         string mcpUrl = "") =>
         OkBody(Controller(WebAuthMode.FromApi(apiAuthMode, authority), new InstanceConfigApi(), logoutRedirectUrl, mcpUrl));
+
+    // ---- sk-998 row 12 (SC-004): every GET /api/auth/config reads the
+    // installation settings as a service call, X-Skein-Service-Call: 1 ----
+
+    [Fact]
+    public async Task Get_ReadsTheInstallationSettings_WithTheServiceCallMarker()
+    {
+        var api = new InstanceConfigApi();
+
+        await OkBody(Controller(WebAuthMode.FromApi("local", null), api));
+
+        Assert.Equal(["1"], Assert.Single(api.Markers));
+    }
 
     // ---- row 224 (D-7): authMode token from the mode taken from skein-api ----
 

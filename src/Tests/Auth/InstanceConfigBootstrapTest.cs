@@ -1,5 +1,11 @@
 using System.Net;
 using System.Text;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 using SkeinWeb.Auth;
@@ -208,6 +214,42 @@ public class InstanceConfigBootstrapTest
 
         await Assert.ThrowsAsync<InstanceConfigUnavailableException>(() => run.Load);
         Assert.Equal(1, run.Handler.Attempts);
+    }
+
+    // sk-998 row 13 (SC-004): the startup read goes through the client
+    // Program.cs builds — CreateHttpClient — and carries the channel secret
+    // and the service-call marker. skein-api is a recorder on a loopback
+    // Kestrel port: CreateHttpClient makes its own HttpClient, so the
+    // transport is the only seam.
+    [Fact]
+    public async Task StartupClient_SendsTheSecretAndTheServiceCallMarker()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var recorded = new List<(string?[] Secret, string?[] Marker)>();
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        await using var api = builder.Build();
+        api.MapGet("/ui/v1/internal/instance-config", (HttpRequest request) =>
+        {
+            lock (recorded)
+            {
+                recorded.Add((
+                    request.Headers["X-Skein-Internal-Secret"].ToArray(),
+                    request.Headers["X-Skein-Service-Call"].ToArray()));
+            }
+            return Results.Text(HybridLiteral, "application/json");
+        });
+        await api.StartAsync(ct);
+        var address = api.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
+
+        using var http = InstanceConfigBootstrap.CreateHttpClient(address, "boot-secret");
+        var config = await InstanceConfigBootstrap.LoadAsync(
+            http, TimeSpan.FromSeconds(30), TimeProvider.System, NullLogger.Instance, ct);
+
+        Assert.Equal("hybrid", config.AuthMode);
+        var (secret, marker) = Assert.Single(recorded);
+        Assert.Equal(["boot-secret"], secret);
+        Assert.Equal(["1"], marker);
     }
 
     [Fact]
