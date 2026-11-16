@@ -290,6 +290,36 @@ public sealed class EdgePipelineTest
         Assert.True(IsAnonymous(outcome.User));
     }
 
+    public static TheoryData<string, string> LegacyModesByLoneTrustHeader()
+    {
+        var data = new TheoryData<string, string>();
+        foreach (var mode in new[] { "keycloak", "hybrid" })
+        {
+            data.Add(mode, "X-Auth-Request-Email");
+            data.Add(mode, "X-Auth-Request-User");
+        }
+        return data;
+    }
+
+    // Either trust header alone, from an untrusted peer, is refused the same
+    // way as both: no session, and the refusal Warning.
+    [Theory]
+    [MemberData(nameof(LegacyModesByLoneTrustHeader))]
+    public async Task UntrustedPeer_WithOneTrustHeader_GetsNoSession_AndTheRefusalWarning(string mode, string header)
+    {
+        var world = new World(mode, ["10.0.0.1"]);
+
+        var outcome = await world.Send("203.0.113.9", ctx =>
+            ctx.Request.Headers[header] = header == "X-Auth-Request-Email" ? VisitorEmail : VisitorUsername);
+
+        Assert.Empty(outcome.Provisions);
+        Assert.False(outcome.SetCookie);
+        Assert.True(outcome.Reached);
+        Assert.True(IsAnonymous(outcome.User));
+        Assert.Contains(world.SsoLogs, e =>
+            e.Level == LogLevel.Warning && e.Text.Contains("SKEIN_TRUSTED_PROXIES", StringComparison.Ordinal));
+    }
+
     public static TheoryData<string, string> LegacyModesByPeerForm()
     {
         var data = new TheoryData<string, string>();
