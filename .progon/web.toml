@@ -1,0 +1,58 @@
+schema = 1
+root = ".."
+
+[defaults]
+adapter = "dotnet"
+image = "mcr.microsoft.com/dotnet/sdk:10.0"
+prepare_image = true
+network = "grant"
+nuget_cache = true
+memory_mib = 4096
+cpu = 2
+
+[kind.unit]
+[kind.unit.options]
+project = "src/Tests/SkeinWeb.Tests.csproj"
+[kind.unit.selection]
+filter = "Category!=Integration"
+
+# Session revocation through real NATS subscriptions and the shared Redis ticket store.
+[kind.integ]
+[kind.integ.env]
+TEST_NATS_URL = "nats://nats:4222"
+TEST_NATS_MONITOR_URL = "http://nats:8222/"
+TEST_REDIS_URL = "redis:6379"
+[kind.integ.options]
+project = "src/Tests/SkeinWeb.Tests.csproj"
+[kind.integ.selection]
+filter = "Category=Integration"
+[[kind.integ.fixture]]
+name = "nats"
+image = "nats:2.10-alpine"
+pull = true
+cpu = 0.5
+memory_mib = 128
+command = ["-m", "8222"]
+ready = ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+[[kind.integ.fixture]]
+name = "redis"
+image = "redis:7-alpine"
+pull = true
+cpu = 0.5
+memory_mib = 128
+command = ["redis-server", "--appendonly", "no"]
+ready = ["redis-cli", "ping"]
+
+# Stryker.NET through Microsoft Testing Platform (the test project runs on VSTest
+# by default; the run swaps the xUnit package inside the snapshot only).
+[kind.mutation]
+adapter = "stryker-net"
+cpu = 4
+memory_mib = 8192
+timeout_seconds = 7200
+workdir = "src/Tests"
+prepare = ["sed -i 's/xunit.v3.mtp-off/xunit.v3.mtp-v2/' SkeinWeb.Tests.csproj"]
+[kind.mutation.options]
+install = "dotnet tool install --tool-path /work/.progon/tools dotnet-stryker"
+command = ["/work/.progon/tools/dotnet-stryker"]
+args = ["--test-runner", "mtp"]

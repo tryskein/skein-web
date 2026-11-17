@@ -111,6 +111,22 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 | source-reading checks | not used | — | — | — | — |
 | artifact contract | not used | — | — | — | — |
 
+### Running on the test VMs (progon)
+
+The profile is `.progon/web.toml`; run from the repository root:
+
+| Kind | Command | Narrowed run |
+|---|---|---|
+| unit | `progon web unit` | `progon web unit 'FullyQualifiedName~<Class or Method>'` |
+| integ | `progon web integ` | `progon web integ 'FullyQualifiedName~<Class or Method>'` |
+| mutation | `progon web mutation '<glob>'` | the globs are Stryker `--mutate` targets, e.g. `'**/Health/*.cs'` |
+
+`integ` starts NATS and Redis fixtures and sets `TEST_NATS_URL`,
+`TEST_NATS_MONITOR_URL` and `TEST_REDIS_URL`. `mutation` runs Stryker.NET on the
+Microsoft Testing Platform: the run swaps `xunit.v3.mtp-off` for
+`xunit.v3.mtp-v2` in the snapshot's test project only, never in the repository.
+A full mutation run is long; always name targets.
+
 ### Project specifics
 
 - Session revocation is tested against isolated NATS and Redis containers;
