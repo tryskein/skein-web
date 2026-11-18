@@ -1,4 +1,8 @@
+using System.Net;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using SkeinWeb.Auth;
 using StackExchange.Redis;
@@ -235,5 +239,77 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.False(await Db.KeyExistsAsync(rolledBack));
         Assert.Equal(SessionStoreMigration.MarkerValue, await Db.StringGetAsync(SessionStoreMigration.MarkerKey));
+    }
+}
+
+/// <summary>
+/// A value of the former purpose is rejected at the format boundary, under both names and in both
+/// modes, while a value of the current purpose on the same keyring and row is accepted (US-6, SC-011, SC-013).
+/// </summary>
+[Trait("Category", "Integration")]
+[Collection("session-pipeline")]
+public sealed class SessionFormatRejectionTest
+{
+    private static readonly Guid Alice = Guid.Parse("0199a1b2-0000-7000-8000-00000000000a");
+
+    private static AuthenticationTicket Ticket(string key) => new(
+        new System.Security.Claims.ClaimsPrincipal(new System.Security.Claims.ClaimsIdentity(
+            [new System.Security.Claims.Claim("Microsoft.AspNetCore.Authentication.Cookies-SessionId", key)], "Cookies")),
+        "Cookies");
+
+    [RedisTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AValueOfTheFormerPurpose_IsRejectedUnderBothNames_AndTheCurrentOneIsAccepted(bool insecureHttp)
+    {
+        await using var host = await SessionPipelineHost.StartAsync(insecureHttp);
+        var (_, key, _) = await host.SignInAsync(Alice); // a LIVE row under this key
+        var former = new TicketDataFormat(host.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector(
+            "Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationMiddleware", "Cookies", "v2"));
+        var current = host.Services.GetRequiredService<TicketDataFormat>();
+
+        foreach (var name in new[] { "skein.sid", "__Host-skein.sid" })
+        {
+            var old = await host.SendAsync("/test/me", $"{name}={Uri.EscapeDataString(former.Protect(Ticket(key)))}");
+            Assert.Equal(HttpStatusCode.Unauthorized, old.Status);
+        }
+        var fresh = await host.SendAsync("/test/me", $"{host.CookieName}={Uri.EscapeDataString(current.Protect(Ticket(key)))}");
+        Assert.Equal(HttpStatusCode.OK, fresh.Status); // control, and (insecure mode) the new skein.sid works
+    }
+
+    [RedisFact]
+    public async Task AFormerHashWithALongTtl_AndAFormerCookie_AreRejected()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var key = "skein:session:legacy-" + Guid.NewGuid().ToString("N");
+        await host.Db.HashSetAsync(key, [new HashEntry("absexp", -1), new HashEntry("sldexp", 86400), new HashEntry("data", new byte[] { 1 })]);
+        await host.Db.KeyExpireAsync(key, TimeSpan.FromDays(30));
+        var former = new TicketDataFormat(host.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector(
+            "Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationMiddleware", "Cookies", "v2"));
+
+        var reply = await host.SendAsync("/test/me", $"{host.CookieName}={Uri.EscapeDataString(former.Protect(Ticket(key)))}");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, reply.Status);
+    }
+
+    [RedisFact]
+    public async Task AfterTheCleanup_AReaderOfTheFormerVersionAcceptsNothingOfThisOne()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var (cookie, key, set) = await host.SignInAsync(Alice);
+        var preUpdate = "skein:session:legacy-" + Guid.NewGuid().ToString("N");
+        await host.Db.HashSetAsync(preUpdate, [new HashEntry("absexp", -1), new HashEntry("sldexp", 86400), new HashEntry("data", new byte[] { 1 })]);
+        await host.Db.KeyDeleteAsync(SessionStoreMigration.MarkerKey);
+
+        await new SessionStoreMigration(host.Mux, TimeProvider.System, Microsoft.Extensions.Logging.Abstractions.NullLogger<SessionStoreMigration>.Instance)
+            .RunAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
+
+        // The reader of the former version: its cookie purpose and HGETALL of the row.
+        var former = new TicketDataFormat(host.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector(
+            "Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationMiddleware", "Cookies", "v2"));
+        Assert.Null(former.Unprotect(Uri.UnescapeDataString(set.Value))); // the cookie of this version
+        await Assert.ThrowsAsync<RedisServerException>(() => host.Db.HashGetAllAsync(key)); // WRONGTYPE: a string row
+        Assert.Empty(await host.Db.HashGetAllAsync(preUpdate)); // the row issued before the update is gone
+        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/me", cookie)).Status); // this version still works
     }
 }
