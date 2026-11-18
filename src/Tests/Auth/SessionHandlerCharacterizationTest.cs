@@ -259,10 +259,11 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
     public async Task Q4_Control_WithoutSuppressionARotationYieldsTwoSessionCookies()
     {
         await using var stand = await Stand.StartAsync();
-        var (cookie, _) = await stand.SeedAsync();
+        var (cookie, oldKey) = await stand.SeedAsync();
         stand.Time.Advance(TimeSpan.FromHours(13));
 
         var reply = await stand.GetAsync("/rotate?revoke=0&suppress=0", cookie);
+        Dump(stand, reply, oldKey);
 
         Assert.Equal(2, reply.SessionCookies(stand.CookieName).Count);
     }
@@ -276,6 +277,7 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         stand.Store.ResetCounters();
 
         var reply = await stand.GetAsync("/rotate?revoke=1&suppress=1", cookie);
+        Dump(stand, reply, oldKey);
 
         var set = Assert.Single(reply.SessionCookies(stand.CookieName));
         var newKey = stand.KeyOf(set);
@@ -310,6 +312,19 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         Assert.Contains(reply.Cookies, c => c.Name == stand.CookieName && c.IsDeletion);
         Assert.False(stand.Store.Rows.ContainsKey(key));
         Assert.True(stand.Store.RemoveCalls >= 1);
+    }
+
+    private void Dump(Stand stand, Reply reply, string oldKey)
+    {
+        output.WriteLine($"status {reply.Status}, old key {oldKey}, errors {stand.Errors.Count}");
+        foreach (var c in reply.Cookies)
+        {
+            output.WriteLine($"Set-Cookie {c.Name} deletion={c.IsDeletion} key={(c.Name == stand.CookieName && !c.IsDeletion ? stand.KeyOf(c) : "-")}");
+        }
+        foreach (var e in stand.Errors)
+        {
+            output.WriteLine($"error: {e.Message}");
+        }
     }
 
     // ---- Q5: a remote (OIDC-shaped) callback ------------------------------------------------
