@@ -62,6 +62,7 @@ public class AuthControllerLogoutTest
 
         var services = new ServiceCollection();
         services.AddSingleton(authService.Object);
+        services.AddSingleton(SkeinWeb.Tests.Auth.TestRedis.RevokingStore());
         if (registry is not null)
         {
             services.AddSingleton(registry);

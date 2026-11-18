@@ -48,15 +48,16 @@ public class AuthModeMappingTest
     public void Mapper_UnknownApiMode_HasNoDefault(string? apiMode) =>
         Assert.Throws<InvalidOperationException>(() => WebAuthMode.FromApi(apiMode, Authority));
 
-    // Same table, with the scheme set each row must register written out.
+    // Same table, with the scheme set each row must register written out: the session is read by
+    // Cookies and every new authentication is signed into Skein.Issue.
     public static TheoryData<string, string?, string[], WebAuthKind, bool> RegistrationTable => new()
     {
-        { "local", null, ["Cookies"], WebAuthKind.Local, false },
-        { "local", Authority, ["Cookies"], WebAuthKind.Local, false },
-        { "keycloak", null, ["Cookies"], WebAuthKind.Keycloak, false },
-        { "keycloak", Authority, ["Cookies", "OpenIdConnect"], WebAuthKind.KeycloakOidc, false },
-        { "hybrid", null, ["Cookies"], WebAuthKind.Keycloak, true },
-        { "hybrid", Authority, ["Cookies", "OpenIdConnect"], WebAuthKind.KeycloakOidc, true },
+        { "local", null, ["Cookies", "Skein.Issue"], WebAuthKind.Local, false },
+        { "local", Authority, ["Cookies", "Skein.Issue"], WebAuthKind.Local, false },
+        { "keycloak", null, ["Cookies", "Skein.Issue"], WebAuthKind.Keycloak, false },
+        { "keycloak", Authority, ["Cookies", "OpenIdConnect", "Skein.Issue"], WebAuthKind.KeycloakOidc, false },
+        { "hybrid", null, ["Cookies", "Skein.Issue"], WebAuthKind.Keycloak, true },
+        { "hybrid", Authority, ["Cookies", "OpenIdConnect", "Skein.Issue"], WebAuthKind.KeycloakOidc, true },
     };
 
     [Theory]

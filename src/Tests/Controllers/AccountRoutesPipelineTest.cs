@@ -10,6 +10,7 @@ using SkeinWeb.Auth;
 using SkeinWeb.Controllers;
 using SkeinWeb.Hubs;
 using SkeinWeb.Middleware;
+using SkeinWeb.Tests.Auth;
 using StackExchange.Redis;
 
 namespace SkeinWeb.Tests.Controllers;
@@ -32,6 +33,7 @@ namespace SkeinWeb.Tests.Controllers;
 /// cookie does carry the identity — the cookie is a working session. Without
 /// a cookie <c>/api/v1</c> stays 401 and is not forwarded.
 /// </remarks>
+[Trait("Category", "Integration")]
 public sealed class AccountRoutesPipelineTest : IAsyncLifetime
 {
     private const string AuthResponseU1 = """
@@ -85,19 +87,28 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
     }
 
     private readonly RecordingApi _api = new();
-    private WebApplication _app = null!;
+    private WebApplication? _app;
+    private ConnectionMultiplexer? _redis;
     private Uri _base = null!;
 
     public async ValueTask InitializeAsync()
     {
+        if (string.IsNullOrWhiteSpace(TestRedis.Url))
+        {
+            return; // every test of the class is skipped without the harness Redis
+        }
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions { EnvironmentName = "Testing" });
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         var services = builder.Services;
 
-        var mux = new Mock<IConnectionMultiplexer>();
-        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(new Mock<IDatabase>().Object);
-        services.AddSingleton(mux.Object);
-        services.AddDistributedMemoryCache();
+        // The sign-up route issues a session, so the store is a real Redis (database 13). The cookie
+        // is sent over http, so the composition is the Development insecure-http mode: without it
+        // the __Host- prefixed Secure cookie would not come back.
+        _redis = TestRedis.Connect(13);
+        _redis.GetServers().First(s => !s.IsReplica).FlushDatabase(13);
+        services.AddSingleton<IConnectionMultiplexer>(_redis);
+        services.AddDataProtection();
+        services.AddSingleton(new SessionCookiePolicy(AllowInsecureHttp: true));
         services.AddSingleton<RedisTicketStore>();
         services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
         services.AddSingleton(TimeProvider.System);
@@ -133,7 +144,18 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         _base = new Uri(address);
     }
 
-    public ValueTask DisposeAsync() => _app.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        if (_app is not null)
+        {
+            await _app.DisposeAsync();
+        }
+        if (_redis is not null)
+        {
+            _redis.GetServers().First(s => !s.IsReplica).FlushDatabase(13);
+            _redis.Dispose();
+        }
+    }
 
     private HttpClient Browser(CookieContainer? cookies = null) =>
         new(new HttpClientHandler { CookieContainer = cookies ?? new CookieContainer(), UseCookies = true })
@@ -164,7 +186,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
             h.Key.Equals(SkeinHeaders.Username, StringComparison.OrdinalIgnoreCase) ||
             h.Key.Equals(SkeinHeaders.SessionEpoch, StringComparison.OrdinalIgnoreCase));
 
-    [Fact]
+    [RedisFact]
     public async Task EveryPublicPath_AnswersWithoutSession_AndReachesApiWithoutIdentity()
     {
         using var browser = Browser();
@@ -185,7 +207,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
 
     // sk-998 row 14 (SC-004, US-3): each public account route is a service
     // call — exactly one request to skein-api, carrying X-Skein-Service-Call: 1.
-    [Fact]
+    [RedisFact]
     public async Task EveryPublicPath_ReachesApiOnce_WithTheServiceCallMarker()
     {
         using var browser = Browser();
@@ -205,7 +227,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
     // sk-998 row 15 (INV-2, SC-004, edge "browser forges the marker"): the
     // /api/v1 proxy — the real AddProxyHttpClient with InternalApiHandler —
     // forwards a browser request that sent the marker without it.
-    [Theory]
+    [RedisTheory]
     [InlineData("X-Skein-Service-Call")]
     [InlineData("x-skein-service-call")]
     public async Task ProxiedRequest_WithAForgedMarker_ReachesApiWithoutIt(string headerName)
@@ -230,7 +252,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         Assert.Empty(ServiceCallMarker(sent));
     }
 
-    [Fact]
+    [RedisFact]
     public async Task WithASessionCookie_PublicPathsStillCarryNoIdentity_WhileTheProxyDoes()
     {
         var cookies = new CookieContainer();
@@ -257,7 +279,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         Assert.True(CarriesIdentity(Assert.Single(_api.Requests[mark..])));
     }
 
-    [Fact]
+    [RedisFact]
     public async Task ApiV1_WithoutSession_Is401_AndNotForwarded()
     {
         using var browser = Browser();

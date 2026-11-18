@@ -65,6 +65,21 @@ internal static class TestRedis
         return mux.Object;
     }
 
+    /// <summary>
+    /// A store over a Redis that answers every revocation script with "a row was deleted": for the
+    /// tests that only need the end of a session to complete (the effective key is revoked, the
+    /// cookie scheme is signed out).
+    /// </summary>
+    public static RedisTicketStore RevokingStore()
+    {
+        var db = new Mock<IDatabase>();
+        db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisResult.Create((RedisValue)1, ResultType.Integer));
+        var mux = new Mock<IConnectionMultiplexer>();
+        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
+        return Store(mux.Object);
+    }
+
     public static RedisTicketStore Store(IConnectionMultiplexer mux) =>
         new(mux, NullLogger<RedisTicketStore>.Instance);
 

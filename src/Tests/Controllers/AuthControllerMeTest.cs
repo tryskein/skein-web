@@ -66,6 +66,7 @@ public class AuthControllerMeTest
             .Returns(Task.CompletedTask);
         var services = new ServiceCollection();
         services.AddSingleton(auth.Object);
+        services.AddSingleton(SkeinWeb.Tests.Auth.TestRedis.RevokingStore());
         services.AddSingleton<ProblemDetailsFactory, PlainProblemDetailsFactory>();
         var ctx = new DefaultHttpContext
         {

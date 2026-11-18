@@ -57,6 +57,7 @@ public class ApiProxyMiddlewareSessionRevokedTest
             .Returns(Task.CompletedTask);
         var services = new ServiceCollection();
         services.AddSingleton(auth.Object);
+        services.AddSingleton(SkeinWeb.Tests.Auth.TestRedis.RevokingStore());
 
         var ctx = new DefaultHttpContext { RequestServices = services.BuildServiceProvider() };
         ctx.Request.Method = HttpMethods.Get;

@@ -29,8 +29,8 @@ public sealed class OidcLogoutTest
         var services = new ServiceCollection();
         services.AddLogging();
         services.AddDataProtection().UseEphemeralDataProtectionProvider();
-        services.AddDistributedMemoryCache();
         services.AddSingleton(Mock.Of<IConnectionMultiplexer>());
+        services.AddSingleton(new SessionCookiePolicy(AllowInsecureHttp: false));
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<ConnectionRegistry>();
         services.AddSingleton<RedisTicketStore>();

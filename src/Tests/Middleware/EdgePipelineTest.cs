@@ -4,6 +4,7 @@ using System.Net;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -14,6 +15,7 @@ using Moq;
 using SkeinWeb.Auth;
 using SkeinWeb.Hubs;
 using SkeinWeb.Middleware;
+using SkeinWeb.Tests.Auth;
 using StackExchange.Redis;
 
 namespace SkeinWeb.Tests.Middleware;
@@ -110,10 +112,11 @@ public sealed class EdgePipelineTest
         ClaimsPrincipal? User,
         IPAddress? RemoteIp,
         bool SetCookie,
-        HttpRequestMessage[] Provisions);
+        HttpRequestMessage[] Provisions,
+        string[] SetCookies);
 
     /// <summary>One assembled pipeline: product registrations, edge, authentication, trust-header bootstrap.</summary>
-    private sealed class World
+    private sealed class World : IDisposable
     {
         private readonly WebApplication _app;
         private readonly RequestDelegate _pipeline;
@@ -121,8 +124,19 @@ public sealed class EdgePipelineTest
         private IPAddress? _seenRemoteIp;
         private bool _reached;
 
+        public const int RedisDatabase = 12;
+        public ConnectionMultiplexer? Redis { get; }
         public RecordingApi Api { get; }
         public CapturingLogs Logs { get; } = new();
+
+        public void Dispose()
+        {
+            if (Redis is not null)
+            {
+                Redis.GetServers().First(s => !s.IsReplica).FlushDatabase(RedisDatabase);
+                Redis.Dispose();
+            }
+        }
 
         /// <param name="apiAuthMode">skein-api <c>authMode</c>; no OIDC authority (legacy trust headers).</param>
         /// <param name="trustedProxies">Entries of <c>SKEIN_TRUSTED_PROXIES</c>.</param>
@@ -135,7 +149,7 @@ public sealed class EdgePipelineTest
         /// (what <c>ASPNETCORE_FORWARDEDHEADERS_ENABLED=true</c> sets).</param>
         public World(
             string apiAuthMode, string[] trustedProxies, string allowedHosts = "", long apiEpoch = 3,
-            bool likeTheHost = false, bool forwardedHeadersFlag = false)
+            bool likeTheHost = false, bool forwardedHeadersFlag = false, bool realRedis = false)
         {
             Api = new RecordingApi(apiEpoch);
             var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -148,10 +162,22 @@ public sealed class EdgePipelineTest
             builder.Logging.AddProvider(Logs);
             var services = builder.Services;
 
-            var mux = new Mock<IConnectionMultiplexer>();
-            mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(new Mock<IDatabase>().Object);
-            services.AddSingleton(mux.Object);
-            services.AddDistributedMemoryCache();
+            // Unit rows never reach the store (no session cookie), so a mock suffices; the rows that
+            // issue or renew a session run on the real Redis of the harness (database 12).
+            if (realRedis)
+            {
+                Redis = TestRedis.Connect(RedisDatabase);
+                Redis.GetServers().First(s => !s.IsReplica).FlushDatabase(RedisDatabase);
+                services.AddSingleton<IConnectionMultiplexer>(Redis);
+            }
+            else
+            {
+                var mux = new Mock<IConnectionMultiplexer>();
+                mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(new Mock<IDatabase>().Object);
+                services.AddSingleton(mux.Object);
+            }
+            services.AddDataProtection();
+            services.AddSingleton(new SessionCookiePolicy(AllowInsecureHttp: true));
             services.AddSingleton(TimeProvider.System);
             services.AddSingleton<ConnectionRegistry>();
             services.AddSingleton<RedisTicketStore>();
@@ -206,7 +232,7 @@ public sealed class EdgePipelineTest
             });
         }
 
-        public async Task<Outcome> Send(string peer, Action<HttpContext> arrange)
+        public async Task<Outcome> Send(string peer, Action<HttpContext> arrange, string? cookie = null)
         {
             await using var scope = _app.Services.CreateAsyncScope();
             var ctx = new DefaultHttpContext { RequestServices = scope.ServiceProvider };
@@ -218,6 +244,10 @@ public sealed class EdgePipelineTest
             ctx.Request.Path = "/api/auth/me";
             ctx.Request.Host = new HostString("skein.example.com");
             ctx.Response.Body = new MemoryStream();
+            if (cookie is not null)
+            {
+                ctx.Request.Headers.Cookie = cookie;
+            }
             arrange(ctx);
 
             await _pipeline(ctx);
@@ -236,7 +266,8 @@ public sealed class EdgePipelineTest
                 _seenUser,
                 _seenRemoteIp,
                 ctx.Response.Headers.SetCookie.Count > 0,
-                Api.Provisions);
+                Api.Provisions,
+                ctx.Response.Headers.SetCookie.Select(v => v!).ToArray());
         }
 
         public (LogLevel Level, string Text)[] SsoLogs =>
@@ -331,11 +362,12 @@ public sealed class EdgePipelineTest
         return data;
     }
 
-    [Theory]
+    [Trait("Category", "Integration")]
+    [RedisTheory]
     [MemberData(nameof(LegacyModesByPeerForm))]
     public async Task TrustedPeer_InEitherAddressForm_GetsASession_AndTheVisitorAddressIsKept(string mode, string peer)
     {
-        var world = new World(mode, ["10.0.0.1"]);
+        using var world = new World(mode, ["10.0.0.1"], realRedis: true);
 
         var outcome = await world.Send(peer, ctx =>
         {
@@ -350,20 +382,34 @@ public sealed class EdgePipelineTest
         Assert.Equal(["198.51.100.23"], clientIp);
     }
 
-    [Theory]
+    [Trait("Category", "Integration")]
+    [RedisTheory]
     [MemberData(nameof(LegacyModes))]
     public async Task TrustedPeer_ExpiredSession_IsRefreshedAndReissued(string mode)
     {
-        var world = new World(mode, ["10.0.0.1"], apiEpoch: 3);
+        using var world = new World(mode, ["10.0.0.1"], apiEpoch: 3, realRedis: true);
 
-        var outcome = await world.Send("10.0.0.1", ctx =>
-        {
-            TrustHeaders(ctx);
-            ctx.User = ExpiredSession();
-        });
+        // A first request signs the visitor in; its cookie names the live session key K.
+        var first = await world.Send("10.0.0.1", TrustHeaders);
+        var cookie = Assert.Single(first.SetCookies).Split(';')[0];
+        var server = world.Redis!.GetServers().First(s => !s.IsReplica);
+        var key = (string)server.Keys(World.RedisDatabase, "skein:session:*").Single()!;
 
-        Assert.Single(outcome.Provisions);
-        Assert.True(outcome.SetCookie);
+        // The ticket's claims are now overdue for a refresh.
+        var db = world.Redis.GetDatabase(World.RedisDatabase);
+        var ticket = TicketSerializer.Default.Deserialize((byte[])(await db.StringGetAsync(key))!)!;
+        var identity = (ClaimsIdentity)ticket.Principal.Identity!;
+        identity.RemoveClaim(identity.FindFirst("urn:skein:refreshed-at")!);
+        var overdue = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds();
+        identity.AddClaim(new Claim("urn:skein:refreshed-at", overdue.ToString(CultureInfo.InvariantCulture)));
+        await db.StringSetAsync(key, TicketSerializer.Default.Serialize(ticket), TimeSpan.FromHours(24));
+
+        var second = await world.Send("10.0.0.1", TrustHeaders, cookie);
+
+        Assert.Equal(2, second.Provisions.Length); // one call more, to refresh
+        Assert.Equal(key, (string)server.Keys(World.RedisDatabase, "skein:session:*").Single()!); // K is kept
+        var refreshed = TicketSerializer.Default.Deserialize((byte[])(await db.StringGetAsync(key))!)!;
+        Assert.True(long.Parse(refreshed.Principal.FindFirstValue("urn:skein:refreshed-at")!, CultureInfo.InvariantCulture) > overdue);
     }
 
     [Theory]
@@ -594,12 +640,13 @@ public sealed class EdgePipelineTest
         return data;
     }
 
-    [Theory]
+    [Trait("Category", "Integration")]
+    [RedisTheory]
     [MemberData(nameof(HostFlagByPeerForm))]
     public async Task HostComposedPipeline_TrustedPeer_GetsASession_WhateverTheForwardedHeadersFlag(
         bool forwardedHeadersFlag, string peer)
     {
-        var world = new World("keycloak", ["10.0.0.1"], likeTheHost: true, forwardedHeadersFlag: forwardedHeadersFlag);
+        using var world = new World("keycloak", ["10.0.0.1"], likeTheHost: true, forwardedHeadersFlag: forwardedHeadersFlag, realRedis: true);
 
         var outcome = await world.Send(peer, ctx =>
         {

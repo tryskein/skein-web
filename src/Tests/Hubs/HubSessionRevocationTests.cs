@@ -54,6 +54,7 @@ public class HubSessionRevocationTests
             .Returns(Task.CompletedTask);
         var services = new ServiceCollection();
         services.AddSingleton(auth.Object);
+        services.AddSingleton(SkeinWeb.Tests.Auth.TestRedis.RevokingStore());
         services.AddSingleton(replica.Registry);
         return new DefaultHttpContext
         {
