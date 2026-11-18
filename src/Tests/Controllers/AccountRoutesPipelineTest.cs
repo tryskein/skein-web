@@ -114,6 +114,9 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
                 .ReturnsAsync(true);
             db.Setup(d => d.SetMembersAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
                 .ReturnsAsync(Array.Empty<RedisValue>()); // an empty index: nothing to revoke
+            // The browser carries the cookie of an earlier sign-up: its key is revoked by a later route.
+            db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(RedisResult.Create((RedisValue)1, ResultType.Integer));
             var mux = new Mock<IConnectionMultiplexer>();
             mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
             services.AddSingleton(mux.Object);
@@ -208,7 +211,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
             var before = _api.Requests.Length;
             using var response = await Send(browser, method, path, body);
 
-            Assert.True(response.IsSuccessStatusCode, $"{method} {path} answered {(int)response.StatusCode} without a session");
+            Assert.True(response.IsSuccessStatusCode, $"{method} {path} answered {(int)response.StatusCode} without a session: {(response.IsSuccessStatusCode ? "" : response.Content.ReadAsStringAsync().Result)}");
             var sent = Assert.Single(_api.Requests[before..]);
             Assert.False(CarriesIdentity(sent), $"{method} {path} reached skein-api with identity headers");
         }
