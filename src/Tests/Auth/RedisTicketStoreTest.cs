@@ -185,6 +185,7 @@ public sealed class RedisTicketStoreTest : IDisposable
 
         var confirmed = TestRedis.Ticket(owner, extra: new Claim(ClaimTypes.Role, "admin"));
         Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, confirmed, explicitRenewal: true));
+        staleClone.Properties.IssuedUtc = DateTimeOffset.UtcNow.AddHours(6);
         staleClone.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddHours(30);
         Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, staleClone));
 
@@ -192,6 +193,37 @@ public sealed class RedisTicketStoreTest : IDisposable
         Assert.Equal("admin", stored.Principal.FindFirstValue(ClaimTypes.Role)); // the confirmed claim stays
         Assert.Equal("p@example.com", stored.Properties.Items[RedisTicketStore.SsoEmailItem]);
         Assert.True(stored.Properties.ExpiresUtc >= staleClone.Properties.ExpiresUtc); // while the expiry moved forward
+    }
+
+    [RedisFact]
+    public async Task SuccessiveAutomaticRenewals_KeepTheWindowAt24Hours_AndNeverMoveTheExpiryBack()
+    {
+        var store = Store();
+        var owner = NewUser();
+        var key = await IssueAsync(store, TestRedis.Ticket(owner));
+        var t0 = DateTimeOffset.UtcNow;
+        var window = TimeSpan.FromHours(24);
+
+        async Task<AuthenticationTicket> RenewAtAsync(TimeSpan after)
+        {
+            // What the cookie handler's sliding renewal hands over: a window of its own length starting now.
+            var incoming = TestRedis.Ticket(owner);
+            incoming.Properties.IssuedUtc = t0 + after;
+            incoming.Properties.ExpiresUtc = t0 + after + window;
+            Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, incoming));
+            return await StoredAsync(store, key);
+        }
+
+        foreach (var after in new[] { TimeSpan.FromHours(13), TimeSpan.FromHours(26) })
+        {
+            var stored = await RenewAtAsync(after);
+            Assert.Equal(window, stored.Properties.ExpiresUtc - stored.Properties.IssuedUtc);
+            Assert.Equal(t0 + after + window, stored.Properties.ExpiresUtc);
+        }
+
+        var late = await RenewAtAsync(TimeSpan.FromHours(1)); // an older request arrives last
+        Assert.Equal(window, late.Properties.ExpiresUtc - late.Properties.IssuedUtc);
+        Assert.Equal(t0 + TimeSpan.FromHours(26) + window, late.Properties.ExpiresUtc); // the later window wins
     }
 
     [RedisFact]

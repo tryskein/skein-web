@@ -307,17 +307,19 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     }
 
     /// <summary>
-    /// The row as it is stored now, with its expiry moved to the later of the stored and the incoming one
-    /// (never earlier than what a parallel writer set).
+    /// The row as it is stored now, with its window (IssuedUtc and ExpiresUtc, always together: the cookie
+    /// handler measures the window as their difference) replaced by the incoming one only when the incoming
+    /// window ends later. Never earlier than what a parallel writer set, and never a window of another length.
     /// </summary>
     private static AuthenticationTicket ExtendOnly(AuthenticationTicket incoming, AuthenticationTicket stored)
     {
         var properties = stored.Properties.Clone();
         properties.Items.Remove(SsoPairWriteMarker);
-        var later = incoming.Properties.ExpiresUtc;
-        if (later is { } incomingExpiry && (properties.ExpiresUtc is not { } storedExpiry || incomingExpiry > storedExpiry))
+        if (incoming.Properties.ExpiresUtc is { } incomingExpiry
+            && (properties.ExpiresUtc is not { } storedExpiry || incomingExpiry > storedExpiry))
         {
             properties.ExpiresUtc = incomingExpiry;
+            properties.IssuedUtc = incoming.Properties.IssuedUtc;
         }
         return new AuthenticationTicket(stored.Principal, properties, stored.AuthenticationScheme);
     }
