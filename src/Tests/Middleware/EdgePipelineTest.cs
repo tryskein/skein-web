@@ -181,6 +181,7 @@ public sealed class EdgePipelineTest
             services.AddSingleton(TimeProvider.System);
             services.AddSingleton<ConnectionRegistry>();
             services.AddSingleton<RedisTicketStore>();
+            services.AddSingleton<SessionIssuer>();
 
             var proxies = TrustedProxyConfig.FromEntries(trustedProxies);
             services.AddSkeinEdge(proxies, AllowedHostsConfig.Parse(allowedHosts));
