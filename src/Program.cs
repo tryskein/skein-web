@@ -575,7 +575,6 @@ app.MapGet("/oauth2/start", (HttpContext http, string? rd) =>
         new[] { OpenIdConnectDefaults.AuthenticationScheme });
 }).AllowAnonymous()
   .Produces<ProblemDetails>(StatusCodes.Status502BadGateway, "application/problem+json")
-  .Produces<SsoUnavailableResponse>(StatusCodes.Status502BadGateway, "application/json")
   .WithDescription("Starts the native OIDC sign-in (404 outside KeycloakOidc mode). Refused before the operation when the session store failed technically while the session was read: ProblemDetails 502 (type https://skein.local/errors/upstream-unavailable, error=upstream_unavailable); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON 502 {error: sso_unavailable, message} instead. No Set-Cookie.");
 
 app.MapControllers();
