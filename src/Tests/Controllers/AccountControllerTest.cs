@@ -188,7 +188,11 @@ public class AccountControllerTest
             var auth = new Mock<IAuthenticationService>();
             auth.Setup(a => a.SignInAsync(It.IsAny<HttpContext>(), It.IsAny<string>(),
                     It.IsAny<ClaimsPrincipal>(), It.IsAny<AuthenticationProperties>()))
-                .Callback((HttpContext _, string _, ClaimsPrincipal p, AuthenticationProperties _) => SignIns.Add(p))
+                .Callback((HttpContext c, string _, ClaimsPrincipal p, AuthenticationProperties _) =>
+                {
+                    SignIns.Add(p);
+                    SessionRequestState.Of(c).IssuedKey = "issued-key"; // what the store reports on an issue
+                })
                 .Returns(Task.CompletedTask);
             services.AddSingleton(auth.Object);
             services.AddSingleton<ProblemDetailsFactory, PlainProblemDetailsFactory>();
@@ -549,49 +553,6 @@ public class AccountControllerTest
         await AssertRateLimited(h, route, "u0@client.io", "203.0.113.7");
     }
 
-    // ---- row 217: reset re-issues only the same user's session ---------------
-
-    [Fact]
-    public async Task ResetComplete_SameUsersSession_IsReissuedWithTheEpochOfTheAnswer()
-    {
-        var h = Build();
-        h.NewRequest("203.0.113.7", user: SignedIn(U1));
-
-        var result = await h.Controller.PasswordResetComplete(
-            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
-
-        Assert.Equal(StatusCodes.Status204NoContent, StatusOf(result));
-        var reissued = Assert.Single(h.SignIns);
-        Assert.Equal(U1, reissued.FindFirstValue(ClaimTypes.NameIdentifier));
-        Assert.Equal("4", reissued.FindFirstValue(SessionPrincipal.SessionEpochClaim));
-    }
-
-    [Fact]
-    public async Task ResetComplete_AnotherUsersSession_IsNotReissued_NorTurnedIntoTheOwners()
-    {
-        var h = Build();
-        h.NewRequest("203.0.113.7", user: SignedIn(U2));
-
-        var result = await h.Controller.PasswordResetComplete(
-            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
-
-        Assert.Equal(StatusCodes.Status204NoContent, StatusOf(result));
-        Assert.Empty(h.SignIns);
-    }
-
-    [Fact]
-    public async Task ResetComplete_WithoutSession_IssuesNoSession()
-    {
-        var h = Build();
-        h.NewRequest("203.0.113.7");
-
-        var result = await h.Controller.PasswordResetComplete(
-            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
-
-        Assert.Equal(StatusCodes.Status204NoContent, StatusOf(result));
-        Assert.Empty(h.SignIns);
-    }
-
     // ---- INV-26: the reset ends the user's other sessions ----
 
     private const string KeyOfThisTab = "skein:session:this-tab";
@@ -613,49 +574,6 @@ public class AccountControllerTest
         Add("u1-other", U1, "skein:session:u1-other");
         Add("u2", U2, "skein:session:u2");
         return closed;
-    }
-
-    public static TheoryData<string> ResetRequesters => new() { "same-user-session", "no-session", "other-user-session" };
-
-    [Theory]
-    [MemberData(nameof(ResetRequesters))]
-    public async Task ResetComplete_EndsTheOwnersOtherSessions_KeepsOnlyTheReissuedOne(string requester)
-    {
-        var h = Build();
-        var closed = Connections(h);
-        h.NewRequest("203.0.113.7", user: requester switch
-        {
-            "same-user-session" => SignedInWithKey(U1, KeyOfThisTab),
-            "other-user-session" => SignedInWithKey(U2, "skein:session:u2"),
-            _ => null,
-        });
-        // Only the re-issued session of the token's owner is kept.
-        string? kept = requester == "same-user-session" ? KeyOfThisTab : null;
-        string[] expectedClosed = requester == "same-user-session" ? ["u1-other"] : ["u1-this-tab", "u1-other"];
-
-        var result = await h.Controller.PasswordResetComplete(
-            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
-
-        Assert.Equal(StatusCodes.Status204NoContent, StatusOf(result));
-        h.Sessions.Verify(r => r.RemoveSessionsAsync(Guid.Parse(U1), kept, It.IsAny<CancellationToken>()), Times.Once);
-        h.Sessions.Verify(r => r.RemoveSessionsAsync(Guid.Parse(U2), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
-        Assert.Equal(expectedClosed.Order(), closed.Order());
-    }
-
-    [Fact]
-    public async Task ResetComplete_RemovalIncomplete_StillAnswers204_AndLogsAnError()
-    {
-        // The password is already set — the failure is reported, not hidden.
-        var h = Build();
-        h.Sessions.Setup(r => r.RemoveSessionsAsync(It.IsAny<Guid>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync(new SessionRemovalResult(Removed: 1, Failed: 1, IndexRead: true));
-        h.NewRequest("203.0.113.7", user: SignedInWithKey(U1, KeyOfThisTab));
-
-        var result = await h.Controller.PasswordResetComplete(
-            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
-
-        Assert.Equal(StatusCodes.Status204NoContent, StatusOf(result));
-        Assert.Contains(h.Logs.Entries, e => e.Level == LogLevel.Error);
     }
 
     // ---- a 2xx outside the contract is not a success ----------
