@@ -281,11 +281,11 @@ public sealed class AccountController : ControllerBase
     /// <param name="token">Token from the reset link.</param>
     /// <param name="req">The new password.</param>
     /// <param name="ct">Request abort.</param>
-    /// <response code="204">Password set; the current session re-issued only if it belongs to the token's user.</response>
+    /// <response code="204">Password set. The key of the session cookie the request carried (any user's) and every ticket of the token's user are revoked, and a NEW session of that user is issued: Set-Cookie with the new key, whatever cookie came in (none, another user's, the user's own).</response>
     /// <response code="400">Body not of the declared shape.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie. Password changed but the session not issued (a user id that cannot be read, the previous sessions not all removed, data unusable for a session, or a failed issue): ProblemDetails of type …/password-changed-session-not-issued with error=upstream_unavailable, no Set-Cookie; the password and the spent token stay. No confirmation of the change (skein-api did not answer): ProblemDetails of type …/upstream-unavailable, which does not claim the change or the token spend.</response>
     [HttpPost("password-reset/{token}")]
     [ExplicitSignIn(Surface.PasswordResetComplete)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
@@ -297,11 +297,13 @@ public sealed class AccountController : ControllerBase
         Summary = "Complete a password reset",
         Description =
             "Forwards to skein-api POST /ui/v1/auth/password-reset/{token}; 204 on success. " +
-            "Every session of the user ends; if this request carries a session of the same " +
-            "user, that session is re-issued with the new session epoch (Set-Cookie) and stays " +
-            "logged in; a session of another user is left as it is. The user's other session " +
-            "tickets are removed and this replica's hub connections of those sessions are " +
-            "closed (other replicas close theirs on the next access re-check, within 30 s). " +
+            "Every session of the user ends and the key of the cookie the request carried is revoked, " +
+            "whoever it belongs to; then a new session with a NEW key is issued (204 with Set-Cookie, " +
+            "whatever cookie came in). This replica's hub connections of the user are closed at once " +
+            "(other replicas close theirs on the next access re-check, within 30 s). If the password " +
+            "is changed but the sessions cannot all be removed or the new one cannot be issued, the " +
+            "answer is 502 of type password-changed-session-not-issued without a cookie; the password " +
+            "and the spent token stay. No answer from skein-api: 502 of type upstream-unavailable. " +
             "Rate limit per client IP only." +
             " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "CompletePasswordReset")]
@@ -321,17 +323,38 @@ public sealed class AccountController : ControllerBase
             HttpStatusCode.OK,
             async ok =>
             {
-                // T012: 200 AuthResponse with the NEW epoch. A body without the
-                // user or the epoch is outside the contract — 502, not a 204
-                // that would hide it (the password is set either way; the
-                // session is not re-issued).
-                var user = Deserialize<UserDto>(ok.Body);
-                if (user?.Id is null || SessionEpochOf(ok) is not { } epoch)
+                // The password is set and the epoch moved: from here nothing may stop the revocation.
+                var subject = ReadSubjectId(ok.Body);
+                _issuer.MarkSessionWriteSuppressed(HttpContext);
+                _issuer.MarkPointOfNoReturn(HttpContext);
+                if (subject is not { } userId)
                 {
-                    return UpstreamBroken("password-reset-complete", "200 without the user or sessionEpoch — no session re-issued");
+                    // No known subject: nothing to revoke by index, and no session to issue.
+                    return PasswordChangedNotIssued("200 without a readable user id");
                 }
-                var kept = await ReissueSameUserSessionAsync(user, epoch);
-                await EndOtherSessionsAsync(user, kept);
+
+                var revoked = await EndSessionsAfterResetAsync(userId);
+                var user = Deserialize<UserDto>(ok.Body);
+                if (!revoked)
+                {
+                    return PasswordChangedNotIssued("the previous sessions could not all be revoked");
+                }
+                if (!IsIssuable(user) || SessionEpochOf(ok) is not { } epoch)
+                {
+                    return PasswordChangedNotIssued("200 without usable data for a session");
+                }
+                try
+                {
+                    await _issuer.IssueAsync(
+                        HttpContext,
+                        SessionPrincipal.Create(user!, epoch),
+                        new AuthenticationProperties { IsPersistent = true, AllowRefresh = true },
+                        nameof(Surface.PasswordResetComplete));
+                }
+                catch (SessionIssueException)
+                {
+                    return PasswordChangedNotIssued("the new session could not be issued");
+                }
                 return NoContent();
             },
             "password-reset-complete",
@@ -524,90 +547,84 @@ public sealed class AccountController : ControllerBase
     private string? TrustedClientIp() =>
         _apiOptions.ClientIpTrusted ? HttpContext.Connection.RemoteIpAddress?.ToString() : null;
 
-    /// <summary>
-    /// Re-issues the current session after a successful password reset (plan
-    /// K-16): only when the request is authenticated AND its user is the one
-    /// the reset response names. The cookie handler renews the SAME session
-    /// key with the new principal, so the browser keeps its session id and
-    /// only the epoch (and any refreshed field) changes.
-    /// </summary>
-    /// <returns>Whether a session of the user was re-issued, and its ticket key
-    /// (null for a session minted before keys were stamped into tickets).</returns>
-    private async Task<KeptSession> ReissueSameUserSessionAsync(UserDto user, long epoch)
+    /// <summary>The user id of a confirmed reset answer, read on its own before any claim or epoch is looked at.</summary>
+    private static Guid? ReadSubjectId(string body)
     {
-        if (User.Identity is not { IsAuthenticated: true })
+        try
         {
-            return new KeptSession(false, null);
+            using var doc = JsonDocument.Parse(body);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("id", out var id)
+                && id.ValueKind == JsonValueKind.String
+                && Guid.TryParse(id.GetString(), out var parsed)
+                ? parsed
+                : null;
         }
-        var currentUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (!string.Equals(currentUserId, user.Id, StringComparison.OrdinalIgnoreCase))
+        catch (JsonException)
         {
-            // Another user's tab: leave its session alone.
-            return new KeptSession(false, null);
+            return null;
         }
-        var key = SessionPrincipal.SessionKeyOf(User);
-        await SignInAsync(user, epoch);
-        _logger.LogInformation("password-reset-complete: current session of {UserId} re-issued with the new epoch", user.Id);
-        return new KeptSession(true, key);
     }
 
-    /// <summary>The outcome of <see cref="ReissueSameUserSessionAsync"/>.</summary>
-    private sealed record KeptSession(bool Reissued, string? Key);
-
     /// <summary>
-    /// Ends the user's other sessions after a successful reset (INV-26): their
-    /// tickets are removed, and this replica's hub connections of them are
-    /// closed at once — skein-api already refuses them (new epoch), and a
-    /// connection of a removed ticket is closed on every other replica by the
-    /// access re-check. Every session stored by this version carries its ticket key
-    /// (<see cref="SessionPrincipal.WithSessionKey"/> stamps it on issue and renewal); should a
-    /// re-issued session still lack one, it cannot be
-    /// told apart from the others and every session of the user ends, the
-    /// current one included — the user logs in again with the new password.
-    /// <para>A removal that does not complete — the user's index unreadable or a
-    /// ticket undeletable after the store's retries — is logged as an Error
-    /// with the user id and the count left, and the route still answers 204:
-    /// skein-api has already set the password and moved the session epoch, and
-    /// the reset token is spent, so failing the request would only hide that
-    /// success. The tickets left stay in the user's index for a later
-    /// revocation; skein-api refuses every request of those sessions (old
-    /// epoch), and a hub connection of a ticket that disappears later is closed
-    /// by the access re-check.</para>
+    /// The local revocation after a confirmed reset (INV-13): the key the request carried, whoever owns
+    /// it, then every ticket of the user found by the reverse index, and this replica's hub connections
+    /// of the user — all with tokens that the request abort cannot cancel. False when the input key or
+    /// any ticket could not be removed, or the index could not be read; the connections close anyway.
     /// </summary>
-    private async Task EndOtherSessionsAsync(UserDto user, KeptSession kept)
+    private async Task<bool> EndSessionsAfterResetAsync(Guid userId)
     {
-        if (!Guid.TryParse(user.Id, out var userId))
+        var complete = true;
+        try
         {
-            return;
+            await _issuer.RevokeIncomingAsync(HttpContext);
         }
-        if (kept.Reissued && kept.Key is null)
+        catch (SessionIssueException)
         {
-            _logger.LogWarning(
-                "password-reset-complete: re-issued session of {UserId} has no ticket key, every session of the user ends",
-                user.Id);
+            complete = false;
         }
-        // Past the point of no return: the password is set, the epoch moved.
-        var result = await _sessions.RemoveSessionsAsync(userId, kept.Key, CancellationToken.None);
-        var closed = _hubConnections.AbortUserSessionsExcept(userId, kept.Key);
+
+        var result = await _sessions.RemoveSessionsAsync(userId, keepKey: null, CancellationToken.None);
+        var closed = _hubConnections.AbortUserSessionsExcept(userId, keepSessionKey: null);
         if (!result.Complete)
         {
-            using (_logger.BeginScope(new Dictionary<string, object>
-            {
-                ["userId"] = user.Id,
-                ["ticketsRemoved"] = result.Removed,
-                ["ticketsNotRemoved"] = result.Failed,
-                ["userIndexRead"] = result.IndexRead,
-                ["hubConnectionsClosed"] = closed,
-            }))
-            {
-                _logger.LogError(
-                    "password-reset-complete: the user's other sessions could not all be removed; password reset kept");
-            }
-            return;
+            complete = false;
         }
-        _logger.LogInformation(
-            "password-reset-complete: other sessions of {UserId} ended tickets={Removed} hubConnections={Closed}",
-            user.Id, result.Removed, closed);
+
+        using (_logger.BeginScope(new Dictionary<string, object>
+        {
+            ["userId"] = userId,
+            ["ticketsRemoved"] = result.Removed,
+            ["ticketsNotRemoved"] = result.Failed,
+            ["userIndexRead"] = result.IndexRead,
+            ["hubConnectionsClosed"] = closed,
+        }))
+        {
+            if (complete)
+            {
+                _logger.LogInformation("password-reset-complete: the sessions of the user ended");
+            }
+            else
+            {
+                _logger.LogError("password-reset-complete: the sessions of the user could not all be removed; the password change is kept");
+            }
+        }
+        return complete;
+    }
+
+    /// <summary>
+    /// The password change is confirmed but no session is issued: a named outcome, distinct from "no
+    /// confirmation of the change". The password and the spent token stay as they are.
+    /// </summary>
+    private ObjectResult PasswordChangedNotIssued(string what)
+    {
+        _logger.LogError("password-reset-complete: the password was changed but no session was issued ({What})", what);
+        return Problem(
+            statusCode: StatusCodes.Status502BadGateway,
+            title: "Password changed, session not issued",
+            detail: "The password was changed, but signing in failed. Sign in with the new password.",
+            type: "https://skein.local/errors/password-changed-session-not-issued",
+            extensions: new Dictionary<string, object?> { ["error"] = "upstream_unavailable" });
     }
 
     /// <summary>Whether the user of a confirmed answer carries everything a session principal needs.</summary>
@@ -648,18 +665,6 @@ public sealed class AccountController : ControllerBase
             detail: "The account was created, but signing it in failed. Sign in with the new credentials.",
             type: "https://skein.local/errors/account-created-session-not-issued",
             extensions: new Dictionary<string, object?> { ["error"] = "upstream_unavailable" });
-    }
-
-    private async Task SignInAsync(UserDto user, long sessionEpoch)
-    {
-        await HttpContext.SignInAsync(
-            CookieAuthenticationDefaults.AuthenticationScheme,
-            SessionPrincipal.Create(user, sessionEpoch),
-            new AuthenticationProperties
-            {
-                IsPersistent = true,
-                AllowRefresh = true,
-            });
     }
 
     /// <summary>
