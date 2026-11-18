@@ -149,9 +149,12 @@ the session cookie handler is refused early with `502` and no `Set-Cookie`, inst
 the `/api/v1` proxy, the hub and the `/api/auth/*` endpoints. The body depends on the request:
 
 - `application/problem+json` with `error` `upstream_unavailable` (login carries no `error`);
-- in the trust-headers mode, a request from a trusted proxy peer with both identity headers gets
-  `{"error":"sso_unavailable","message":...}`; a failure to establish the session from the identity
-  headers is `sso_provisioning_failed`.
+- in the trust-headers mode, a trusted-proxy request with both identity headers gets
+  `{"error":"sso_unavailable","message":...}`, unless it is an explicit sign-in operation (login, sign-up,
+  sign-up by invitation, completing a password reset) or one of the service paths that skip the SSO step
+  (`/healthz`, `/ready`, `/metrics`, `/api/auth/config`, `/mcp`, `/agent/v1`): those keep the
+  `application/problem+json` form of their own endpoint. A failure to establish the session from the
+  identity headers is `sso_provisioning_failed`.
 
 `/mcp` is not in this list: it is served before the session handler and authenticates separately with
 `X-Skein-Api-Key`, so a session store outage does not touch it.

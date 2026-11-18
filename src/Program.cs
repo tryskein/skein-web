@@ -522,9 +522,11 @@ app.UseAuthentication();
 // cluster edge (trust-headers org pattern). In local mode the
 // middleware is a no-op.
 //
-// Position: AFTER UseAuthentication (we need to see whether the cookie
-// middleware already attached an authenticated principal — if so, this
-// middleware short-circuits) and BEFORE UseAuthorization (so the fresh
+// Position: AFTER UseAuthentication (we need the principal the cookie
+// middleware attached and the remembered header pair of its ticket: the
+// request passes on without a call to skein-api only when the pair of the
+// request equals the remembered one and the periodic refresh is not due;
+// otherwise the subject is confirmed) and BEFORE UseAuthorization (so the fresh
 // principal we mint via context.SignInAsync is visible to [Authorize]
 // gates on /api/auth/me and friends; otherwise AuthZ short-circuits
 // with 401 before this middleware ever runs and the first /me on a

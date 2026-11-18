@@ -24,9 +24,10 @@ namespace SkeinWeb.Tests.Middleware;
 ///     <see cref="SkeinApiClient"/>.
 ///   - Keycloak mode + missing trust headers: same no-op (the
 ///     downstream auth gates own the 401 response).
-///   - Keycloak mode + already-authenticated principal with a FRESH
-///     <c>urn:skein:refreshed-at</c> claim: pass through without
-///     calling the upstream provisioning endpoint.
+///   - Keycloak mode + already-authenticated principal: passes through without
+///     provisioning when there are no trust headers, or when the pair of the
+///     request equals the pair remembered in the ticket and the refresh is not due
+///     (the matching-pair case is covered by the integration suite, which has the store).
 ///   - Keycloak mode + authenticated principal but no trust headers
 ///     (e.g. internal probe): pass through without provisioning (the
 ///     TTL-refresh path is silent when oauth2-proxy didn't sit in front).
