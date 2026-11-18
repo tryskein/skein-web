@@ -84,7 +84,7 @@ public sealed class SessionLogRedactionTest
     {
         var (host, port) = RedisEndpoint();
         using var proxy = new CuttableProxy(host, port);
-        var options = new ConfigurationOptions { AbortOnConnectFail = false, SyncTimeout = 1000, AsyncTimeout = 1000, ConnectTimeout = 1000 };
+        var options = new ConfigurationOptions { AbortOnConnectFail = false, SyncTimeout = 1000, AsyncTimeout = 1000, ConnectTimeout = 1000, IncludeDetailInExceptions = true };
         options.EndPoints.Add(IPAddress.Loopback.ToString(), proxy.Port);
         await using var mux = await ConnectionMultiplexer.ConnectAsync(options);
         var key = "skein:session:SECRET-" + Guid.NewGuid().ToString("N");

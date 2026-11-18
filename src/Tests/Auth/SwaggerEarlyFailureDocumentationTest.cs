@@ -56,9 +56,12 @@ public sealed class SwaggerEarlyFailureDocumentationTest
         foreach (var (method, path, operation) in operations)
         {
             var @class = ClassOf(method, path);
-            var declared = operation.GetProperty("responses").TryGetProperty("502", out var r)
-                ? r.GetProperty("description").GetString() ?? "" : "";
-            Assert.True(declared.Length > 0, $"{method} {path} declares no 502");
+            // The declaration is the 502 response text and the operation text together: a controller
+            // action carries it in the response, a route of Program.cs in the operation description.
+            var declared = (operation.GetProperty("responses").TryGetProperty("502", out var r)
+                ? r.GetProperty("description").GetString() ?? "" : "")
+                + " " + (operation.TryGetProperty("description", out var d) ? d.GetString() ?? "" : "");
+            Assert.True(operation.GetProperty("responses").TryGetProperty("502", out _), $"{method} {path} declares no 502");
             switch (@class)
             {
                 case Class.Two:

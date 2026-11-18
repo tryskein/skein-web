@@ -196,11 +196,14 @@ public sealed class RedisTicketStoreTest : IDisposable
         var real = Store();
         var key = await IssueAsync(real, TestRedis.Ticket(owner));
         var db = DbProxy.Create(Db, out var proxy);
-        var rival = TicketSerializer.Default.Serialize(TestRedis.Ticket(owner, extra: new Claim("rival", "1")));
+        var writes = 0;
         proxy.After = async (name, args) =>
         {
             if (name == nameof(IDatabase.StringGetAsync) && (RedisKey)args[0]! == key)
             {
+                // A different value every time, so no read ever matches the next write's expectation.
+                var rival = TicketSerializer.Default.Serialize(
+                    TestRedis.Ticket(owner, extra: new Claim("rival", (++writes).ToString())));
                 await Db.StringSetAsync(key, rival, TimeSpan.FromHours(1));
             }
         };
