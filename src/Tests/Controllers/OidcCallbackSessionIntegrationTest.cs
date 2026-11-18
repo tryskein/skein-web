@@ -150,6 +150,7 @@ public sealed class OidcCallbackSessionIntegrationTest
         Assert.Equal(returnUri.Length == 0 ? "/" : returnUri, location);
         var set = Assert.Single(reply.Sessions(host.CookieName)); // the correlation and nonce deletions are not session cookies
         Assert.Contains(reply.Cookies, c => c.IsDeletion && c.Name.StartsWith(".AspNetCore.Correlation.", StringComparison.Ordinal));
+        Assert.DoesNotContain("expires=", set.Raw, StringComparison.OrdinalIgnoreCase); // a browser-session cookie, as the challenge made it
         var fresh = host.KeyOf(set);
         Assert.NotEqual(old, fresh);
         Assert.True(await host.Db.KeyExistsAsync(fresh));

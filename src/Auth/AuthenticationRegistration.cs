@@ -295,7 +295,9 @@ public static class AuthenticationRegistration
                             await issuer.RotateAsync(
                                 ctx.HttpContext,
                                 ctx.Principal!,
-                                new AuthenticationProperties { IsPersistent = true, AllowRefresh = true },
+                                // The properties of the challenge, as before: the cookie is a browser-session
+                                // one, not persistent.
+                                ctx.Properties ?? new AuthenticationProperties(),
                                 "Oidc");
                             ctx.Response.Redirect(string.IsNullOrEmpty(ctx.ReturnUri) ? "/" : ctx.ReturnUri);
                         }

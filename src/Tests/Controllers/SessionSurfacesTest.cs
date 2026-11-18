@@ -69,6 +69,7 @@ public sealed class SessionSurfacesTest
 
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         var set = Assert.Single(reply.Sessions(host.CookieName));
+        Assert.Contains("expires=", set.Raw, StringComparison.OrdinalIgnoreCase); // a login cookie is persistent: the contrast with OIDC
         var fresh = host.KeyOf(set);
         Assert.NotEqual(old, fresh);
         Assert.True(await host.Db.KeyExistsAsync(fresh));
