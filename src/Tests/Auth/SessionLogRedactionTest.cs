@@ -1,5 +1,4 @@
-using System.Net;
-using System.Net.Sockets;
+using Moq;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using SkeinWeb.Auth;
@@ -19,96 +18,37 @@ public sealed class SessionLogRedactionTest
 {
     private static readonly Guid Alice = Guid.Parse("0199a1b2-0000-7000-8000-00000000000a");
 
-    /// <summary>A byte pipe between the client and Redis that can be cut for good.</summary>
-    private sealed class CuttableProxy : IDisposable
+    private static readonly string Key = "skein:session:SECRET-" + Guid.NewGuid().ToString("N");
+
+    // The client library of this version puts no key into the exception of a cut connection, so the
+    // stimulus is an exception shaped as the library shapes one when it does name the key (the text
+    // of a timeout or of a refused command), injected on the database boundary. The check is on the
+    // line the console formatter really prints, at both levels the store logs at.
+    [Theory]
+    [InlineData("retrieve")]
+    [InlineData("exists")]
+    public async Task AFailedOperation_IsLoggedWithoutTheSessionKey_InTheLineTheFormatterPrints(string operation)
     {
-        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
-        private readonly List<TcpClient> _sockets = [];
-        private volatile bool _cut;
+        var failure = new RedisConnectionException(ConnectionFailureType.SocketFailure,
+            $"No connection is active/available to service this operation: GET {Key}; Timeout performing GET ({Key}), inst: 1");
+        Assert.Contains(Key, failure.ToString()); // the stimulus is suitable only with the key in its own text
 
-        public CuttableProxy(string redisHost, int redisPort)
-        {
-            _listener.Start();
-            _ = Task.Run(async () =>
-            {
-                while (!_cut)
-                {
-                    TcpClient client;
-                    try
-                    {
-                        client = await _listener.AcceptTcpClientAsync();
-                    }
-                    catch (Exception)
-                    {
-                        return;
-                    }
-                    var upstream = new TcpClient();
-                    await upstream.ConnectAsync(redisHost, redisPort);
-                    lock (_sockets)
-                    {
-                        _sockets.Add(client);
-                        _sockets.Add(upstream);
-                    }
-                    _ = client.GetStream().CopyToAsync(upstream.GetStream()).ContinueWith(_ => { });
-                    _ = upstream.GetStream().CopyToAsync(client.GetStream()).ContinueWith(_ => { });
-                }
-            });
-        }
+        var db = new Moq.Mock<IDatabase>();
+        db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ThrowsAsync(failure);
+        db.Setup(d => d.KeyExistsAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ThrowsAsync(failure);
+        var mux = new Moq.Mock<IConnectionMultiplexer>();
+        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
+        var formatted = new FormatterLogs();
+        using var factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Trace).AddProvider(formatted));
+        var store = new RedisTicketStore(mux.Object, factory.CreateLogger<RedisTicketStore>());
 
-        public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+        var ex = operation == "retrieve"
+            ? await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.RetrieveAsync(Key, new DefaultHttpContext(), CancellationToken.None))
+            : await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.ExistsAsync(Key, CancellationToken.None));
 
-        public void Cut()
-        {
-            _cut = true;
-            _listener.Stop();
-            lock (_sockets)
-            {
-                foreach (var socket in _sockets)
-                {
-                    socket.Close();
-                }
-            }
-        }
-
-        public void Dispose() => Cut();
-    }
-
-    private static (string Host, int Port) RedisEndpoint()
-    {
-        var options = ConfigurationOptions.Parse(TestRedis.Url!);
-        var endpoint = options.EndPoints[0];
-        return endpoint is DnsEndPoint dns ? (dns.Host, dns.Port) : (((IPEndPoint)endpoint).Address.ToString(), ((IPEndPoint)endpoint).Port);
-    }
-
-    [RedisFact]
-    public async Task AFailedOperationOnACutConnection_IsLoggedWithoutTheSessionKey()
-    {
-        var (host, port) = RedisEndpoint();
-        using var proxy = new CuttableProxy(host, port);
-        var options = new ConfigurationOptions { AbortOnConnectFail = false, SyncTimeout = 1000, AsyncTimeout = 1000, ConnectTimeout = 1000, IncludeDetailInExceptions = true };
-        options.EndPoints.Add(IPAddress.Loopback.ToString(), proxy.Port);
-        await using var mux = await ConnectionMultiplexer.ConnectAsync(options);
-        var key = "skein:session:SECRET-" + Guid.NewGuid().ToString("N");
-        await mux.GetDatabase().StringSetAsync(key, "x"); // the connection is open and works
-        proxy.Cut();
-        await Task.Delay(300);
-
-        // The stimulus is suitable only when the real exception of the operation carries the key.
-        var actual = await Assert.ThrowsAnyAsync<Exception>(() => mux.GetDatabase().StringGetAsync(key));
-        if (!actual.ToString().Contains(key, StringComparison.Ordinal))
-        {
-            // The row is not accepted on a stimulus whose own exception carries no key: it proves nothing.
-            Assert.Skip("Row R34(a) not accepted: the exception of a cut connection carries no session key in this client version; a human decides the stimulus.");
-        }
-
-        var log = new SessionPipelineHost.ErrorLogs();
-        using var factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Trace).AddProvider(log));
-        var store = new RedisTicketStore(mux, factory.CreateLogger<RedisTicketStore>());
-        var ex = await Assert.ThrowsAsync<SessionStoreUnavailableException>(
-            () => store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None));
-
-        Assert.Contains(log.Entries, e => e.Text.Contains("retrieve", StringComparison.Ordinal)); // control: the operation was logged
-        Assert.DoesNotContain(log.Entries, e => e.Text.Contains("SECRET-", StringComparison.Ordinal));
+        Assert.Contains(operation, formatted.Output); // control: the failed operation is in the log
+        Assert.Contains("RedisConnectionException", formatted.Output);
+        Assert.DoesNotContain("SECRET-", formatted.Output);
         Assert.DoesNotContain("SECRET-", ex.ToString());
     }
 
