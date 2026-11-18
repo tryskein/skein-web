@@ -82,6 +82,10 @@ internal sealed class SurfacesApi : HttpMessageHandler
                 ? Json(UserJson(UserB, "b@x.io", 3))
                 : Json(UserJson(UserA, "a@x.io", EpochA));
         }
+        if (path == "/ui/v1/auth/oidc/provision" && post)
+        {
+            return Json(UserJson(UserA, "a@x.io", EpochA));
+        }
         if (path == "/ui/v1/auth/signup" && post)
         {
             return Json(UserJson(UserA, "a@x.io", 4));
@@ -151,7 +155,11 @@ internal sealed class SurfacesHost : IAsyncDisposable
     public IServiceProvider Services => _app.Services;
     public string CookieName => "skein.sid";
 
-    public static async Task<SurfacesHost> StartAsync()
+    /// <param name="mode">Authentication mode; local by default.</param>
+    /// <param name="sso">Settings for the mode (the OIDC client for the native mode).</param>
+    /// <param name="configure">Extra registrations, after the standard ones.</param>
+    public static async Task<SurfacesHost> StartAsync(
+        WebAuthMode? mode = null, SsoOptions? sso = null, Action<IServiceCollection>? configure = null)
     {
         var mux = TestRedis.Connect(Database);
         mux.GetServers().First(s => !s.IsReplica).FlushDatabase(Database);
@@ -175,7 +183,8 @@ internal sealed class SurfacesHost : IAsyncDisposable
         var replica = new HubTestReplica(new HubTestWorld(), new FakeTimeProvider(DateTimeOffset.UtcNow));
         services.AddSingleton(replica.Registry);
         services.AddSingleton<TimeProvider>(TimeProvider.System);
-        services.AddSkeinAuthentication(WebAuthMode.FromApi("local", null), new SsoOptions());
+        services.AddSkeinAuthentication(mode ?? WebAuthMode.FromApi("local", null), sso ?? new SsoOptions());
+        configure?.Invoke(services);
         services.AddAuthorization();
         services.AddHttpContextAccessor();
         services.Configure<SsoOptions>(_ => { });
@@ -246,6 +255,19 @@ internal sealed class SurfacesHost : IAsyncDisposable
             await hub.OnConnectedAsync();
             return Results.Json(new { connection = id });
         });
+        if (mode?.IsKeycloakOidcMode == true)
+        {
+            // As Program.cs maps it.
+            app.MapGet("/oauth2/start", (HttpContext http, string? rd) => Results.Challenge(
+                new AuthenticationProperties { RedirectUri = OidcReturnPath.Resolve(rd, http.Request.Scheme, http.Request.Host.Value ?? string.Empty) },
+                new[] { Microsoft.AspNetCore.Authentication.OpenIdConnect.OpenIdConnectDefaults.AuthenticationScheme }))
+                .AllowAnonymous();
+            app.MapGet("/test/oidc-signout", async (HttpContext ctx) =>
+            {
+                await ctx.SignOutAsync(Microsoft.AspNetCore.Authentication.OpenIdConnect.OpenIdConnectDefaults.AuthenticationScheme);
+                return Results.Ok();
+            });
+        }
         app.MapControllers();
         app.UseMiddleware<ApiProxyMiddleware>();
 
