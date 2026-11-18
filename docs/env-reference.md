@@ -317,6 +317,24 @@ default. Changing the mode means restarting both services. The former
 `Authentication__Mode` and `Authentication__Hybrid` settings are gone — if a
 deployment still sets them, they are ignored.
 
+#### `SKEIN_ALLOW_INSECURE_HTTP`
+
+- **Purpose:** switches the session cookie to the insecure-http shape for local
+  work over plain HTTP. Off, the cookie is `__Host-skein.sid` with `Secure`,
+  `HttpOnly`, `Path=/`, no `Domain` and `SameSite=Lax`, whatever the request
+  scheme, `X-Forwarded-Proto` or proxy trust. On, the cookie is `skein.sid` with
+  the same attributes except `Secure`, again whatever the scheme or
+  `X-Forwarded-Proto`. A self-signed HTTPS certificate does not need this setting.
+- **Required:** no · **Default:** off · **Format:** `true` / `false`
+  (case-insensitive, parsed by the configuration binder).
+- **If unset:** off. The local and e2e compose files of the Skein stack set it
+  to `true` themselves.
+- **If `true` outside the `Development` environment:** startup throws
+  `InvalidOperationException` naming the setting, as the first action of the
+  process, so nothing is bound and no network is touched.
+- **Careful:** in the normal mode a cookie with `Path=/` is visible to every
+  application on the host, whatever the path it is served under.
+
 #### `Authentication__LogoutRedirectUrl` (`Authentication:LogoutRedirectUrl`)
 
 - **Purpose:** absolute sign-out URL of the authenticating proxy in front of this
@@ -328,7 +346,7 @@ deployment still sets them, they are ignored.
   compiled-in constant.
 - **Required:** no · **Default:** empty · **Format:** absolute `http(s)` URL.
 - **If unset in `Keycloak` mode:** the BFF degrades rather than fails — logout
-  clears the local `skein.sid` cookie, returns `redirectTo: null`, and a startup
+  clears the local session cookie (`__Host-skein.sid`, or `skein.sid` with `SKEIN_ALLOW_INSECURE_HTTP`), returns `redirectTo: null`, and a startup
   warning says the external proxy session survives, so the next request signs the
   user straight back in. Making it required would break proxy-less local runs of
   this mode for the sake of a value only a proxied deployment can supply.

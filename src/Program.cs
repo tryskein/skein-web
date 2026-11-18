@@ -29,6 +29,12 @@ DotNetRuntimeStatsBuilder
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Session cookie policy comes first: SKEIN_ALLOW_INSECURE_HTTP=true outside
+// Development throws here, before any required setting is read, before any
+// network call and before the port is bound.
+var sessionCookiePolicy = SessionCookiePolicy.Resolve(builder.Configuration, builder.Environment);
+builder.Services.AddSingleton(sessionCookiePolicy);
+
 // Console output: logfmt below Error, JSON for Error and Critical, secret-named
 // fields masked and request paths passed through LoggablePath — see
 // SkeinConsoleFormatter.
