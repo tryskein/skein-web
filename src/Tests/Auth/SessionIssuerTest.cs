@@ -72,6 +72,21 @@ public sealed class SessionIssuerTest
         Assert.NotEmpty(set.Value);
     }
 
+    [RedisFact]
+    public async Task Rotation_ClosesTheHubConnectionOfTheOldKey_ThroughTheRealPath()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var (cookie, key, _) = await host.SignInAsync(Alice);
+        var hub = await host.SendAsync("/test/hub", cookie);
+        var connection = JsonDocument.Parse(hub.Body).RootElement.GetProperty("connection").GetString()!;
+        Assert.DoesNotContain(connection, host.Replica.Aborted); // control: open before the rotation
+
+        await host.SendAsync($"/test/issue?user={Alice}", cookie);
+
+        Assert.Contains(connection, host.Replica.Aborted);
+        Assert.False(await host.Db.KeyExistsAsync(key));
+    }
+
     // ---- R26 ----------------------------------------------------------------------------------
 
     [RedisFact]
@@ -144,17 +159,21 @@ public sealed class SessionIssuerTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (cookie, key, _) = await host.SignInAsync(Alice);
-        host.Faults.After = (name, _) =>
+        var injected = false;
+        // The step that really follows the confirmed DEL: the removal of the member from the index.
+        host.Faults.Before = (name, _) =>
         {
-            if (name == nameof(IDatabase.ScriptEvaluateAsync))
+            if (name == nameof(IDatabase.SetRemoveAsync))
             {
-                host.Faults.Before = (_, _) => new InvalidOperationException("injected after the DEL");
+                injected = true;
+                return new InvalidOperationException("injected after the DEL");
             }
-            return Task.CompletedTask;
+            return null;
         };
 
         var reply = await host.SendAsync("/test/end-current", cookie);
 
+        Assert.True(injected, "the failure was never injected: the test proves nothing");
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         Assert.True(Assert.Single(reply.Cookies).IsDeletion);
         host.Faults.Before = null;
