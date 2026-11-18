@@ -84,7 +84,10 @@ internal sealed class SurfacesApi : HttpMessageHandler
         }
         if (path == "/ui/v1/auth/oidc/provision" && post)
         {
-            return Json(UserJson(UserA, "a@x.io", EpochA));
+            var email = System.Text.Json.JsonDocument.Parse(body).RootElement.GetProperty("email").GetString()!;
+            return email.StartsWith('b')
+                ? Json(UserJson(UserB, "b@x.io", 3))
+                : Json(UserJson(UserA, "a@x.io", EpochA));
         }
         if (path == "/ui/v1/auth/signup" && post)
         {
@@ -135,9 +138,11 @@ internal sealed class SurfacesHost : IAsyncDisposable
     private readonly HttpClient _client;
 
     private SurfacesHost(WebApplication app, HttpClient client, ConnectionMultiplexer mux, DbProxy faults,
-        SurfacesApi api, HubTestReplica replica, SessionPipelineHost.ErrorLogs logs, TaskCompletionSource aborted)
+        SurfacesApi api, HubTestReplica replica, SessionPipelineHost.ErrorLogs logs, TaskCompletionSource aborted,
+        System.Collections.Concurrent.ConcurrentQueue<string> chain)
     {
         RequestAbortedSeen = aborted.Task;
+        ChainConnections = chain;
         _app = app;
         _client = client;
         Mux = mux;
@@ -149,6 +154,9 @@ internal sealed class SurfacesHost : IAsyncDisposable
 
     /// <summary>Completes when the server sees the client abort a request (RequestAborted fires).</summary>
     public Task RequestAbortedSeen { get; }
+
+    /// <summary>Hub connections opened by <c>/test/chain</c> inside the request that then went to the proxy.</summary>
+    public System.Collections.Concurrent.ConcurrentQueue<string> ChainConnections { get; }
 
     public ConnectionMultiplexer Mux { get; }
     public DbProxy Faults { get; }
@@ -163,8 +171,10 @@ internal sealed class SurfacesHost : IAsyncDisposable
     /// <param name="sso">Settings for the mode (the OIDC client for the native mode).</param>
     /// <param name="configure">Extra registrations, after the standard ones.</param>
     public static async Task<SurfacesHost> StartAsync(
-        WebAuthMode? mode = null, SsoOptions? sso = null, Action<IServiceCollection>? configure = null)
+        WebAuthMode? mode = null, SsoOptions? sso = null, Action<IServiceCollection>? configure = null, bool trustHeaders = false)
     {
+        // The legacy trust-headers mode with passwords kept (hybrid), so the explicit operations work too.
+        mode = trustHeaders ? new WebAuthMode(WebAuthKind.Keycloak, Hybrid: true) : mode;
         var mux = TestRedis.Connect(Database);
         mux.GetServers().First(s => !s.IsReplica).FlushDatabase(Database);
         var db = DbProxy.Create(mux.GetDatabase(Database), out var faults);
@@ -207,7 +217,8 @@ internal sealed class SurfacesHost : IAsyncDisposable
         services.AddSingleton<ActionRateLimiter>();
         services.AddTransient<ApiProxyMiddleware>();
         services.AddTransient<SessionStoreFailureMiddleware>();
-        services.AddSingleton(TrustedProxyConfig.FromEntries([]));
+        services.AddSingleton(TrustedProxyConfig.FromEntries(trustHeaders ? ["10.0.0.1"] : []));
+        services.AddTransient<SsoSessionMiddleware>();
         services.AddControllers().AddApplicationPart(typeof(SkeinWeb.Controllers.AccountController).Assembly);
         services.AddProblemDetails();
 
@@ -219,9 +230,23 @@ internal sealed class SurfacesHost : IAsyncDisposable
             ctx.RequestAborted.Register(() => aborted.TrySetResult());
             await next();
         });
+        if (trustHeaders)
+        {
+            // The transport peer is whatever the test says; the trusted one by default.
+            app.Use((ctx, next) =>
+            {
+                var peer = ctx.Request.Headers["X-Test-Peer"].FirstOrDefault() ?? "10.0.0.1";
+                ctx.Features.Set(new EdgeSnapshot(IPAddress.Parse(peer), AmbiguousForwardedHost: false));
+                return next();
+            });
+        }
         app.UseRouting();
         app.UseMiddleware<SessionStoreFailureMiddleware>();
         app.UseAuthentication();
+        if (trustHeaders)
+        {
+            app.UseMiddleware<SsoSessionMiddleware>();
+        }
         app.UseAuthorization();
 
         app.MapGet("/test/me", (HttpContext ctx) =>
@@ -232,12 +257,8 @@ internal sealed class SurfacesHost : IAsyncDisposable
                     key = SessionPrincipal.SessionKeyOf(ctx.User),
                 })
                 : Results.Unauthorized());
-        app.MapGet("/test/hub", async (HttpContext ctx) =>
+        async Task<string> ConnectAsync(HttpContext ctx)
         {
-            if (ctx.User.Identity?.IsAuthenticated != true)
-            {
-                return Results.Unauthorized();
-            }
             var user = Guid.Parse(ctx.User.FindFirstValue(ClaimTypes.NameIdentifier)!);
             world.AccessApi.SetUser(user);
             var id = $"surf-{Interlocked.Increment(ref _connection)}";
@@ -263,8 +284,13 @@ internal sealed class SurfacesHost : IAsyncDisposable
                 Groups = world.GroupManager,
             };
             await hub.OnConnectedAsync();
-            return Results.Json(new { connection = id });
-        });
+            return id;
+        }
+
+        app.MapGet("/test/hub", async (HttpContext ctx) =>
+            ctx.User.Identity?.IsAuthenticated != true
+                ? Results.Unauthorized()
+                : Results.Json(new { connection = await ConnectAsync(ctx) }));
         if (mode?.IsKeycloakOidcMode == true)
         {
             // As Program.cs maps it.
@@ -274,6 +300,18 @@ internal sealed class SurfacesHost : IAsyncDisposable
                 .AllowAnonymous();
         }
         app.MapControllers();
+        // One request: the connection is opened from the principal the SSO step left on THIS context, then the
+        // same context is sent on to the real /api/v1 proxy.
+        var chain = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        app.Use(async (ctx, next) =>
+        {
+            if (ctx.Request.Path == "/test/chain" && ctx.User.Identity?.IsAuthenticated == true)
+            {
+                chain.Enqueue(await ConnectAsync(ctx));
+                ctx.Request.Path = "/api/v1/projects";
+            }
+            await next();
+        });
         app.UseMiddleware<ApiProxyMiddleware>();
 
         await app.StartAsync();
@@ -281,7 +319,7 @@ internal sealed class SurfacesHost : IAsyncDisposable
         {
             BaseAddress = new Uri(app.Urls.First()),
         };
-        return new SurfacesHost(app, client, mux, faults, api, replica, logs, aborted);
+        return new SurfacesHost(app, client, mux, faults, api, replica, logs, aborted, chain);
     }
 
     public async Task<SessionPipelineHost.Reply> SendAsync(

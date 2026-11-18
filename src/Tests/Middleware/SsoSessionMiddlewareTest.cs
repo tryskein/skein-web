@@ -217,57 +217,6 @@ public class SsoSessionMiddlewareTest
     }
 
     [Fact]
-    public async Task KeycloakMode_AlreadyAuthenticated_WithFreshRefreshTimestamp_PassesThrough()
-    {
-        // Arrange: keycloak mode + cookie principal carrying a recent
-        // urn:skein:refreshed-at claim (within the 5-min TTL). The SSO
-        // middleware must NOT re-provision on every request — it
-        // short-circuits the TTL-refresh path when the timestamp is
-        // fresh.
-        var services = new ServiceCollection();
-        services.AddSingleton<SkeinApiClient>(_ =>
-        {
-            throw new InvalidOperationException(
-                "SkeinApiClient must not be resolved when the refresh timestamp is fresh");
-        });
-        var sp = services.BuildServiceProvider();
-
-        var mw = new SsoSessionMiddleware(
-            KeycloakMode,
-            TrustedProxies,
-            sp,
-            NullLogger<SsoSessionMiddleware>.Instance);
-
-        var ctx = new DefaultHttpContext();
-        ctx.Request.Path = "/";
-        WithTrustedPeer(ctx);
-        ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
-        ctx.Request.Headers["X-Auth-Request-User"] = "u";
-        ctx.User = new ClaimsPrincipal(
-            new ClaimsIdentity(
-                new[]
-                {
-                    new Claim(ClaimTypes.NameIdentifier, Guid.NewGuid().ToString()),
-                    FreshRefreshedAtClaim(),
-                },
-                authenticationType: "Cookies"));
-
-        var nextCalled = false;
-        RequestDelegate next = _ =>
-        {
-            nextCalled = true;
-            return Task.CompletedTask;
-        };
-
-        // Act
-        await mw.InvokeAsync(ctx, next);
-
-        // Assert
-        Assert.True(nextCalled);
-        Assert.Equal(200, ctx.Response.StatusCode);
-    }
-
-    [Fact]
     public async Task KeycloakMode_AlreadyAuthenticated_NoTrustHeaders_SkipsRefresh()
     {
         // Arrange: keycloak mode + authenticated principal but NO trust
@@ -352,91 +301,88 @@ public class SsoSessionMiddlewareTest
         }
     }
 
-    // ---- K-16: a TTL refresh never raises the epoch ----
+    // ---- R56: the trust boundary and the classification, without a store ----------------------------
 
-    private sealed class ProvisionApi(long sessionEpoch) : HttpMessageHandler
+    private static SsoSessionMiddleware Throwing(out List<string> touched)
     {
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
-            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
-            {
-                Content = new StringContent(
-                    "{\"id\":\"0199a1b2-0000-7000-8000-000000000001\",\"email\":\"u@example.com\"," +
-                    "\"username\":\"u\",\"name\":\"u\",\"role\":\"user\",\"isExternal\":false," +
-                    "\"sessionEpoch\":" + sessionEpoch + "}",
-                    System.Text.Encoding.UTF8, "application/json"),
-            });
+        var seen = new List<string>();
+        touched = seen;
+        var services = new ServiceCollection();
+        services.AddSingleton<SkeinApiClient>(_ =>
+        {
+            seen.Add("api");
+            throw new InvalidOperationException("skein-api must not be reached");
+        });
+        services.AddSingleton<SessionIssuer>(_ =>
+        {
+            seen.Add("issuer");
+            throw new InvalidOperationException("the issuer must not be reached");
+        });
+        return new SsoSessionMiddleware(
+            KeycloakMode, TrustedProxies, services.BuildServiceProvider(), NullLogger<SsoSessionMiddleware>.Instance);
     }
 
-    private sealed record RefreshRun(DefaultHttpContext Ctx, List<ClaimsPrincipal> SignIns, List<string?> SignOuts, bool NextCalled);
-
-    /// <summary>
-    /// A cookie session issued with epoch 3 whose refresh is due (stale
-    /// timestamp), trust headers present, and skein-api now reporting
-    /// <paramref name="apiEpoch"/>.
-    /// </summary>
-    private static async Task<RefreshRun> RefreshWithApiEpoch(long apiEpoch)
+    private static DefaultHttpContext RequestWith(string path, string peer, bool email = true, bool user = true, bool session = false)
     {
-        var signIns = new List<ClaimsPrincipal>();
-        var signOuts = new List<string?>();
-        var auth = new Moq.Mock<Microsoft.AspNetCore.Authentication.IAuthenticationService>();
-        auth.Setup(a => a.SignInAsync(Moq.It.IsAny<HttpContext>(), Moq.It.IsAny<string>(),
-                Moq.It.IsAny<ClaimsPrincipal>(), Moq.It.IsAny<Microsoft.AspNetCore.Authentication.AuthenticationProperties>()))
-            .Callback((HttpContext _, string _, ClaimsPrincipal p, Microsoft.AspNetCore.Authentication.AuthenticationProperties _) => signIns.Add(p))
-            .Returns(Task.CompletedTask);
-        auth.Setup(a => a.SignOutAsync(Moq.It.IsAny<HttpContext>(), Moq.It.IsAny<string?>(),
-                Moq.It.IsAny<Microsoft.AspNetCore.Authentication.AuthenticationProperties?>()))
-            .Callback((HttpContext _, string? scheme, Microsoft.AspNetCore.Authentication.AuthenticationProperties? _) => signOuts.Add(scheme))
-            .Returns(Task.CompletedTask);
-        var services = new ServiceCollection();
-        services.AddSingleton(auth.Object);
-        services.AddSingleton(new SkeinApiClient(
-            new HttpClient(new ProvisionApi(apiEpoch)) { BaseAddress = new Uri("http://skein-api.test/") },
-            NullLogger<SkeinApiClient>.Instance));
-        var sp = services.BuildServiceProvider();
+        var ctx = new DefaultHttpContext();
+        ctx.Request.Path = path;
+        ctx.Features.Set(new EdgeSnapshot(IPAddress.Parse(peer), AmbiguousForwardedHost: false));
+        if (email)
+        {
+            ctx.Request.Headers["X-Auth-Request-Email"] = "b@example.com";
+        }
+        if (user)
+        {
+            ctx.Request.Headers["X-Auth-Request-User"] = "b";
+        }
+        if (session)
+        {
+            ctx.User = new ClaimsPrincipal(new ClaimsIdentity(
+                [new Claim(ClaimTypes.NameIdentifier, "0199a1b2-0000-7000-8000-00000000000a"), FreshRefreshedAtClaim()],
+                authenticationType: "Cookies"));
+        }
+        return ctx;
+    }
 
-        var ctx = new DefaultHttpContext { RequestServices = sp };
-        ctx.Request.Path = "/";
-        WithTrustedPeer(ctx);
-        ctx.Request.Headers["X-Auth-Request-Email"] = "u@example.com";
-        ctx.Request.Headers["X-Auth-Request-User"] = "u";
-        var stale = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
-        ctx.User = new ClaimsPrincipal(new ClaimsIdentity(
-            [
-                new Claim(ClaimTypes.NameIdentifier, "0199a1b2-0000-7000-8000-000000000001"),
-                new Claim(ClaimTypes.Email, "u@example.com"),
-                new Claim("username", "u"),
-                new Claim(ClaimTypes.Name, "u"),
-                new Claim(ClaimTypes.Role, "user"),
-                new Claim("is_external", "false"),
-                new Claim(SessionPrincipal.SessionEpochClaim, "3"),
-                new Claim(RefreshedAtClaim, stale),
-            ],
-            authenticationType: "Cookies"));
+    [Theory]
+    [InlineData("198.51.100.9", true, true, true, "/")]   // an untrusted peer with a live session
+    [InlineData("198.51.100.9", true, true, false, "/")]  // an untrusted peer, no session
+    [InlineData("10.0.0.1", true, false, true, "/")]      // an incomplete pair: no username
+    [InlineData("10.0.0.1", false, true, true, "/")]      // an incomplete pair: no email
+    [InlineData("10.0.0.1", true, true, true, "/healthz")]
+    [InlineData("10.0.0.1", true, true, true, "/ready")]
+    [InlineData("10.0.0.1", true, true, true, "/metrics")]
+    [InlineData("10.0.0.1", true, true, true, "/api/auth/config")]
+    [InlineData("10.0.0.1", true, true, true, "/mcp")]
+    public async Task OutsideTheTrustBoundary_NeitherSkeinApiNorTheIssuerIsReached_AndNextRuns(
+        string peer, bool email, bool user, bool session, string path)
+    {
+        var mw = Throwing(out var touched);
+        var ctx = RequestWith(path, peer, email, user, session);
 
         var nextCalled = false;
-        var mw = new SsoSessionMiddleware(KeycloakMode, TrustedProxies, sp, NullLogger<SsoSessionMiddleware>.Instance);
         await mw.InvokeAsync(ctx, _ => { nextCalled = true; return Task.CompletedTask; });
-        return new RefreshRun(ctx, signIns, signOuts, nextCalled);
+
+        Assert.True(nextCalled);
+        Assert.Empty(touched);
+        Assert.Equal(200, ctx.Response.StatusCode);
     }
 
-    [Fact]
-    public async Task KeycloakMode_TtlRefresh_EpochChanged_EndsTheSession_NeverRaisesIt()
+    [Theory]
+    [InlineData(Surface.Login)]
+    [InlineData(Surface.Signup)]
+    [InlineData(Surface.InvitationSignup)]
+    [InlineData(Surface.PasswordResetComplete)]
+    public async Task AnExplicitSignInOperation_WithAnotherUsersHeaders_IsLeftAlone(Surface surface)
     {
-        var run = await RefreshWithApiEpoch(4);
+        var mw = Throwing(out var touched);
+        var ctx = RequestWith("/api/auth/anything", "10.0.0.1", session: true);
+        ctx.SetEndpoint(new Endpoint(null, new EndpointMetadataCollection(new ExplicitSignInAttribute(surface)), surface.ToString()));
 
-        Assert.Empty(run.SignIns);
-        Assert.Equal(["Cookies"], run.SignOuts);
-        Assert.False(run.Ctx.User.Identity?.IsAuthenticated ?? false);
-        Assert.True(run.NextCalled);
-    }
+        var nextCalled = false;
+        await mw.InvokeAsync(ctx, _ => { nextCalled = true; return Task.CompletedTask; });
 
-    [Fact]
-    public async Task KeycloakMode_TtlRefresh_SameEpoch_ReissuesWithThatEpoch()
-    {
-        var run = await RefreshWithApiEpoch(3);
-
-        var reissued = Assert.Single(run.SignIns);
-        Assert.Equal("3", reissued.FindFirstValue(SessionPrincipal.SessionEpochClaim));
-        Assert.Empty(run.SignOuts);
+        Assert.True(nextCalled);
+        Assert.Empty(touched);
     }
 }
