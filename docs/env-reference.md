@@ -85,6 +85,8 @@ spellings are shown below; the environment form is the one used in deployments.
   until the window ends.
 - **Required:** no · **Default:** `60` · **Format:** whole number of seconds,
   `1`–`3600`.
+- **Also used by:** the wait of a replica for the session-format cleanup of
+  another replica (see `REDIS_URL`); no marker within the window stops the start.
 - **If skein-api gives no valid answer within the window:** the process logs a
   critical error naming the last failure and exits with code 1 — the pod never
   becomes ready. There is no default mode to fall back on (E-13). A 401 (wrong
@@ -113,6 +115,16 @@ spellings are shown below; the environment form is the one used in deployments.
   about that option.
 - **Careful:** Redis holds sessions *and* cookie-encryption keys. A Redis without
   persistence logs everyone out when it restarts.
+- **Session format marker:** at startup, before the first request, skein-web
+  deletes once per deployment the session rows of the former format (Redis
+  hashes under `skein:session:*`), so every session issued before the update
+  ends and users sign in once. It records that in the key `skein:session-format`
+  (value `3`), takes the lock `skein:session-format:lock` while it works, and
+  touches no other key. The other replicas wait for the marker and stop the start
+  on the `SKEIN_API_STARTUP_TIMEOUT_SECONDS` window. After a rollback to the
+  former version, delete `skein:session-format` before rolling forward again;
+  without that the cleanup is skipped, and rows of the former format are still
+  rejected (a hash is read as no session, and the cookie format differs).
 
 #### `NATS_URL`
 

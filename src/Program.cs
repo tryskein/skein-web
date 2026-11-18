@@ -108,6 +108,7 @@ builder.Services.AddHealthChecks();
 // acceptable risk by user for R1.1.
 builder.Services.AddSingleton<RedisTicketStore>();
 builder.Services.AddSingleton<SessionIssuer>();
+builder.Services.AddSingleton<SessionStoreMigration>();
 builder.Services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
 builder.Services.AddSingleton<ISessionTicketProbe>(sp => sp.GetRequiredService<RedisTicketStore>());
 
@@ -392,6 +393,13 @@ builder.Services.AddSwaggerGen(c =>
 });
 
 var app = builder.Build();
+
+// Strict migration of the session format: before the first request is served,
+// the session rows of the former format are deleted once per deployment under a
+// lock, and the marker skein:session-format = 3 is written. Other replicas wait
+// for the marker and fail the start on SKEIN_API_STARTUP_TIMEOUT_SECONDS.
+await app.Services.GetRequiredService<SessionStoreMigration>()
+    .RunAsync(apiStartupTimeout, CancellationToken.None);
 
 // sk-194.6.52 — with NO trusted proxy declared, the ForwardedHeaders
 // middleware has no allowlist to check a forwarded header against, so
