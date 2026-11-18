@@ -219,7 +219,13 @@ public class AuthControllerThrottleTest
         var controller = new AuthController(apiClient, new LoginRateLimiter(mux.Object), LocalMode, sso, apiOpts,
             SkeinWeb.Tests.Auth.TestRedis.Issuer(), NullLogger<AuthController>.Instance);
         var services = new ServiceCollection();
-        services.AddSingleton(Mock.Of<IAuthenticationService>());
+        var auth = new Mock<IAuthenticationService>();
+        auth.Setup(a => a.SignInAsync(It.IsAny<HttpContext>(), It.IsAny<string>(), It.IsAny<ClaimsPrincipal>(), It.IsAny<AuthenticationProperties>()))
+            .Callback((HttpContext c, string _, ClaimsPrincipal _, AuthenticationProperties _) =>
+                SkeinWeb.Auth.SessionRequestState.Of(c).IssuedKey = "issued-key")
+            .Returns(Task.CompletedTask);
+        services.AddSingleton(auth.Object);
+        services.AddSingleton(SkeinWeb.Tests.Auth.TestRedis.RevokingStore());
         var ctx = new DefaultHttpContext { RequestServices = services.BuildServiceProvider() };
         ctx.Request.Host = new HostString("skein.test");
         ctx.Connection.RemoteIpAddress = IPAddress.Parse("203.0.113.5");

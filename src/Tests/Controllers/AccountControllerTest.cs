@@ -576,6 +576,174 @@ public class AccountControllerTest
         return closed;
     }
 
+    // ---- password reset: the outcomes of INV-13 on mocks (branches only; the chain is on the real handler) ----
+
+    private static string TypeOf(IActionResult result) =>
+        Assert.IsAssignableFrom<ProblemDetails>(Assert.IsType<ObjectResult>(result).Value).Type!;
+
+    private const string PasswordChangedNotIssued = "https://skein.local/errors/password-changed-session-not-issued";
+    private const string UpstreamUnavailableType = "https://skein.local/errors/upstream-unavailable";
+
+    [Theory]
+    [InlineData("same-user-session")]
+    [InlineData("other-user-session")]
+    [InlineData("no-session")]
+    public async Task ResetComplete_Complete_Is204_RevokesEveryTicketOfTheUser_AndIssuesOneNewSession(string requester)
+    {
+        var h = Build();
+        var closed = Connections(h);
+        h.NewRequest("203.0.113.7", user: requester switch
+        {
+            "same-user-session" => SignedInWithKey(U1, KeyOfThisTab),
+            "other-user-session" => SignedInWithKey(U2, "skein:session:u2"),
+            _ => null,
+        });
+
+        var result = await h.Controller.PasswordResetComplete(
+            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+
+        Assert.Equal(StatusCodes.Status204NoContent, StatusOf(result));
+        var issued = Assert.Single(h.SignIns);
+        Assert.Equal(U1, issued.FindFirstValue(ClaimTypes.NameIdentifier));
+        Assert.Equal("4", issued.FindFirstValue(SessionPrincipal.SessionEpochClaim));
+        // Nothing is kept by key: every ticket of the user goes, the new session is issued after.
+        h.Sessions.Verify(r => r.RemoveSessionsAsync(Guid.Parse(U1), null, It.IsAny<CancellationToken>()), Times.Once);
+        h.Sessions.Verify(r => r.RemoveSessionsAsync(Guid.Parse(U2), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Equal(new[] { "u1-this-tab", "u1-other" }.Order(), closed.Order());
+    }
+
+    [Fact]
+    public async Task ResetComplete_WhenNotEveryTicketIsRemoved_Is502PasswordChanged_WithNoSession_AndTheHubStillCloses()
+    {
+        var h = Build();
+        var closed = Connections(h);
+        h.Sessions.Setup(r => r.RemoveSessionsAsync(It.IsAny<Guid>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionRemovalResult(Removed: 1, Failed: 1, IndexRead: true));
+        h.NewRequest("203.0.113.7", user: SignedInWithKey(U1, KeyOfThisTab));
+
+        var result = await h.Controller.PasswordResetComplete(
+            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+
+        Assert.Equal(StatusCodes.Status502BadGateway, StatusOf(result));
+        Assert.Equal(PasswordChangedNotIssued, TypeOf(result));
+        Assert.Empty(h.SignIns);
+        Assert.Contains(h.Logs.Entries, e => e.Level == LogLevel.Error);
+        Assert.Equal(new[] { "u1-this-tab", "u1-other" }.Order(), closed.Order());
+    }
+
+    [Fact]
+    public async Task ResetComplete_WhenTheIndexCannotBeRead_IsTheSamePartialOutcome()
+    {
+        var h = Build();
+        h.Sessions.Setup(r => r.RemoveSessionsAsync(It.IsAny<Guid>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new SessionRemovalResult(Removed: 0, Failed: 0, IndexRead: false));
+        h.NewRequest("203.0.113.7");
+
+        var result = await h.Controller.PasswordResetComplete(
+            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+
+        Assert.Equal(PasswordChangedNotIssued, TypeOf(result));
+        Assert.Empty(h.SignIns);
+    }
+
+    [Fact]
+    public async Task ResetComplete_WithoutAReadableUserId_IsPasswordChanged_AndRevokesNothingByIndex()
+    {
+        var h = Build();
+        h.Api.Override = () => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("{\"sessionEpoch\":4}", Encoding.UTF8, "application/json"),
+        };
+        h.NewRequest("203.0.113.7");
+
+        var result = await h.Controller.PasswordResetComplete(
+            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+
+        Assert.Equal(PasswordChangedNotIssued, TypeOf(result));
+        Assert.Empty(h.SignIns);
+        h.Sessions.Verify(r => r.RemoveSessionsAsync(It.IsAny<Guid>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task ResetComplete_WithAKnownUserButNoEpoch_RevokesAndIsPasswordChanged()
+    {
+        var h = Build();
+        h.Api.Override = () => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(
+                "{\"id\":\"" + U1 + "\",\"email\":\"dev@client.io\",\"username\":\"dev\",\"name\":\"dev\",\"role\":\"user\"}",
+                Encoding.UTF8, "application/json"),
+        };
+        h.NewRequest("203.0.113.7");
+
+        var result = await h.Controller.PasswordResetComplete(
+            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+
+        Assert.Equal(PasswordChangedNotIssued, TypeOf(result));
+        Assert.Empty(h.SignIns);
+        h.Sessions.Verify(r => r.RemoveSessionsAsync(Guid.Parse(U1), null, It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task ResetComplete_WhenTheOutcomeIsUnknown_IsTheUnavailableError_WithoutAnyRevocation()
+    {
+        var h = Build();
+        h.Api.Override = () => throw new HttpRequestException("answer lost");
+        h.NewRequest("203.0.113.7", user: SignedInWithKey(U1, KeyOfThisTab));
+
+        var result = await h.Controller.PasswordResetComplete(
+            "tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+
+        Assert.Equal(StatusCodes.Status502BadGateway, StatusOf(result));
+        Assert.Equal(UpstreamUnavailableType, TypeOf(result));
+        Assert.Empty(h.SignIns);
+        h.Sessions.Verify(r => r.RemoveSessionsAsync(It.IsAny<Guid>(), It.IsAny<string?>(), It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    // ---- registrations: a confirmed answer without usable data is not a failure of the call ----
+
+    [Theory]
+    [InlineData("signup", "{}")]
+    [InlineData("signup", "{\"id\":\"0199a1b2-0000-7000-8000-000000000001\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\"}")]
+    [InlineData("invitations/{token}/signup", "{}")]
+    [InlineData("invitations/{token}/signup", "{\"id\":\"0199a1b2-0000-7000-8000-000000000001\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\",\"isExternal\":false,\"sessionEpoch\":4}")]
+    public async Task Registration_ConfirmedWithUnusableData_IsAccountCreatedNotSignedIn(string name, string body)
+    {
+        var route = ByName(name);
+        var h = Build();
+        h.Api.Override = () => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(body, Encoding.UTF8, "application/json"),
+        };
+        h.NewRequest("203.0.113.7");
+
+        var result = await route.Invoke(h.Controller, "dev@client.io", "tok-1", "dev", "correct horse");
+
+        Assert.Equal(StatusCodes.Status502BadGateway, StatusOf(result));
+        Assert.Equal("https://skein.local/errors/account-created-session-not-issued", TypeOf(result));
+        Assert.Empty(h.SignIns);
+        Assert.Contains(h.Logs.Entries, e => e.Level == LogLevel.Error);
+    }
+
+    [Theory]
+    [InlineData("signup")]
+    [InlineData("invitations/{token}/signup")]
+    public async Task Registration_NotConfirmed_IsTheOrdinaryUpstreamError(string name)
+    {
+        var route = ByName(name);
+        var h = Build();
+        h.Api.Override = () => new HttpResponseMessage(HttpStatusCode.Created)
+        {
+            Content = new StringContent(AuthResponseU1, Encoding.UTF8, "application/json"),
+        };
+        h.NewRequest("203.0.113.7");
+
+        var result = await route.Invoke(h.Controller, "dev@client.io", "tok-1", "dev", "correct horse");
+
+        Assert.Equal(UpstreamUnavailableType, TypeOf(result));
+        Assert.Empty(h.SignIns);
+    }
+
     // ---- a 2xx outside the contract is not a success ----------
 
     public static TheoryData<string, string> NonContractSuccess()

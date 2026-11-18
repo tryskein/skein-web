@@ -140,7 +140,11 @@ public class AuthControllerLoginTest
                 It.IsAny<HttpContext>(), It.IsAny<string>(),
                 It.IsAny<ClaimsPrincipal>(), It.IsAny<AuthenticationProperties>()))
             .Callback<HttpContext, string, ClaimsPrincipal, AuthenticationProperties>(
-                (_, _, p, _) => captured = p)
+                (c, _, p, _) =>
+                {
+                    captured = p;
+                    SessionRequestState.Of(c).IssuedKey = "issued-key"; // what the store reports on an issue
+                })
             .Returns(Task.CompletedTask);
 
         var services = new ServiceCollection();

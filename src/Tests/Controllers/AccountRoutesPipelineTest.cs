@@ -119,6 +119,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         services.AddDataProtection();
         services.AddSingleton(new SessionCookiePolicy(AllowInsecureHttp: true));
         services.AddSingleton<RedisTicketStore>();
+        services.AddSingleton<SessionIssuer>();
         services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<ConnectionRegistry>();
