@@ -134,7 +134,12 @@ public sealed class PasswordResetSessionTest
         var onAlice = ConnectionOf(await host.SendAsync(HttpMethod.Get, "/test/hub", cookie: cookie));
         await MakeSlidingDueAsync(host, key);
         byte[] before = (await host.Db.StringGetAsync(key))!;
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected") : null;
+        // The key cannot be deleted by either of the two ways the sequence has: the revocation of the incoming
+        // key and the removal by the user's index.
+        host.Faults.Before = (name, args) =>
+            name == nameof(IDatabase.ScriptEvaluateAsync)
+            || (name == nameof(IDatabase.KeyDeleteAsync) && ((RedisKey)args[0]!).ToString() == key)
+                ? new InvalidOperationException("injected") : null;
 
         var reply = await ResetAsync(host, cookie);
 

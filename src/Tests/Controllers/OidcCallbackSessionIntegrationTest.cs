@@ -199,15 +199,16 @@ public sealed class OidcCallbackSessionIntegrationTest
     }
 
     [RedisFact]
-    public async Task ProviderSignOut_RemovesTheServerRowOfTheCurrentSession()
+    public async Task RemoteSignOutFromTheProvider_RemovesTheServerRowOfTheCurrentSession()
     {
         var (host, _) = await StartAsync();
         await using var __ = host;
         var (cookie, key) = await SignInByTicketAsync(host, "own-live");
 
-        var reply = await host.SendAsync(HttpMethod.Get, "/test/oidc-signout", cookie: cookie);
+        // The provider's front-channel sign-out request: the handler signs out of SignOutScheme (Main).
+        var reply = await host.SendAsync(HttpMethod.Get, "/signout-oidc", cookie: cookie);
 
-        Assert.True((int)reply.Status < 400 || reply.Status == HttpStatusCode.Redirect);
+        Assert.True((int)reply.Status < 500, reply.Body);
         Assert.False(await host.Db.KeyExistsAsync(key));
     }
 
