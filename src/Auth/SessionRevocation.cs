@@ -1,6 +1,5 @@
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.Cookies;
 using SkeinWeb.Hubs;
 
 namespace SkeinWeb.Auth;
@@ -43,24 +42,33 @@ public static class SessionRevocation
     }
 
     /// <summary>
-    /// Ends the session of the current request: signs out of the cookie scheme,
-    /// which deletes the cookie and removes the Redis ticket, then closes this
-    /// replica's hub connections opened with that session (INV-26: a revoked
-    /// session receives no more hub frames). Connections on other replicas are
-    /// closed by their access re-check once the ticket is gone
-    /// (<see cref="AccessRecheckService"/>). Never retried, and not cancellable —
-    /// tearing a session down is past the point of no return (same reasoning
-    /// as logout).
+    /// Ends the session of the current request. The row of the key of the EFFECTIVE principal
+    /// (the new key after an issue on this request, otherwise the key of the cookie) is deleted
+    /// first, this replica's hub connections opened with that session are closed (INV-26: a revoked
+    /// session receives no more hub frames), the late sliding write of Main is suppressed, and only
+    /// then the cookie scheme is signed out, which deletes the cookie. The sign-out's own removal of
+    /// the incoming key is a no-op when that key was just deleted
+    /// (<see cref="SessionRequestState.RemovedKeys"/>). Connections on other replicas are closed by
+    /// their access re-check once the ticket is gone (<see cref="AccessRecheckService"/>). Never
+    /// retried, and not cancellable — tearing a session down is past the point of no return (same
+    /// reasoning as logout).
     /// </summary>
     /// <param name="context">The request whose session ends: revoked by
     /// skein-api, or signed out by the user (<c>POST /api/auth/logout</c>).</param>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
     public static async Task EndSessionAsync(HttpContext context)
     {
         var sessionKey = SessionPrincipal.SessionKeyOf(context.User);
-        await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+        var state = SessionRequestState.Of(context);
+        state.SuppressMainWrite = true;
+        state.NoCancellation = true;
+
         if (sessionKey is not null)
         {
+            await context.RequestServices.GetRequiredService<RedisTicketStore>()
+                .RevokeAsync(sessionKey, context, CancellationToken.None);
             context.RequestServices.GetService<ConnectionRegistry>()?.AbortSession(sessionKey);
         }
+        await context.SignOutAsync(SessionSchemes.Main);
     }
 }

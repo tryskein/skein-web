@@ -107,6 +107,7 @@ builder.Services.AddHealthChecks();
 // not enough for cross-origin clients or older browsers. Confirmed
 // acceptable risk by user for R1.1.
 builder.Services.AddSingleton<RedisTicketStore>();
+builder.Services.AddSingleton<SessionIssuer>();
 builder.Services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
 builder.Services.AddSingleton<ISessionTicketProbe>(sp => sp.GetRequiredService<RedisTicketStore>());
 
