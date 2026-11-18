@@ -53,24 +53,39 @@ internal sealed class StartupStand : IAsyncDisposable
         var options = StackExchange.Redis.ConfigurationOptions.Parse(TestRedis.Url!);
         var endpoint = options.EndPoints[0];
         var (host, port) = endpoint is DnsEndPoint dns ? (dns.Host, dns.Port) : (((IPEndPoint)endpoint).Address.ToString(), ((IPEndPoint)endpoint).Port);
-        var proxy = new RedisProxy(host, port);
-        var api = await StubSkeinApi.StartAsync(authMode);
-        if (beforeLaunch is not null)
+        RedisProxy? proxy = null;
+        StubSkeinApi? api = null;
+        try
         {
-            await beforeLaunch(proxy);
-        }
-        var app = AppProcess.Start(new Dictionary<string, string?>
-        {
-            ["ASPNETCORE_ENVIRONMENT"] = environment,
-            ["SKEIN_ALLOW_INSECURE_HTTP"] = insecure,
-            ["SKEIN_API_URL"] = api.Url,
-            ["SKEIN_INTERNAL_SECRET"] = Internal,
-            ["REDIS_URL"] = $"redis://127.0.0.1:{proxy.Port}",
-            ["NATS_URL"] = Environment.GetEnvironmentVariable("TEST_NATS_URL"),
-            ["SKEIN_TRUSTED_PROXIES"] = trusted,
-            ["SKEIN_API_STARTUP_TIMEOUT_SECONDS"] = "60",
-        });
+            proxy = new RedisProxy(host, port);
+            api = await StubSkeinApi.StartAsync(authMode);
+            if (beforeLaunch is not null)
+            {
+                await beforeLaunch(proxy);
+            }
+            var app = AppProcess.Start(new Dictionary<string, string?>
+            {
+                ["ASPNETCORE_ENVIRONMENT"] = environment,
+                ["SKEIN_ALLOW_INSECURE_HTTP"] = insecure,
+                ["SKEIN_API_URL"] = api.Url,
+                ["SKEIN_INTERNAL_SECRET"] = Internal,
+                ["REDIS_URL"] = $"redis://127.0.0.1:{proxy.Port}",
+                ["NATS_URL"] = Environment.GetEnvironmentVariable("TEST_NATS_URL"),
+                ["SKEIN_TRUSTED_PROXIES"] = trusted,
+                ["SKEIN_API_STARTUP_TIMEOUT_SECONDS"] = "60",
+            });
         return new StartupStand(proxy, api, app, mux);
+        }
+        catch
+        {
+            proxy?.Dispose();
+            if (api is not null)
+            {
+                await api.DisposeAsync();
+            }
+            mux.Dispose();
+            throw;
+        }
     }
 
     public async Task<(HttpStatusCode Status, string Body, string[] SetCookies)> SendAsync(
@@ -136,7 +151,16 @@ public sealed class StandardStartupIntegrationTest
             seed.Dispose();
             hold = proxy.Hold(predicate);
         });
-        await hold!.Reached.WaitAsync(TimeSpan.FromSeconds(60));
+        try
+        {
+            await hold!.Reached.WaitAsync(TimeSpan.FromSeconds(60));
+        }
+        catch
+        {
+            // A start that never reaches the held command must not leave the process and the ports behind.
+            await stand.DisposeAsync();
+            throw;
+        }
         return stand;
     }
 
