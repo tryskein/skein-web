@@ -45,7 +45,7 @@ public sealed class SessionSurfacesTest
     private static async Task<(string, string, string)> ExpiredAsync(SurfacesHost host, string cookie, string key, string control)
     {
         await host.Db.KeyDeleteAsync(key);
-        return (cookie, "-", control);
+        return (cookie, key, control); // the key stays known: the new key must differ from it
     }
 
     // ---- R40 ----------------------------------------------------------------------------------

@@ -142,7 +142,7 @@ public sealed class OidcCallbackSessionIntegrationTest
         // The sessions of the stand are made by a local-mode login route of the same host.
         var (cookie, old) = await SignInByTicketAsync(host, kind);
         var other = await StoreAsync(host, A);
-        var connection = old == "-" ? null : await OpenHubAsync(host, cookie);
+        var connection = old == "-" || !await host.Db.KeyExistsAsync(old) ? null : await OpenHubAsync(host, cookie);
 
         var (reply, location) = await CallbackAsync(host, idp, returnUri, cookie);
 
@@ -247,7 +247,7 @@ public sealed class OidcCallbackSessionIntegrationTest
                 var key = await StoreAsync(host, A);
                 var cookie = CookieFor(host, key);
                 await host.Db.KeyDeleteAsync(key);
-                return (cookie, "-");
+                return (cookie, key); // known, so the new key is told from it
             }
             default:
                 return ($"{host.CookieName}=not-a-session-value", "-");

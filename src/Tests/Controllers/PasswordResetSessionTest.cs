@@ -88,6 +88,12 @@ public sealed class PasswordResetSessionTest
         Assert.Equal(HttpStatusCode.OK, (await host.SendAsync(HttpMethod.Get, "/test/me", cookie: set.AsRequestCookie())).Status);
         Assert.Equal(HttpStatusCode.OK, (await ProxyAsync(host, set.AsRequestCookie())).Status); // epoch of the new session is accepted
         Assert.Equal([fresh], host.IndexOf(A));
+        if (kind == "expired")
+        {
+            Assert.NotEqual(bobKey, fresh);
+            Assert.False(await host.Db.KeyExistsAsync(bobKey));
+            Assert.Equal(HttpStatusCode.Unauthorized, (await host.SendAsync(HttpMethod.Get, "/test/me", cookie: bobCookie)).Status);
+        }
         Assert.False(await host.Db.KeyExistsAsync(aliceKey));
         Assert.False(await host.Db.KeyExistsAsync(aliceOther));
         Assert.Contains(onAlice, host.Replica.Aborted);
