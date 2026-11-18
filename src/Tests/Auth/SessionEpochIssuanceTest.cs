@@ -91,7 +91,16 @@ public class SessionEpochIssuanceTest
         CookieAuthenticationDefaults.AuthenticationScheme));
 
     /// <summary>What a door did: the principals it signed in, and the log levels.</summary>
-    private sealed record Outcome(IReadOnlyList<ClaimsPrincipal> Sessions, IReadOnlyList<LogLevel> Levels);
+    private sealed record Outcome(IReadOnlyList<ClaimsPrincipal> Sessions, IReadOnlyList<LogLevel> Levels, int? Status = null);
+
+    private static int? StatusOf<T>(ActionResult<T> result) => StatusOf(result.Result as IActionResult ?? new OkResult());
+
+    private static int? StatusOf(IActionResult result) => result switch
+    {
+        ObjectResult o => o.StatusCode ?? StatusCodes.Status200OK,
+        StatusCodeResult s => s.StatusCode,
+        _ => null,
+    };
 
     /// <summary>A request context whose sign-ins are captured.</summary>
     private static (DefaultHttpContext Ctx, List<ClaimsPrincipal> SignIns) Context(
@@ -101,7 +110,11 @@ public class SessionEpochIssuanceTest
         var auth = new Mock<IAuthenticationService>();
         auth.Setup(a => a.SignInAsync(It.IsAny<HttpContext>(), It.IsAny<string>(),
                 It.IsAny<ClaimsPrincipal>(), It.IsAny<AuthenticationProperties>()))
-            .Callback((HttpContext _, string _, ClaimsPrincipal p, AuthenticationProperties _) => signIns.Add(p))
+            .Callback((HttpContext c, string _, ClaimsPrincipal p, AuthenticationProperties _) =>
+            {
+                signIns.Add(p);
+                SessionRequestState.Of(c).IssuedKey = "issued-key"; // what the store reports on an issue
+            })
             .Returns(Task.CompletedTask);
         services.AddSingleton(auth.Object);
         services.AddSingleton<ProblemDetailsFactory, PlainProblemDetailsFactory>();
@@ -145,8 +158,8 @@ public class SessionEpochIssuanceTest
         var (ctx, signIns) = Context(new ServiceCollection());
         controller.ControllerContext = new ControllerContext { HttpContext = ctx };
 
-        await controller.Login(new LoginRequest("dev@client.io", "pw"), CancellationToken.None);
-        return new Outcome(signIns, log.Levels);
+        var result = await controller.Login(new LoginRequest("dev@client.io", "pw"), CancellationToken.None);
+        return new Outcome(signIns, log.Levels, StatusOf(result));
     }
 
     private static async Task<Outcome> NativeOidc(bool withEpoch)
@@ -228,8 +241,8 @@ public class SessionEpochIssuanceTest
         var (ctx, signIns) = Context(new ServiceCollection());
         controller.ControllerContext = new ControllerContext { HttpContext = ctx };
 
-        await controller.Signup(new SignupRequest("dev@client.io", "dev", "pw", true, null, "en"), CancellationToken.None);
-        return new Outcome(signIns, log.Levels);
+        var result = await controller.Signup(new SignupRequest("dev@client.io", "dev", "pw", true, null, "en"), CancellationToken.None);
+        return new Outcome(signIns, log.Levels, StatusOf(result));
     }
 
     private static async Task<Outcome> InvitationSignup(bool withEpoch)
@@ -239,8 +252,8 @@ public class SessionEpochIssuanceTest
         var (ctx, signIns) = Context(new ServiceCollection());
         controller.ControllerContext = new ControllerContext { HttpContext = ctx };
 
-        await controller.InvitationSignup("tok-1", new InvitationSignupRequest("dev", "pw", true), CancellationToken.None);
-        return new Outcome(signIns, log.Levels);
+        var result = await controller.InvitationSignup("tok-1", new InvitationSignupRequest("dev", "pw", true), CancellationToken.None);
+        return new Outcome(signIns, log.Levels, StatusOf(result));
     }
 
     private static async Task<Outcome> PasswordReset(bool withEpoch)
@@ -252,8 +265,8 @@ public class SessionEpochIssuanceTest
         var (ctx, signIns) = Context(new ServiceCollection(), ExistingSession());
         controller.ControllerContext = new ControllerContext { HttpContext = ctx };
 
-        await controller.PasswordResetComplete("tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
-        return new Outcome(signIns, log.Levels);
+        var result = await controller.PasswordResetComplete("tok-1", new PasswordResetCompleteRequest("new"), CancellationToken.None);
+        return new Outcome(signIns, log.Levels, StatusOf(result));
     }
 
     private static Task<Outcome> Through(string door, bool withEpoch) => door switch
@@ -278,6 +291,10 @@ public class SessionEpochIssuanceTest
     {
         var outcome = await Through(door, withEpoch: true);
 
+        if (outcome.Status is { } status)
+        {
+            Assert.InRange(status, 200, 204); // a refused issue would answer 502 and still have captured a principal
+        }
         var session = Assert.Single(outcome.Sessions);
         Assert.Equal(U1, session.FindFirstValue(ClaimTypes.NameIdentifier));
         Assert.Equal(AnswerEpoch, session.FindFirstValue(SessionPrincipal.SessionEpochClaim));
