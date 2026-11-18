@@ -123,14 +123,13 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return;
         }
 
-        var issuer = context.RequestServices.GetRequiredService<SessionIssuer>();
         var authenticated = context.User.Identity is { IsAuthenticated: true };
 
         if (authenticated)
         {
             // 6) The pair of THIS request against the remembered one: local, no call to skein-api.
             var current = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
-            var pairMatches = PairMatches(current.Properties, email, username);
+            var pairMatches = PairMatches(current?.Properties, email, username);
             if (pairMatches && !IsRefreshDue(context.User))
             {
                 await next(context);
@@ -152,7 +151,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
                 return;
             }
 
-            if (!await ApplyToLiveSessionAsync(context, issuer, confirmed, email, username))
+            if (!await ApplyToLiveSessionAsync(context, confirmed, email, username))
             {
                 return;
             }
@@ -166,7 +165,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
         {
             return;
         }
-        if (!await RotateToAsync(context, issuer, bootstrap, email, username))
+        if (!await RotateToAsync(context, bootstrap, email, username))
         {
             return;
         }
@@ -252,13 +251,13 @@ public sealed class SsoSessionMiddleware : IMiddleware
     /// and epoch → an explicit renewal of the same key. False when the response is already written.
     /// </summary>
     private async Task<bool> ApplyToLiveSessionAsync(
-        HttpContext context, SessionIssuer issuer, Confirmed confirmed, string email, string username)
+        HttpContext context, Confirmed confirmed, string email, string username)
     {
         var ticketUserId = context.User.FindFirstValue(ClaimTypes.NameIdentifier);
         if (!string.Equals(ticketUserId, confirmed.User.Id, StringComparison.OrdinalIgnoreCase))
         {
             _logger.LogInformation("sso: the confirmed subject differs from the session's; a new session is issued");
-            return await RotateToAsync(context, issuer, confirmed, email, username);
+            return await RotateToAsync(context, confirmed, email, username);
         }
 
         var ticketEpoch = context.User.FindFirstValue(SessionPrincipal.SessionEpochClaim);
@@ -271,7 +270,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
                 "sso: the session of {UserId} is revoked (epoch changed); session ended", confirmed.User.Id);
             try
             {
-                await issuer.EndCurrentAsync(context);
+                await _services.GetRequiredService<SessionIssuer>().EndCurrentAsync(context);
             }
             catch (SessionIssueException)
             {
@@ -285,11 +284,11 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return true;
         }
 
-        return await RenewSameKeyAsync(context, issuer, confirmed, email, username);
+        return await RenewSameKeyAsync(context, confirmed, email, username);
     }
 
     private async Task<bool> RenewSameKeyAsync(
-        HttpContext context, SessionIssuer issuer, Confirmed confirmed, string email, string username)
+        HttpContext context, Confirmed confirmed, string email, string username)
     {
         var key = SessionPrincipal.SessionKeyOf(context.User);
         var principal = NewPrincipal(confirmed);
@@ -319,7 +318,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
 
             case RenewOutcome.KeyAbsent:
                 // The row is gone (revoked in parallel): a new authentication from the answer already in hand.
-                return await RotateToAsync(context, issuer, confirmed, email, username);
+                return await RotateToAsync(context, confirmed, email, username);
 
             case RenewOutcome.CasExhausted:
             case RenewOutcome.OwnerMismatch:
@@ -334,8 +333,9 @@ public sealed class SsoSessionMiddleware : IMiddleware
     }
 
     private async Task<bool> RotateToAsync(
-        HttpContext context, SessionIssuer issuer, Confirmed confirmed, string email, string username)
+        HttpContext context, Confirmed confirmed, string email, string username)
     {
+        var issuer = _services.GetRequiredService<SessionIssuer>();
         try
         {
             await issuer.RotateAsync(
@@ -343,11 +343,24 @@ public sealed class SsoSessionMiddleware : IMiddleware
         }
         catch (SessionIssueException)
         {
-            await WriteJsonStatusAsync(context, StatusCodes.Status502BadGateway, new
-            {
-                error = "sso_provisioning_failed",
-                message = "Failed to establish a Skein session from your SSO identity. Try again.",
-            });
+            // A key the request carried that could not be revoked is a failure of the store (the old key
+            // stays alive for its owner); any other failure is the issue of the new session.
+            var revokeFailed = issuer.IncomingSessionKey(context) is not null
+                && !SessionRequestState.Of(context).PreviousKeyRevoked;
+            await WriteJsonStatusAsync(
+                context,
+                StatusCodes.Status502BadGateway,
+                revokeFailed
+                    ? new
+                    {
+                        error = "sso_unavailable",
+                        message = "Authentication service is temporarily unavailable.",
+                    }
+                    : new
+                    {
+                        error = "sso_provisioning_failed",
+                        message = "Failed to establish a Skein session from your SSO identity. Try again.",
+                    });
             return false;
         }
         _logger.LogInformation("sso: signed in user {UserId}", confirmed.User.Id);
