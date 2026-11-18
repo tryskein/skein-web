@@ -171,6 +171,7 @@ public sealed class AuthController : ControllerBase
     /// <response code="429">Too many failed attempts for this email; locked out for 60 seconds.</response>
     /// <response code="502">Upstream skein-api was unreachable, returned an unexpected status, or answered 200 without <c>sessionEpoch</c>.</response>
     [HttpPost("login")]
+    [ExplicitSignIn(Surface.Login)]
     [AllowAnonymous]
     [ProducesResponseType(typeof(UserDto), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]

@@ -69,29 +69,6 @@ namespace SkeinWeb.Middleware;
 public sealed class SsoSessionMiddleware : IMiddleware
 {
     /// <summary>
-    /// Bypass list — paths the middleware must never touch even in
-    /// keycloak mode. Infrastructure / static endpoints that either
-    /// don't carry oauth2-proxy headers or must work without a cookie.
-    /// </summary>
-    private static readonly string[] BypassPaths = new[]
-    {
-        "/healthz",
-        "/ready",
-        "/metrics",
-        "/mcp",
-        "/api/auth/config",
-    };
-
-    // oauth2-proxy trust headers (oauth2-proxy option set_xauthrequest = true):
-    //   X-Auth-Request-User   — the Keycloak `preferred_username` claim
-    //   X-Auth-Request-Email  — the Keycloak `email` claim
-    // X-Auth-Request-Access-Token is NOT forwarded (pass_access_token=false
-    // in a typical oauth2-proxy deployment), which is why the previous
-    // JWT-validation design silently no-op'd in such deployments.
-    private const string UserHeader = "X-Auth-Request-User";
-    private const string EmailHeader = "X-Auth-Request-Email";
-
-    /// <summary>
     /// Custom claim that records when the cookie principal was last
     /// re-synced against skein-api. Value is a Unix-seconds string. Used
     /// purely by this middleware — no other code reads it.
@@ -134,14 +111,10 @@ public sealed class SsoSessionMiddleware : IMiddleware
         }
 
         // 2) Bypass paths.
-        var path = context.Request.Path;
-        foreach (var prefix in BypassPaths)
+        if (TrustedSsoRequest.IsBypassPath(context.Request.Path))
         {
-            if (path.StartsWithSegments(prefix, StringComparison.OrdinalIgnoreCase))
-            {
-                await next(context);
-                return;
-            }
+            await next(context);
+            return;
         }
 
         // 3) Trust headers count only from a trusted TRANSPORT peer — the
@@ -150,8 +123,8 @@ public sealed class SsoSessionMiddleware : IMiddleware
         //    header (X-Forwarded-For, X-Original-For, …) takes part in this
         //    decision. Checked before the TTL refresh and the epoch check, so
         //    a foreign identity never refreshes, re-signs or ends a session.
-        if (HasTrustHeaders(context.Request) &&
-            !_trustedProxies.Contains(context.Features.Get<EdgeSnapshot>()?.TransportPeer))
+        if (TrustedSsoRequest.HasTrustHeaders(context.Request) &&
+            !TrustedSsoRequest.IsFromTrustedPeer(context, _trustedProxies))
         {
             _logger.LogWarning(
                 "sso: trust headers from a transport peer outside {Setting} ignored; " +
@@ -175,9 +148,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
         // 5) Read trust headers. Both must be present — username alone
         //    can't drive provisioning (skein-api needs the email key)
         //    and email alone can't populate the canonical handle.
-        var email = context.Request.Headers[EmailHeader].FirstOrDefault();
-        var username = context.Request.Headers[UserHeader].FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(username))
+        if (!TrustedSsoRequest.TryReadIdentity(context.Request, out var email, out var username))
         {
             await next(context);
             return;
@@ -291,10 +262,6 @@ public sealed class SsoSessionMiddleware : IMiddleware
         await next(context);
     }
 
-    /// <summary>Whether the request carries either trust header, whatever its value.</summary>
-    private static bool HasTrustHeaders(HttpRequest request) =>
-        request.Headers.ContainsKey(EmailHeader) || request.Headers.ContainsKey(UserHeader);
-
     /// <summary>
     /// TTL refresh fallback. Called on every authenticated request; only
     /// hits skein-api when the cookie's <see cref="RefreshedAtClaim"/>
@@ -311,9 +278,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
         // Leave the cookie alone — the user is still authenticated, the
         // event-driven NATS path covers role flips, and the next request
         // that DOES come through oauth2-proxy will refresh as expected.
-        var email = context.Request.Headers[EmailHeader].FirstOrDefault();
-        var username = context.Request.Headers[UserHeader].FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(username))
+        if (!TrustedSsoRequest.TryReadIdentity(context.Request, out var email, out var username))
         {
             return;
         }

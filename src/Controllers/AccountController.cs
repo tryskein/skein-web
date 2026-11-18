@@ -104,6 +104,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="429"><c>rate_limited</c> — BFF limiter or skein-api backstop.</response>
     /// <response code="502"><c>upstream_unavailable</c> — skein-api unreachable or answered outside the contract.</response>
     [HttpPost("signup")]
+    [ExplicitSignIn(Surface.Signup)]
     [ProducesResponseType(typeof(UserDto), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
@@ -273,6 +274,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="429"><c>rate_limited</c>.</response>
     /// <response code="502"><c>upstream_unavailable</c>.</response>
     [HttpPost("password-reset/{token}")]
+    [ExplicitSignIn(Surface.PasswordResetComplete)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
@@ -435,6 +437,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="429"><c>rate_limited</c>.</response>
     /// <response code="502"><c>upstream_unavailable</c>.</response>
     [HttpPost("invitations/{token}/signup")]
+    [ExplicitSignIn(Surface.InvitationSignup)]
     [ProducesResponseType(typeof(InvitationSignupResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
