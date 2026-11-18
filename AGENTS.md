@@ -107,7 +107,7 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 | integration | enabled | Session revocation through real NATS subscriptions and the shared Redis ticket store | `./scripts/integration-test.sh` | `./scripts/integration-test.sh 'FullyQualifiedName~<Class or Method>'` | `src/Tests/**`, trait `Category=Integration` |
 | e2e | covered by skein-frontend | no own suite; the `e2e` group of skein-frontend exercises the hub, the cookie session and the proxy on a live stack built from `projects/*` | from the top of `skein/`: `./scripts/e2e-test.sh` | from the top of `skein/`: `./scripts/e2e-test.sh -- -g '<test title>'` | `projects/skein-frontend/browser/e2e/` |
 | smoke (image contract) | not used | — | — | — | — |
-| mutation | not used | — | — | — | — |
+| mutation | on demand, a final gate for a large change | Stryker.NET on the Microsoft Testing Platform, only on lines changed since a base commit; runs on the test VMs only | see "Running on the test VMs" | one or more `--mutate` globs | `.progon/web.toml` |
 | source-reading checks | not used | — | — | — | — |
 | artifact contract | not used | — | — | — | — |
 
@@ -119,13 +119,34 @@ The profile is `.progon/web.toml`; run from the repository root:
 |---|---|---|
 | unit | `progon web unit` | `progon web unit 'FullyQualifiedName~<Class or Method>'` |
 | integ | `progon web integ` | `progon web integ 'FullyQualifiedName~<Class or Method>'` |
-| mutation | `progon web mutation '<glob>'` | the globs are Stryker `--mutate` targets, e.g. `'**/Health/*.cs'` |
+| mutation | `progon web mutation --since <BASE> --keep --split <N> --quota-wait 7200 --background <targets>` (see below) | the targets are Stryker `--mutate` globs, e.g. `'**/Health/*.cs'` |
 
 `integ` starts NATS and Redis fixtures and sets `TEST_NATS_URL`,
 `TEST_NATS_MONITOR_URL` and `TEST_REDIS_URL`. `mutation` runs Stryker.NET on the
 Microsoft Testing Platform: the run swaps `xunit.v3.mtp-off` for
 `xunit.v3.mtp-v2` in the snapshot's test project only, never in the repository.
 A full mutation run is long; always name targets.
+
+Mutation of everything changed since a base commit (`<BASE>`, the commit the
+work started from), in bash:
+
+```bash
+mapfile -t T < <(git diff --name-only <BASE>..HEAD -- src | grep -v '^src/Tests/' | grep '\.cs$' | sed 's#^src/##')
+progon web mutation --since <BASE> --keep --split 3 --quota-wait 7200 --background "${T[@]}"
+progon wait <group id printed by the command>
+```
+
+- The targets are globs relative to the project directory `src/`:
+  `Auth/SessionIssuer.cs`, not `src/Auth/SessionIssuer.cs` (a path with the
+  `src/` prefix matches no file, every mutant is ignored and the run ends with
+  `no mutant measured`). Pass each target as its own argument.
+- `--split` needs the targets named; it divides them into parts that run as one
+  group. The whole-run ceiling is 7200 s per part, so a change of a few
+  thousand mutants must be split (a run of about 3300 mutants was estimated at
+  about 3 hours, over the ceiling).
+- A verdict `no mutant measured` means the tool tested nothing: read the raw
+  log of the run (`results/stryker-net/stream.log` under the run directory in
+  the progon cache) before running again.
 
 ### Project specifics
 
