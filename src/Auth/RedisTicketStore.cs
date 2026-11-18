@@ -502,11 +502,19 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     /// out, revoked or removed, or has expired. Uses <c>EXISTS</c>, not a read, so it does not
     /// slide the lifetime: a session with an open hub connection must still expire.
     /// </summary>
-    /// <exception cref="Exception">The store is unreachable; the caller decides.</exception>
-    public Task<bool> ExistsAsync(string key, CancellationToken ct)
+    /// <exception cref="SessionStoreUnavailableException">The store is unreachable; the caller decides.</exception>
+    public async Task<bool> ExistsAsync(string key, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        return _redis.GetDatabase().KeyExistsAsync(key);
+        try
+        {
+            return await _redis.GetDatabase().KeyExistsAsync(key).WaitAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogFailure("exists", ex);
+            throw new SessionStoreUnavailableException();
+        }
     }
 
     /// <inheritdoc />
@@ -514,12 +522,20 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     /// Ownership is read from the reverse index: the key is in <c>skein:user-tickets:{userId}</c>.
     /// A revocation of the user's sessions drops the member.
     /// </remarks>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
     public async Task<bool> IsSessionOfAsync(string key, Guid userId, CancellationToken ct)
     {
-        var db = _redis.GetDatabase();
-        if (!await db.SetContainsAsync(UserIndexPrefix + userId, key))
+        try
         {
-            return false;
+            if (!await _redis.GetDatabase().SetContainsAsync(UserIndexPrefix + userId, key).WaitAsync(ct))
+            {
+                return false;
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogFailure("is-session-of", ex);
+            throw new SessionStoreUnavailableException();
         }
         return await ExistsAsync(key, ct);
     }

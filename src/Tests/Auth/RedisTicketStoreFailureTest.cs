@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
+using Microsoft.Extensions.Logging;
 using SkeinWeb.Auth;
 using StackExchange.Redis;
 
@@ -159,5 +160,25 @@ public class RedisTicketStoreFailureTest
 
         Assert.Equal(new SessionRemovalResult(Removed: 1, Failed: 1, IndexRead: true), result);
         Assert.Equal(["gone"], pruned);
+    }
+
+    [Fact]
+    public async Task Probes_OnATechnicalFailure_ThrowTheSourceFreeException_AndLogNoKey()
+    {
+        var log = new SessionPipelineHost.ErrorLogs();
+        using var factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Trace).AddProvider(log));
+        var db = new Mock<IDatabase>();
+        db.Setup(d => d.KeyExistsAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
+        db.Setup(d => d.SetContainsAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
+        var mux = new Mock<IConnectionMultiplexer>();
+        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
+        var store = new RedisTicketStore(mux.Object, factory.CreateLogger<RedisTicketStore>());
+
+        var exists = await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.ExistsAsync(Key, CancellationToken.None));
+        var owner = await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.IsSessionOfAsync(Key, Owner, CancellationToken.None));
+
+        Assert.All([exists, owner], e => Assert.Null(e.InnerException));
+        Assert.Contains(log.Entries, e => e.Text.Contains("exists") || e.Text.Contains("is-session-of"));
+        Assert.DoesNotContain(log.Entries, e => e.Text.Contains("SECRET-KEY-VALUE"));
     }
 }
