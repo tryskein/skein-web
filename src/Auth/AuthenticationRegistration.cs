@@ -112,7 +112,12 @@ public static class AuthenticationRegistration
                 // keeps the cookie small — we never replay access/refresh tokens
                 // back at Keycloak; skein-api derives identity from the cookie
                 // principal, not from upstream tokens.
-                options.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+                // Every new authentication is signed into the Issue scheme (a new key); ending a
+                // session, including the remote sign-out, stays on Main. Nothing in skein-web calls
+                // AuthenticateAsync with the OIDC scheme: with SignInScheme = Issue such a call would
+                // return nothing, because the Issue scheme never reads a cookie.
+                options.SignInScheme = SessionSchemes.Issue;
+                options.SignOutScheme = SessionSchemes.Main;
                 options.SaveTokens = false;
 
                 options.Scope.Clear();
@@ -275,6 +280,36 @@ public static class AuthenticationRegistration
                             provisioned.User,
                             sessionEpoch,
                             new Claim("urn:skein:refreshed-at", nowUnix));
+                    },
+
+                    // The session is issued here, entirely: the handler would sign into the Issue scheme
+                    // itself after this event, but a refusal must be answered inside the event (an
+                    // exception after TicketReceived does not reach OnRemoteFailure). The key the
+                    // callback request carried, whoever owns it, is revoked by the issuer first.
+                    OnTicketReceived = async ctx =>
+                    {
+                        ctx.HandleResponse();
+                        var issuer = ctx.HttpContext.RequestServices.GetRequiredService<SessionIssuer>();
+                        try
+                        {
+                            await issuer.RotateAsync(
+                                ctx.HttpContext,
+                                ctx.Principal!,
+                                new AuthenticationProperties { IsPersistent = true, AllowRefresh = true },
+                                "Oidc");
+                            ctx.Response.Redirect(string.IsNullOrEmpty(ctx.ReturnUri) ? "/" : ctx.ReturnUri);
+                        }
+                        catch (SessionIssueException)
+                        {
+                            ctx.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>()
+                                .CreateLogger("Oidc")
+                                .LogError("oidc: the session could not be issued; no cookie written");
+                            ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+                            ctx.Response.ContentType = "text/plain";
+                            await ctx.Response.WriteAsync(
+                                "OIDC sign-in failed. Contact your administrator.",
+                                ctx.HttpContext.RequestAborted);
+                        }
                     },
 
                     // OIDC challenge is browser-navigation, not XHR. Surfacing
