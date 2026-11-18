@@ -326,9 +326,16 @@ public sealed class SessionSurfacesTest
         };
 
         var first = host.LoginAsync("a@x.io", cookie: cookie);
-        await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        var second = await host.LoginAsync("a@x.io", cookie: cookie); // meets the already deleted key
-        release.SetResult();
+        SessionPipelineHost.Reply second;
+        try
+        {
+            await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            second = await host.LoginAsync("a@x.io", cookie: cookie); // meets the already deleted key
+        }
+        finally
+        {
+            release.TrySetResult(); // the held login is let go even when the second one fails
+        }
         var firstReply = await first;
 
         var firstSet = Assert.Single(firstReply.Sessions(host.CookieName));

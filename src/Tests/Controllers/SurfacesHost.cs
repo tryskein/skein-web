@@ -135,8 +135,9 @@ internal sealed class SurfacesHost : IAsyncDisposable
     private readonly HttpClient _client;
 
     private SurfacesHost(WebApplication app, HttpClient client, ConnectionMultiplexer mux, DbProxy faults,
-        SurfacesApi api, HubTestReplica replica, SessionPipelineHost.ErrorLogs logs)
+        SurfacesApi api, HubTestReplica replica, SessionPipelineHost.ErrorLogs logs, TaskCompletionSource aborted)
     {
+        RequestAbortedSeen = aborted.Task;
         _app = app;
         _client = client;
         Mux = mux;
@@ -145,6 +146,9 @@ internal sealed class SurfacesHost : IAsyncDisposable
         Replica = replica;
         Logs = logs;
     }
+
+    /// <summary>Completes when the server sees the client abort a request (RequestAborted fires).</summary>
+    public Task RequestAbortedSeen { get; }
 
     public ConnectionMultiplexer Mux { get; }
     public DbProxy Faults { get; }
@@ -209,6 +213,12 @@ internal sealed class SurfacesHost : IAsyncDisposable
 
         var app = builder.Build();
         var world = replica.World;
+        var aborted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        app.Use(async (ctx, next) =>
+        {
+            ctx.RequestAborted.Register(() => aborted.TrySetResult());
+            await next();
+        });
         app.UseRouting();
         app.UseMiddleware<SessionStoreFailureMiddleware>();
         app.UseAuthentication();
@@ -276,7 +286,7 @@ internal sealed class SurfacesHost : IAsyncDisposable
         {
             BaseAddress = new Uri(app.Urls.First()),
         };
-        return new SurfacesHost(app, client, mux, faults, api, replica, logs);
+        return new SurfacesHost(app, client, mux, faults, api, replica, logs, aborted);
     }
 
     public async Task<SessionPipelineHost.Reply> SendAsync(

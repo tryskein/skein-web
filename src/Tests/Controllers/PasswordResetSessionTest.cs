@@ -318,9 +318,15 @@ public sealed class PasswordResetSessionTest
             }
         };
         var reset = ResetAsync(host, cookie);
-        await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        await meanwhile();
-        release.SetResult();
+        try
+        {
+            await reached.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await meanwhile();
+        }
+        finally
+        {
+            release.TrySetResult(); // a failing step must not leave the held reset hanging
+        }
         return await reset;
     }
 
@@ -379,6 +385,7 @@ public sealed class PasswordResetSessionTest
     {
         await using var host = await SurfacesHost.StartAsync();
         var (_, old) = await host.SignInAsync("a@x.io");
+        var (bobCookie, bobKey) = await host.SignInAsync("b@x.io"); // the request carries ANOTHER user's key
         var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         host.Faults.After = async (name, _) =>
@@ -393,20 +400,34 @@ public sealed class PasswordResetSessionTest
         using var cancel = new CancellationTokenSource();
         using var client = new HttpClient { BaseAddress = new Uri(host.Services.GetRequiredService<Microsoft.AspNetCore.Hosting.Server.IServer>()
             .Features.Get<Microsoft.AspNetCore.Hosting.Server.Features.IServerAddressesFeature>()!.Addresses.First()) };
-        var request = client.PostAsJsonAsync(ResetPath, new { password = "new password" }, cancel.Token);
-        await reached.Task.WaitAsync(TimeSpan.FromSeconds(10)); // the API has confirmed the change; the pass is running
-        await cancel.CancelAsync();
-        await Task.Delay(500); // the server sees the abort
-        release.SetResult();
+        using var message = new HttpRequestMessage(HttpMethod.Post, ResetPath)
+        {
+            Content = JsonContent.Create(new { password = "new password" }),
+        };
+        message.Headers.TryAddWithoutValidation("Cookie", bobCookie);
+        Task<HttpResponseMessage>? request = null;
+        try
+        {
+            request = client.SendAsync(message, cancel.Token);
+            await reached.Task.WaitAsync(TimeSpan.FromSeconds(10)); // the API has confirmed the change; the pass is running
+            await cancel.CancelAsync();
+            await host.RequestAbortedSeen.WaitAsync(TimeSpan.FromSeconds(10)); // the server itself saw the abort
+        }
+        finally
+        {
+            release.TrySetResult(); // never leave the held request hanging when a wait above fails
+        }
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => request!);
         // The client is gone, so the answer is not observable; its effects are.
         var deadline = DateTime.UtcNow.AddSeconds(10);
-        while (DateTime.UtcNow < deadline && (await host.Db.KeyExistsAsync(old) || host.IndexOf(A).Count == 0))
+        while (DateTime.UtcNow < deadline
+            && (await host.Db.KeyExistsAsync(old) || await host.Db.KeyExistsAsync(bobKey) || host.IndexOf(A).Count == 0))
         {
             await Task.Delay(50);
         }
         Assert.False(await host.Db.KeyExistsAsync(old));
+        Assert.False(await host.Db.KeyExistsAsync(bobKey)); // the incoming key of another owner went too
         var issued = Assert.Single(host.IndexOf(A));
         var ticket = await host.Services.GetRequiredService<RedisTicketStore>().RetrieveAsync(issued, new DefaultHttpContext(), CancellationToken.None);
         Assert.Equal("4", ticket!.Principal.FindFirst(SessionPrincipal.SessionEpochClaim)!.Value);
