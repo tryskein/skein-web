@@ -421,7 +421,7 @@ public sealed class AuthController : ControllerBase
     /// <response code="401">Not authenticated.</response>
     /// <response code="502">Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpPost("logout")]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway, "application/problem+json")]
     [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [Authorize]
     [ProducesResponseType(typeof(LogoutResponse), StatusCodes.Status200OK)]
@@ -564,7 +564,7 @@ public sealed class AuthController : ControllerBase
     [Authorize]
     [ProducesResponseType(typeof(UserDto), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status401Unauthorized)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway, "application/problem+json")]
     [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Current user of the session",

@@ -82,7 +82,7 @@ public sealed class SwaggerEarlyFailureDocumentationTest
             // operations that can give the SSO form declare its schema next to the common one.
             var schemas = string.Join(' ', operation.GetProperty("responses").GetProperty("502").GetProperty("content")
                 .EnumerateObject().Select(c => c.Value.GetRawText()));
-            Assert.Contains("ProblemDetails", schemas);
+            Assert.True(schemas.Contains("ProblemDetails", StringComparison.Ordinal), $"{method} {path}: 502 schemas are {schemas}");
             Assert.Equal(@class == Class.Two, schemas.Contains("SsoUnavailableResponse", StringComparison.Ordinal));
 
             var url = path.Replace("{token}", "t").Replace("{", "").Replace("}", "");

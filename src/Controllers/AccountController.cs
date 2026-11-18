@@ -173,7 +173,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway, "application/problem+json")]
     [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Suggest usernames from an email",
@@ -228,7 +228,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway, "application/problem+json")]
     [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Request a password reset",
@@ -353,7 +353,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway, "application/problem+json")]
     [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Confirm an email address",
@@ -397,7 +397,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(InvitationPreviewResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway, "application/problem+json")]
     [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Preview an invitation",
