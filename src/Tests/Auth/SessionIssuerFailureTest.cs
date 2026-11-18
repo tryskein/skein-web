@@ -62,7 +62,7 @@ public class SessionIssuerFailureTest
 
         public DefaultHttpContext Request(string scheme = "https", string? cookie = null)
         {
-            var ctx = new DefaultHttpContext { RequestServices = Services };
+            var ctx = new DefaultHttpContext { RequestServices = Services.CreateScope().ServiceProvider };
             ctx.Request.Scheme = scheme;
             if (cookie is not null)
             {
@@ -176,7 +176,7 @@ public class SessionIssuerFailureTest
         var logged = string.Join('\n', w.Log.Entries.Select(e => e.Text));
         Assert.DoesNotContain("SECRET-KEY-VALUE", logged);
         Assert.Contains("SessionStoreUnavailableException", logged);
-        Assert.Empty(ctx.Response.Headers.SetCookie);
+        Assert.Equal(0, ctx.Response.Headers.SetCookie.Count);
     }
 
     [Fact]
@@ -192,7 +192,7 @@ public class SessionIssuerFailureTest
 
         Assert.Null(ex.InnerException);
         Assert.DoesNotContain("SECRET-KEY-VALUE", ex.ToString());
-        Assert.Empty(ctx.Response.Headers.SetCookie);
+        Assert.Equal(0, ctx.Response.Headers.SetCookie.Count);
     }
 
     // ---- R13 ----------------------------------------------------------------------------------
