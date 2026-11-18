@@ -173,15 +173,28 @@ public sealed class SsoSessionIntegrationTest
         Assert.Equal("pa@corp.io", stored.Properties.Items[RedisTicketStore.SsoEmailItem]);
     }
 
-    [RedisFact]
-    public async Task APairThatDiffersOnlyInCase_IsConfirmed()
+    [RedisTheory]
+    [InlineData("PA@corp.io", "pa")]
+    [InlineData("pa@corp.io", "PA")]
+    public async Task APairThatDiffersOnlyInCase_IsConfirmed_AndTheNewPairIsRememberedExactly(string email, string username)
     {
         await using var host = await StartAsync();
-        var (cookie, _) = await BootstrapAsync(host);
+        var (cookie, key) = await BootstrapAsync(host);
+        (string, string)[] headers = [("X-Auth-Request-Email", email), ("X-Auth-Request-User", username)];
 
-        await GetAsync(host, cookie, [("X-Auth-Request-Email", "PA@corp.io"), ("X-Auth-Request-User", "pa")]);
+        var first = await GetAsync(host, cookie, headers);
 
-        Assert.Equal(2, host.Api.CallsTo(Provision));
+        Assert.Equal(HttpStatusCode.OK, first.Status);
+        Assert.Equal(2, host.Api.CallsTo(Provision)); // the bootstrap and this confirmation
+        Assert.All(first.Sessions(host.CookieName), c => Assert.Equal(key, host.KeyOf(c))); // the same user: the key stays
+        var stored = await StoredAsync(host, key);
+        Assert.Equal(email, stored.Properties.Items[RedisTicketStore.SsoEmailItem]);
+        Assert.Equal(username, stored.Properties.Items[RedisTicketStore.SsoUserItem]);
+
+        var second = await GetAsync(host, cookie, headers);
+
+        Assert.Equal(HttpStatusCode.OK, second.Status);
+        Assert.Equal(2, host.Api.CallsTo(Provision)); // the next request with this pair is local
     }
 
     // ---- R58: the same subject, confirmed ------------------------------------------------------------
@@ -274,6 +287,64 @@ public sealed class SsoSessionIntegrationTest
     }
 
     // ---- R60: the confirmation fails -------------------------------------------------------------------
+
+    [RedisTheory]
+    [InlineData("server-error", 502, "sso_provisioning_failed")]
+    [InlineData("not-provisioned", 403, "user_not_provisioned")]
+    public async Task AFailedConfirmation_WithASlidingRenewalDue_KeepsTheStatusAndCode_WritesNoCookie_AndLeavesTheRow(
+        string failure, int status, string code)
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await BootstrapAsync(host);
+        await PasswordResetSessionTest.MakeSlidingDueAsync(host, key); // Main plans a sliding renewal
+        byte[] before = (await host.Db.StringGetAsync(key))!;
+        host.Api.Override = r => r.RequestUri!.AbsolutePath != Provision
+            ? null
+            : failure == "server-error"
+                ? new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                : new HttpResponseMessage(HttpStatusCode.Forbidden)
+                {
+                    Content = new StringContent("{\"error\":\"user_not_provisioned\"}", Encoding.UTF8, "application/json"),
+                };
+
+        var reply = await GetAsync(host, cookie, HeadersB); // another pair: the subject must be confirmed
+
+        Assert.Equal((HttpStatusCode)status, reply.Status);
+        Assert.Equal(code, ErrorOf(reply));
+        Assert.Empty(reply.Cookies);
+        Assert.Equal(before, (byte[])(await host.Db.StringGetAsync(key))!);
+    }
+
+    [RedisFact]
+    public async Task AMatchingPair_WithADueRefresh_WhenTheConfirmationFails_KeepsTheSession()
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await BootstrapAsync(host);
+        await AgeRefreshAsync(host, key);
+        host.Api.Override = r => r.RequestUri!.AbsolutePath == Provision ? new HttpResponseMessage(HttpStatusCode.InternalServerError) : null;
+
+        var reply = await GetAsync(host, cookie, HeadersA);
+
+        Assert.Equal(HttpStatusCode.OK, reply.Status); // the same login: a failed refresh is not fatal
+        Assert.Equal(A.ToString(), UserOf(reply));
+        Assert.True(await host.Db.KeyExistsAsync(key));
+        Assert.All(reply.Sessions(host.CookieName), c => Assert.Equal(key, host.KeyOf(c)));
+    }
+
+    [RedisFact]
+    public async Task AMatchingPair_WithADueRefresh_WhenTheAnswerHasNoEpoch_KeepsTheSession_AndLogsAnError()
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await BootstrapAsync(host);
+        await AgeRefreshAsync(host, key);
+        host.Api.Override = Provisioned(SurfacesApi.UserJson(A, "a@x.io", 3).Replace(",\"sessionEpoch\":3", ""));
+
+        var reply = await GetAsync(host, cookie, HeadersA);
+
+        Assert.Equal(HttpStatusCode.OK, reply.Status);
+        Assert.True(await host.Db.KeyExistsAsync(key));
+        Assert.Contains(host.Logs.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Error);
+    }
 
     [RedisTheory]
     [InlineData("unreachable", 502)]
@@ -584,12 +655,13 @@ public sealed class SsoSessionIntegrationTest
 
         var reply = await host.SendAsync(HttpMethod.Post, path, body, cookie, headers == "none" ? [] : HeadersB);
 
-        Assert.True(reply.Status is HttpStatusCode.OK or HttpStatusCode.NoContent, reply.Body);
+        Assert.Equal(operation == "reset" ? HttpStatusCode.NoContent : HttpStatusCode.OK, reply.Status);
         var set = Assert.Single(reply.Sessions(host.CookieName));
         var fresh = host.KeyOf(set);
         Assert.NotEqual(old, fresh); // never the key of the request
         Assert.Equal(0, host.Api.CallsTo(Provision)); // no confirmation on an explicit operation
         var me = await host.SendAsync(HttpMethod.Get, "/test/me", cookie: set.AsRequestCookie());
+        Assert.Equal(HttpStatusCode.OK, me.Status);
         Assert.Equal(A.ToString(), UserOf(me)); // the identity of the operation, not of the headers
         if (old is not null)
         {

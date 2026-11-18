@@ -467,6 +467,9 @@ public sealed class SsoSessionMiddleware : IMiddleware
 
     private static async Task WriteJsonStatusAsync(HttpContext context, int statusCode, object body)
     {
+        // Every answer written here is a refusal: the late sliding write of Main (a renewal it already
+        // planned) must neither touch the row nor add a Set-Cookie of the old key beside it.
+        SessionRequestState.Of(context).SuppressMainWrite = true;
         context.Response.StatusCode = statusCode;
         context.Response.ContentType = "application/json";
         await JsonSerializer.SerializeAsync(
