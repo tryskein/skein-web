@@ -24,46 +24,19 @@ namespace SkeinWeb.Middleware;
 /// reach this pod. The BFF identifies the user from the trusted headers
 /// and does NOT validate any JWT.
 /// </para>
-/// <para>Flow on a request without a cookie:
+/// <para>Flow (trust-headers mode, a trusted transport peer, both headers non-empty, an endpoint that
+/// is not an explicit sign-in operation and not a bypass path):
 /// <list type="number">
-///   <item>Skip unless <see cref="WebAuthMode.IsKeycloakMode"/> (legacy trust-headers).</item>
-///   <item>Skip bypass paths (health checks, metrics, MCP, auth/config).</item>
-///   <item>Trust headers (either one) from a transport peer outside
-///         <c>SKEIN_TRUSTED_PROXIES</c> — or with no
-///         <see cref="EdgeSnapshot"/> — are ignored: a Warning without
-///         personal data or addresses is written and the request goes on as
-///         it came, with no provisioning, no new session and no TTL refresh or
-///         epoch check of an existing one. An empty list trusts no peer.</item>
-///   <item>Skip if the request already carries an authenticated cookie principal —
-///         except that on every authenticated request we ALSO run the TTL
-///         refresh below.</item>
-///   <item>Skip if neither <c>X-Auth-Request-Email</c> nor
-///         <c>X-Auth-Request-User</c> are present — the request never
-///         traversed oauth2-proxy. Subsequent middleware will enforce
-///         auth (e.g. ApiProxyMiddleware returns 401).</item>
-///   <item>Otherwise: call <c>POST /ui/v1/auth/oidc/provision</c> on
-///         skein-api with {email, username, name} and
-///         <c>HttpContext.SignInAsync</c> to mint the same cookie + Redis
-///         ticket as the local-password login flow.</item>
-/// </list></para>
-/// <para>Flow on an authenticated request (TTL refresh fallback —
-/// belt-and-braces for the event-driven invalidation path in
-/// <see cref="SkeinWeb.Auth.UserChangedSubscriber"/>):
-/// <list type="number">
-///   <item>Read the <see cref="RefreshedAtClaim"/> claim. If missing OR
-///         older than <see cref="SessionRefreshTtl"/>, re-fetch claims
-///         from skein-api via <c>OidcProvisionAsync</c>.</item>
-///   <item>Diff against the current cookie claims (role / username /
-///         name / email). If anything changed → <c>SignInAsync</c> with
-///         the fresh tuple, which renews the Valkey ticket under the same key and rolls
-///         the cookie. If nothing changed → still <c>SignInAsync</c>
-///         with the same claims to refresh the timestamp (cheaper than
-///         a custom claims-only update, and keeps the renewal logic in
-///         one place).</item>
-///   <item>Skip silently if the trust headers are absent on this
-///         request — the cookie is still valid; the next request from
-///         oauth2-proxy will carry headers and the refresh will fire
-///         then.</item>
+///   <item>No session: confirm the subject at skein-api and issue a new session through
+///         <see cref="SessionIssuer"/>, remembering the header pair in the ticket.</item>
+///   <item>A live session whose remembered pair equals the request's pair: nothing is asked of
+///         skein-api (the sliding renewal of the cookie handler applies), except the periodic
+///         refresh every <see cref="SessionRefreshTtl"/>.</item>
+///   <item>A different or unknown pair, or a due refresh: confirm the subject. Another user id → a
+///         new session, the old key revoked. The same id with another epoch → the session ends and
+///         nothing is issued. The same id and epoch → an explicit renewal of the same key with the
+///         confirmed claims and the new pair; an absent row → a new session.</item>
+///   <item>An unconfirmed subject is neither executed as the old user nor given a session.</item>
 /// </list></para>
 /// </remarks>
 public sealed class SsoSessionMiddleware : IMiddleware
@@ -117,12 +90,19 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return;
         }
 
-        // 3) Trust headers count only from a trusted TRANSPORT peer — the
+        // 3) An explicit sign-in operation (login, signup, invitation signup, password reset) owns
+        //    its identity and its outcome: no comparison, no confirmation, no sign-in by headers.
+        if (context.GetEndpoint()?.Metadata.GetMetadata<ExplicitSignInAttribute>() is not null)
+        {
+            await next(context);
+            return;
+        }
+
+        // 4) Trust headers count only from a trusted TRANSPORT peer — the
         //    connection address EdgeSnapshotMiddleware recorded before
         //    ForwardedHeaders rewrote RemoteIpAddress to the visitor. No
         //    header (X-Forwarded-For, X-Original-For, …) takes part in this
-        //    decision. Checked before the TTL refresh and the epoch check, so
-        //    a foreign identity never refreshes, re-signs or ends a session.
+        //    decision. A foreign identity never creates, refreshes, rotates or ends a session.
         if (TrustedSsoRequest.HasTrustHeaders(context.Request) &&
             !TrustedSsoRequest.IsFromTrustedPeer(context, _trustedProxies))
         {
@@ -134,98 +114,107 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return;
         }
 
-        // 4) Already authenticated via the cookie? Run the TTL refresh
-        //    fallback path — re-fetch claims from skein-api when the
-        //    last sync is older than SessionRefreshTtl. Defends against
-        //    missed NATS events (lag, pod restart, queue-group drop).
-        if (context.User.Identity is { IsAuthenticated: true })
-        {
-            await TryRefreshClaimsAsync(context);
-            await next(context);
-            return;
-        }
-
-        // 5) Read trust headers. Both must be present — username alone
-        //    can't drive provisioning (skein-api needs the email key)
-        //    and email alone can't populate the canonical handle.
+        // 5) Both identity headers must be present: username alone cannot drive provisioning
+        //    (skein-api needs the email key) and email alone cannot populate the handle. Incomplete
+        //    headers neither create, rotate nor end a session.
         if (!TrustedSsoRequest.TryReadIdentity(context.Request, out var email, out var username))
         {
             await next(context);
             return;
         }
 
-        // Display name is intentionally empty here. oauth2-proxy does
-        // NOT forward a `name` claim unless it is explicitly added to
-        // the forwarded-header set, so on a stock edge config we have
-        // no upstream value to write. skein-api COALESCEs an
-        // empty `name` to either `username` (on INSERT) or the row's
-        // existing `name` (on UPDATE) — first-login-wins. A future
-        // profile-edit UI is the canonical place for the user to
-        // override their display name without it being re-synced from
-        // an absent claim on every page load.
-        var name = string.Empty;
+        var issuer = context.RequestServices.GetRequiredService<SessionIssuer>();
+        var authenticated = context.User.Identity is { IsAuthenticated: true };
 
-        // 6) Provision via skein-api.
-        AuthenticatedUser provisioned;
+        if (authenticated)
+        {
+            // 6) The pair of THIS request against the remembered one: local, no call to skein-api.
+            var current = await context.AuthenticateAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            var pairMatches = PairMatches(current.Properties, email, username);
+            if (pairMatches && !IsRefreshDue(context.User))
+            {
+                await next(context);
+                return;
+            }
+
+            // Same login with a due periodic refresh: a failed refresh is not fatal, the session stays.
+            // A different or unknown pair needs the subject confirmed first, and an unconfirmed
+            // subject is not executed as the old one, nor given a session.
+            var confirmed = await ConfirmAsync(context, email, username, failureIsFatal: !pairMatches);
+            if (confirmed is null)
+            {
+                // A fatal failure has written its answer; a failed periodic refresh of an unchanged
+                // pair leaves the session as it is.
+                if (pairMatches)
+                {
+                    await next(context);
+                }
+                return;
+            }
+
+            if (!await ApplyToLiveSessionAsync(context, issuer, confirmed, email, username))
+            {
+                return;
+            }
+            await next(context);
+            return;
+        }
+
+        // 7) No session: the bootstrap, a new authentication from the headers.
+        var bootstrap = await ConfirmAsync(context, email, username, failureIsFatal: true);
+        if (bootstrap is null)
+        {
+            return;
+        }
+        if (!await RotateToAsync(context, issuer, bootstrap, email, username))
+        {
+            return;
+        }
+        await next(context);
+    }
+
+    /// <summary>The remembered pair of the session equals the pair of the request: both non-empty, ordinal.</summary>
+    private static bool PairMatches(AuthenticationProperties? properties, string email, string username) =>
+        properties is not null
+        && properties.Items.TryGetValue(RedisTicketStore.SsoEmailItem, out var rememberedEmail)
+        && properties.Items.TryGetValue(RedisTicketStore.SsoUserItem, out var rememberedUser)
+        && !string.IsNullOrEmpty(rememberedEmail)
+        && !string.IsNullOrEmpty(rememberedUser)
+        && string.Equals(rememberedEmail, email, StringComparison.Ordinal)
+        && string.Equals(rememberedUser, username, StringComparison.Ordinal);
+
+    private sealed record Confirmed(UserDto User, long Epoch);
+
+    /// <summary>
+    /// Ask skein-api who the headers name. Null when there is no usable answer: with
+    /// <paramref name="failureIsFatal"/> the response is already written (the request is not executed);
+    /// without it (the periodic refresh of an unchanged pair) the failure is logged and the session stays.
+    /// </summary>
+    private async Task<Confirmed?> ConfirmAsync(HttpContext context, string email, string username, bool failureIsFatal)
+    {
+        AuthenticatedUser answer;
         try
         {
             var api = _services.GetRequiredService<SkeinApiClient>();
-            provisioned = await api.OidcProvisionAsync(email, username, name, context.RequestAborted);
-        }
-        catch (SsoProvisioningException ex)
-        {
-            // Map skein-api error codes to their proper HTTP statuses
-            // instead of demoting everything to 502. The codes here
-            // mirror handler/auth.go OIDCProvision.
-            switch (ex.ErrorCode)
-            {
-                case "user_not_provisioned":
-                    _logger.LogWarning(
-                        "sso: provisioning denied — user probably not in the group that gates Skein access ({StatusCode} {Code})",
-                        ex.StatusCode, ex.ErrorCode);
-                    await WriteUserNotProvisionedAsync(context);
-                    return;
-
-                case "missing_claims":
-                    // skein-api rejected the body — most likely
-                    // oauth2-proxy is not forwarding X-Auth-Request-Email
-                    // or -User. Operator-facing problem.
-                    _logger.LogError(
-                        "sso: provisioning rejected, missing claims — check oauth2-proxy auth-response-headers config ({Message})",
-                        ex.Message);
-                    await WriteJsonStatusAsync(context, StatusCodes.Status422UnprocessableEntity, new
-                    {
-                        error = "missing_claims",
-                        message = "Authentication headers from the SSO proxy are incomplete. Contact your administrator.",
-                    });
-                    return;
-
-                case "username_conflict":
-                    _logger.LogError(
-                        "sso: provisioning hit username-suffix exhaustion ({Message})", ex.Message);
-                    await WriteJsonStatusAsync(context, StatusCodes.Status409Conflict, new
-                    {
-                        error = "username_conflict",
-                        message = "Could not derive a unique username from your SSO identity. Contact your administrator.",
-                    });
-                    return;
-
-                default:
-                    // Genuine upstream failure — 502 is honest.
-                    _logger.LogError(
-                        "sso: provisioning failed ({StatusCode} {Code}): {Message}",
-                        ex.StatusCode, ex.ErrorCode, ex.Message);
-                    await WriteJsonStatusAsync(context, StatusCodes.Status502BadGateway, new
-                    {
-                        error = "sso_provisioning_failed",
-                        message = "Failed to establish a Skein session from your SSO identity. Try again.",
-                    });
-                    return;
-            }
+            // Display name is intentionally empty: oauth2-proxy does not forward a name claim on a
+            // stock edge config; skein-api keeps the existing name or falls back to the username.
+            answer = await api.OidcProvisionAsync(email, username, string.Empty, context.RequestAborted);
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
-            return;
+            return null;
+        }
+        catch (SsoProvisioningException ex) when (failureIsFatal)
+        {
+            await WriteProvisioningFailureAsync(context, ex);
+            return null;
+        }
+        catch (Exception ex) when (!failureIsFatal)
+        {
+            _logger.LogWarning(ex,
+                "sso: TTL refresh failed; existing cookie kept (userId={UserId})",
+                context.User.FindFirstValue(ClaimTypes.NameIdentifier));
+            return null;
         }
         catch (Exception ex)
         {
@@ -235,180 +224,198 @@ public sealed class SsoSessionMiddleware : IMiddleware
                 error = "sso_unavailable",
                 message = "Authentication service is temporarily unavailable.",
             });
-            return;
+            return null;
         }
 
-        // 7) sk-674.18 K-16: the session carries the epoch of THIS answer;
-        //    without it no session is issued (no default, no older value).
-        if (provisioned.SessionEpoch is not { } sessionEpoch)
+        // The session carries the epoch of THIS answer; without it no session is issued or renewed.
+        if (answer.SessionEpoch is not { } epoch)
         {
             _logger.LogError(
                 "sso: provisioning response for {UserId} has no sessionEpoch; no session issued",
-                provisioned.User.Id);
+                answer.User.Id);
+            if (failureIsFatal)
+            {
+                await WriteJsonStatusAsync(context, StatusCodes.Status502BadGateway, new
+                {
+                    error = "sso_provisioning_failed",
+                    message = "Failed to establish a Skein session from your SSO identity. Try again.",
+                });
+            }
+            return null;
+        }
+        return new Confirmed(answer.User, epoch);
+    }
+
+    /// <summary>
+    /// The confirmed subject against the live session: another id → a new authentication (the old key
+    /// is revoked); the same id and another epoch → the session ends and nothing is issued; the same id
+    /// and epoch → an explicit renewal of the same key. False when the response is already written.
+    /// </summary>
+    private async Task<bool> ApplyToLiveSessionAsync(
+        HttpContext context, SessionIssuer issuer, Confirmed confirmed, string email, string username)
+    {
+        var ticketUserId = context.User.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (!string.Equals(ticketUserId, confirmed.User.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogInformation("sso: the confirmed subject differs from the session's; a new session is issued");
+            return await RotateToAsync(context, issuer, confirmed, email, username);
+        }
+
+        var ticketEpoch = context.User.FindFirstValue(SessionPrincipal.SessionEpochClaim);
+        var confirmedEpoch = confirmed.Epoch.ToString(CultureInfo.InvariantCulture);
+        if (!string.Equals(ticketEpoch, confirmedEpoch, StringComparison.Ordinal))
+        {
+            // The session was revoked (password reset, deactivation…): end it instead of healing it with
+            // the new epoch. The request goes on anonymous; the next one signs in afresh.
+            _logger.LogInformation(
+                "sso: the session of {UserId} is revoked (epoch changed); session ended", confirmed.User.Id);
+            try
+            {
+                await issuer.EndCurrentAsync(context);
+            }
+            catch (SessionIssueException)
+            {
+                await WriteJsonStatusAsync(context, StatusCodes.Status502BadGateway, new
+                {
+                    error = "sso_unavailable",
+                    message = "Authentication service is temporarily unavailable.",
+                });
+                return false;
+            }
+            return true;
+        }
+
+        return await RenewSameKeyAsync(context, issuer, confirmed, email, username);
+    }
+
+    private async Task<bool> RenewSameKeyAsync(
+        HttpContext context, SessionIssuer issuer, Confirmed confirmed, string email, string username)
+    {
+        var key = SessionPrincipal.SessionKeyOf(context.User);
+        var principal = NewPrincipal(confirmed);
+        var state = SessionRequestState.Of(context);
+        state.ExplicitRenewal = true;
+        try
+        {
+            await context.SignInAsync(
+                CookieAuthenticationDefaults.AuthenticationScheme,
+                principal,
+                NewProperties(email, username, pairWrite: true));
+        }
+        finally
+        {
+            // Only this step is explicit: a later sliding renewal of the handler in the same request
+            // carries a clone of the earlier read and must not write it over the confirmed claims.
+            state.ExplicitRenewal = false;
+        }
+
+        switch (state.RenewOutcome)
+        {
+            case RenewOutcome.Written when key is not null:
+                context.User = SessionPrincipal.WithSessionKey(
+                    new AuthenticationTicket(principal, new AuthenticationProperties(), CookieAuthenticationDefaults.AuthenticationScheme),
+                    key).Principal;
+                return true;
+
+            case RenewOutcome.KeyAbsent:
+                // The row is gone (revoked in parallel): a new authentication from the answer already in hand.
+                return await RotateToAsync(context, issuer, confirmed, email, username);
+
+            case RenewOutcome.CasExhausted:
+            case RenewOutcome.OwnerMismatch:
+                // A live key that kept changing, or that belongs to another user now: not revoked, not
+                // rotated; the request goes on with the session it carried.
+                return true;
+
+            default:
+                _logger.LogError("sso: the renewal of the session ended without a usable outcome");
+                throw new SessionStoreUnavailableException();
+        }
+    }
+
+    private async Task<bool> RotateToAsync(
+        HttpContext context, SessionIssuer issuer, Confirmed confirmed, string email, string username)
+    {
+        try
+        {
+            await issuer.RotateAsync(
+                context, NewPrincipal(confirmed), NewProperties(email, username, pairWrite: false), "Sso");
+        }
+        catch (SessionIssueException)
+        {
             await WriteJsonStatusAsync(context, StatusCodes.Status502BadGateway, new
             {
                 error = "sso_provisioning_failed",
                 message = "Failed to establish a Skein session from your SSO identity. Try again.",
             });
-            return;
+            return false;
         }
-
-        // 8) Mint the cookie + Redis ticket. Mirror AuthController.Login
-        //    so /api/auth/me and the proxy handler treat both flows
-        //    identically.
-        await SignInWithUserAsync(context, provisioned.User, sessionEpoch);
-        _logger.LogInformation("sso: signed in user {UserId}", provisioned.User.Id);
-
-        await next(context);
+        _logger.LogInformation("sso: signed in user {UserId}", confirmed.User.Id);
+        return true;
     }
 
-    /// <summary>
-    /// TTL refresh fallback. Called on every authenticated request; only
-    /// hits skein-api when the cookie's <see cref="RefreshedAtClaim"/>
-    /// is missing or older than <see cref="SessionRefreshTtl"/>. Silent
-    /// no-op if the trust headers are absent (the cookie is still valid,
-    /// the next request from oauth2-proxy will carry headers).
-    /// </summary>
-    private async Task TryRefreshClaimsAsync(HttpContext context)
+    private static ClaimsPrincipal NewPrincipal(Confirmed confirmed)
     {
-        // Without trust headers we cannot reliably re-provision: the
-        // current request didn't traverse oauth2-proxy (e.g. an internal
-        // health probe leaked into the auth pipeline, or the SPA is
-        // talking to /api/* directly during a frontend dev session).
-        // Leave the cookie alone — the user is still authenticated, the
-        // event-driven NATS path covers role flips, and the next request
-        // that DOES come through oauth2-proxy will refresh as expected.
-        if (!TrustedSsoRequest.TryReadIdentity(context.Request, out var email, out var username))
-        {
-            return;
-        }
-
-        // Read the refresh timestamp claim. Missing / unparseable / too
-        // old → refresh; otherwise short-circuit.
-        if (!IsRefreshDue(context.User))
-        {
-            return;
-        }
-
-        AuthenticatedUser refreshed;
-        try
-        {
-            var api = _services.GetRequiredService<SkeinApiClient>();
-            refreshed = await api.OidcProvisionAsync(email, username, string.Empty, context.RequestAborted);
-        }
-        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
-        {
-            return;
-        }
-        catch (Exception ex)
-        {
-            // Refresh failure is non-fatal — the existing cookie keeps
-            // working; the next request retries. We log at warning
-            // because chronic failures here defeat the fallback and
-            // operators should notice.
-            _logger.LogWarning(ex,
-                "sso: TTL refresh failed; existing cookie kept (userId={UserId})",
-                context.User.FindFirstValue(ClaimTypes.NameIdentifier));
-            return;
-        }
-
-        // sk-674.18 K-16: a provisioning answer without sessionEpoch cannot
-        // re-issue the session — keep the existing cookie (as on any other
-        // refresh failure) and say so loudly: chronic, it means skein-api
-        // broke the authentication-response contract.
-        if (refreshed.SessionEpoch is not { } sessionEpoch)
-        {
-            _logger.LogError(
-                "sso: TTL refresh response for {UserId} has no sessionEpoch; existing cookie kept",
-                refreshed.User.Id);
-            return;
-        }
-        var fresh = refreshed.User;
-
-        // sk-674.18 K-16: a refresh never raises the session's
-        // epoch. If skein-api's current epoch differs from the one this
-        // session was issued with, the session was revoked (password reset,
-        // deactivation…) — end it instead of re-signing it with the new epoch,
-        // which would quietly heal a revoked session. The request goes on
-        // unauthenticated; the browser's next request through the proxy
-        // signs in afresh (the bootstrap path below — a new login).
-        var sessionEpochNow = sessionEpoch.ToString(CultureInfo.InvariantCulture);
-        if (!string.Equals(context.User.FindFirstValue(SessionPrincipal.SessionEpochClaim), sessionEpochNow, StringComparison.Ordinal))
-        {
-            _logger.LogInformation(
-                "sso: TTL refresh found the session of {UserId} revoked (epoch changed); session ended",
-                fresh.Id);
-            await SessionRevocation.EndSessionAsync(context);
-            context.User = new ClaimsPrincipal(new ClaimsIdentity());
-            return;
-        }
-
-        // Diff the claim fields that ride in the cookie principal.
-        // SignInAsync ALWAYS runs (even on no-change) so the timestamp
-        // resets and we don't immediately re-fetch on the next request.
-        var changed = HasClaimsChanged(context.User, fresh);
-        await SignInWithUserAsync(context, fresh, sessionEpoch);
-
-        if (changed)
-        {
-            _logger.LogInformation(
-                "sso: TTL refresh detected claim drift for {UserId}; ticket renewed",
-                fresh.Id);
-        }
-        else
-        {
-            _logger.LogDebug(
-                "sso: TTL refresh confirmed claims unchanged for {UserId}; timestamp reset",
-                fresh.Id);
-        }
+        var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
+        // Same principal shape as the login and OIDC paths, plus the refresh timestamp this middleware keys its TTL on.
+        return SessionPrincipal.Create(confirmed.User, confirmed.Epoch, new Claim(RefreshedAtClaim, nowUnix));
     }
 
-    /// <summary>
-    /// Compare the current cookie principal against the fresh DB tuple.
-    /// Returns true when any of role / username / name / email differs.
-    /// Email is included even though it is the lookup key — a future
-    /// admin tool may rewrite it on the DB row and the cookie must
-    /// follow.
-    /// </summary>
-    private static bool HasClaimsChanged(ClaimsPrincipal current, UserDto fresh)
+    private static AuthenticationProperties NewProperties(string email, string username, bool pairWrite)
     {
-        var currentExternal = string.Equals(
-            current.FindFirstValue("is_external"), "true", StringComparison.OrdinalIgnoreCase);
-        return !string.Equals(current.FindFirstValue(ClaimTypes.Role), fresh.Role, StringComparison.Ordinal)
-            || !string.Equals(current.FindFirstValue("username"), fresh.Username, StringComparison.Ordinal)
-            || !string.Equals(current.FindFirstValue(ClaimTypes.Name), fresh.Name, StringComparison.Ordinal)
-            || !string.Equals(current.FindFirstValue(ClaimTypes.Email), fresh.Email, StringComparison.OrdinalIgnoreCase)
-            || currentExternal != fresh.IsExternal;
+        var properties = new AuthenticationProperties { IsPersistent = true, AllowRefresh = true };
+        properties.Items[RedisTicketStore.SsoEmailItem] = email;
+        properties.Items[RedisTicketStore.SsoUserItem] = username;
+        if (pairWrite)
+        {
+            properties.Items[RedisTicketStore.SsoPairWriteMarker] = "1";
+        }
+        return properties;
     }
 
-    /// <summary>
-    /// Build a fresh ClaimsPrincipal from <paramref name="user"/>, stamp
-    /// the refresh timestamp, and call <c>SignInAsync</c>. Shared between
-    /// the bootstrap path (first sign-in via trust headers) and the TTL
-    /// refresh path so both go through one place.
-    /// </summary>
-    private static async Task SignInWithUserAsync(HttpContext context, UserDto user, long sessionEpoch)
+    private async Task WriteProvisioningFailureAsync(HttpContext context, SsoProvisioningException ex)
     {
-        var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-            .ToString(CultureInfo.InvariantCulture);
+        // Map skein-api error codes to their proper HTTP statuses instead of demoting everything to 502.
+        // The codes here mirror handler/auth.go OIDCProvision.
+        switch (ex.ErrorCode)
+        {
+            case "user_not_provisioned":
+                _logger.LogWarning(
+                    "sso: provisioning denied — user probably not in the group that gates Skein access ({StatusCode} {Code})",
+                    ex.StatusCode, ex.ErrorCode);
+                await WriteUserNotProvisionedAsync(context);
+                return;
 
-        // Same principal shape as the login and OIDC paths (SessionPrincipal),
-        // plus the refresh timestamp this middleware keys its TTL on.
-        var principal = SessionPrincipal.Create(user, sessionEpoch, new Claim(RefreshedAtClaim, nowUnix));
+            case "missing_claims":
+                _logger.LogError(
+                    "sso: provisioning rejected, missing claims — check oauth2-proxy auth-response-headers config ({Message})",
+                    ex.Message);
+                await WriteJsonStatusAsync(context, StatusCodes.Status422UnprocessableEntity, new
+                {
+                    error = "missing_claims",
+                    message = "Authentication headers from the SSO proxy are incomplete. Contact your administrator.",
+                });
+                return;
 
-        await context.SignInAsync(
-            CookieAuthenticationDefaults.AuthenticationScheme,
-            principal,
-            new AuthenticationProperties
-            {
-                IsPersistent = true,
-                AllowRefresh = true,
-            });
+            case "username_conflict":
+                _logger.LogError("sso: provisioning hit username-suffix exhaustion ({Message})", ex.Message);
+                await WriteJsonStatusAsync(context, StatusCodes.Status409Conflict, new
+                {
+                    error = "username_conflict",
+                    message = "Could not derive a unique username from your SSO identity. Contact your administrator.",
+                });
+                return;
 
-        // Replace the in-memory principal so downstream middleware /
-        // [Authorize] gates see the fresh claims on THIS request rather
-        // than waiting for the next one to round-trip through the cookie.
-        context.User = principal;
+            default:
+                _logger.LogError(
+                    "sso: provisioning failed ({StatusCode} {Code}): {Message}", ex.StatusCode, ex.ErrorCode, ex.Message);
+                await WriteJsonStatusAsync(context, StatusCodes.Status502BadGateway, new
+                {
+                    error = "sso_provisioning_failed",
+                    message = "Failed to establish a Skein session from your SSO identity. Try again.",
+                });
+                return;
+        }
     }
 
     /// <summary>

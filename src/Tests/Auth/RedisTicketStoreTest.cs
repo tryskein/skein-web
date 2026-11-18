@@ -53,9 +53,11 @@ public sealed class RedisTicketStoreTest : IDisposable
 
     private RedisTicketStore Store() => TestRedis.Store(_mux);
 
-    private static async Task<RenewOutcome?> RenewAsync(RedisTicketStore store, string key, AuthenticationTicket ticket, DefaultHttpContext? ctx = null)
+    private static async Task<RenewOutcome?> RenewAsync(
+        RedisTicketStore store, string key, AuthenticationTicket ticket, DefaultHttpContext? ctx = null, bool explicitRenewal = false)
     {
         ctx ??= new DefaultHttpContext();
+        SessionRequestState.Of(ctx).ExplicitRenewal = explicitRenewal;
         await store.RenewAsync(key, ticket, ctx, CancellationToken.None);
         return SessionRequestState.Of(ctx).RenewOutcome;
     }
@@ -164,13 +166,32 @@ public sealed class RedisTicketStoreTest : IDisposable
 
         var confirm = TestRedis.Ticket(owner, "new@example.com", "new");
         confirm.Properties.Items[RedisTicketStore.SsoPairWriteMarker] = "1";
-        Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, confirm));
+        Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, confirm, explicitRenewal: true));
         Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, staleClone));
 
         var stored = await StoredAsync(store, key);
         Assert.Equal("new@example.com", stored.Properties.Items[RedisTicketStore.SsoEmailItem]);
         Assert.Equal("new", stored.Properties.Items[RedisTicketStore.SsoUserItem]);
         Assert.DoesNotContain(RedisTicketStore.SsoPairWriteMarker, stored.Properties.Items.Keys);
+    }
+
+    [RedisFact]
+    public async Task ClaimWrittenByAParallelExplicitRenewal_IsNotRolledBackByALateAutomaticOne()
+    {
+        var store = Store();
+        var owner = NewUser();
+        var key = await IssueAsync(store, TestRedis.Ticket(owner, "p@example.com", "p", new Claim(ClaimTypes.Role, "user")));
+        var staleClone = await StoredAsync(store, key); // the automatic renewal of a request that read the old claims
+
+        var confirmed = TestRedis.Ticket(owner, extra: new Claim(ClaimTypes.Role, "admin"));
+        Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, confirmed, explicitRenewal: true));
+        staleClone.Properties.ExpiresUtc = DateTimeOffset.UtcNow.AddHours(30);
+        Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, staleClone));
+
+        var stored = await StoredAsync(store, key);
+        Assert.Equal("admin", stored.Principal.FindFirstValue(ClaimTypes.Role)); // the confirmed claim stays
+        Assert.Equal("p@example.com", stored.Properties.Items[RedisTicketStore.SsoEmailItem]);
+        Assert.True(stored.Properties.ExpiresUtc >= staleClone.Properties.ExpiresUtc); // while the expiry moved forward
     }
 
     [RedisFact]
@@ -181,7 +202,7 @@ public sealed class RedisTicketStoreTest : IDisposable
         var key = await IssueAsync(store, TestRedis.Ticket(owner, "proxy@example.com", "proxy-user"));
 
         var update = TestRedis.Ticket(owner, extra: new Claim(ClaimTypes.Role, "admin"));
-        Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, update));
+        Assert.Equal(RenewOutcome.Written, await RenewAsync(store, key, update, explicitRenewal: true));
 
         var stored = await StoredAsync(store, key);
         Assert.Equal("proxy@example.com", stored.Properties.Items[RedisTicketStore.SsoEmailItem]);

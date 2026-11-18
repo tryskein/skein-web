@@ -219,7 +219,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
         try
         {
-            state.RenewOutcome = await TryRenewAsync(key, ticket, ct);
+            state.RenewOutcome = await TryRenewAsync(key, ticket, state.ExplicitRenewal, ct);
         }
         catch (RedisServerException ex) when (IsWrongType(ex))
         {
@@ -237,7 +237,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         }
     }
 
-    private async Task<RenewOutcome> TryRenewAsync(string key, AuthenticationTicket ticket, CancellationToken ct)
+    private async Task<RenewOutcome> TryRenewAsync(string key, AuthenticationTicket ticket, bool explicitRenewal, CancellationToken ct)
     {
         var db = _redis.GetDatabase();
         var newOwner = TryReadUserId(ticket.Principal);
@@ -260,7 +260,12 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
                 return RenewOutcome.OwnerMismatch;
             }
 
-            var merged = SessionPrincipal.WithSessionKey(MergePair(ticket, stored), key);
+            // An explicit renewal (the SSO confirmation) writes the claims it confirmed. An automatic one
+            // (the sliding renewal of the cookie handler) only moves the expiry: its ticket is a clone
+            // of a read made earlier in the request and must not roll back claims a parallel
+            // confirmation wrote since.
+            var merged = SessionPrincipal.WithSessionKey(
+                explicitRenewal ? MergePair(ticket, stored) : ExtendOnly(ticket, stored), key);
             var bytes = TicketSerializer.Default.Serialize(merged);
             var result = await db.ScriptEvaluateAsync(
                 CompareAndSetScript,
@@ -299,6 +304,22 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             }
         }
         return new AuthenticationTicket(incoming.Principal, properties, incoming.AuthenticationScheme);
+    }
+
+    /// <summary>
+    /// The row as it is stored now, with its expiry moved to the later of the stored and the incoming one
+    /// (never earlier than what a parallel writer set).
+    /// </summary>
+    private static AuthenticationTicket ExtendOnly(AuthenticationTicket incoming, AuthenticationTicket stored)
+    {
+        var properties = stored.Properties.Clone();
+        properties.Items.Remove(SsoPairWriteMarker);
+        var later = incoming.Properties.ExpiresUtc;
+        if (later is { } incomingExpiry && (properties.ExpiresUtc is not { } storedExpiry || incomingExpiry > storedExpiry))
+        {
+            properties.ExpiresUtc = incomingExpiry;
+        }
+        return new AuthenticationTicket(stored.Principal, properties, stored.AuthenticationScheme);
     }
 
     private static AuthenticationTicket StripPairMarker(AuthenticationTicket ticket)

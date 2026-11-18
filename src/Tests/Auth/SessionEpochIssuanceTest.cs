@@ -209,6 +209,7 @@ public class SessionEpochIssuanceTest
         var log = new LevelLog();
         var services = new ServiceCollection();
         services.AddSingleton(new SkeinApiClient(Http(AuthBody(withEpoch)), NullLogger<SkeinApiClient>.Instance));
+        services.AddSingleton(TestRedis.Issuer());
         var (ctx, signIns) = Context(services);
         ctx.Request.Path = "/";
         ctx.Request.Headers["X-Auth-Request-Email"] = "dev@client.io";
