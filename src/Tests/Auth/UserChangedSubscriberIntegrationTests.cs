@@ -15,7 +15,10 @@ using StackExchange.Redis;
 namespace SkeinWeb.Tests.Auth;
 
 /// <summary>Session revocation through live subscriptions while the browser bridge is running.</summary>
+// Serialised with the startup stand: its application processes join the same NATS queue group and
+// would take events meant for this test.
 [Trait("Category", "Integration")]
+[Collection("startup-stand")]
 public sealed class UserChangedSubscriberIntegrationTests
 {
     [InfrastructureTheory]
