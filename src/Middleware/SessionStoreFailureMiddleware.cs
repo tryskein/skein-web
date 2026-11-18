@@ -15,7 +15,8 @@ namespace SkeinWeb.Middleware;
 /// Sits between <c>UseRouting</c> and <c>UseAuthentication</c>, so the endpoint metadata is
 /// available and the cookie handler's first read happens inside <c>next</c>. It catches
 /// <see cref="SessionStoreUnavailableException"/> only, and only while the response has not
-/// started; the exception carries no text of its source.
+/// started; the exception carries no text of its source. Whatever the failed request had put on
+/// the response is dropped first.
 /// </para>
 /// <para>
 /// The form of the answer follows the request:
@@ -57,8 +58,13 @@ public sealed class SessionStoreFailureMiddleware(
 
     private async Task WriteRefusalAsync(HttpContext context)
     {
-        // Nothing the failed request had prepared goes out with the refusal.
-        context.Response.Headers.Remove("Set-Cookie");
+        // Nothing the failed request had prepared goes out with the refusal: not a status, not
+        // headers copied from an upstream answer (a Content-Length of another body, a Set-Cookie),
+        // and no late write of Main either. The refusal can come late, from the end of a session the
+        // upstream just revoked; the answer is then still this one, on a response not yet started.
+        context.Response.Headers.Clear();
+        context.Response.ContentLength = null;
+        SessionRequestState.Of(context).SuppressMainWrite = true;
 
         var explicitSignIn = context.GetEndpoint()?.Metadata.GetMetadata<ExplicitSignInAttribute>();
         if (explicitSignIn is null && TrustedSsoRequest.Matches(context, mode, trustedProxies))
