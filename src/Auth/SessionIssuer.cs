@@ -152,6 +152,7 @@ public sealed class SessionIssuer(
             throw new SessionIssueException("The previous session could not be revoked.");
         }
 
+        SessionRequestState.Of(context).PreviousKeyRevoked = true;
         hubConnections.AbortSession(key);
         return true;
     }
@@ -165,7 +166,7 @@ public sealed class SessionIssuer(
         HttpContext context, ClaimsPrincipal principal, AuthenticationProperties properties, string surface)
     {
         EnsureNotIssuedYet(context);
-        return IssueAsync(context, principal, properties, surface, hadPreviousKey: false);
+        return IssueAsync(context, principal, properties, surface, SessionRequestState.Of(context).PreviousKeyRevoked);
     }
 
     private async Task<IssuedSession> IssueAsync(
@@ -192,7 +193,8 @@ public sealed class SessionIssuer(
             new AuthenticationTicket(principal, properties, SessionSchemes.Issue), key).Principal;
 
         logger.LogInformation(
-            "session issued userId={UserId} surface={Surface} hadPreviousKey={HadPreviousKey}",
+            // The placeholder name avoids words the console formatter masks (key, token, secret…).
+            "session issued userId={UserId} surface={Surface} previousSession={PreviousSession}",
             principal.FindFirstValue(ClaimTypes.NameIdentifier), surface, hadPreviousKey);
         WarnIfSchemeLooksInsecure(context);
         return new IssuedSession(key, hadPreviousKey);

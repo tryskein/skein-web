@@ -60,6 +60,9 @@ public sealed class SessionRequestState
     /// </summary>
     public bool ExplicitRenewal { get; set; }
 
+    /// <summary>The request carried a session key that was revoked by the issuer (for the issue event of the log).</summary>
+    public bool PreviousKeyRevoked { get; set; }
+
     /// <summary>Key of the session this request issued, or null.</summary>
     public string? IssuedKey { get; set; }
 

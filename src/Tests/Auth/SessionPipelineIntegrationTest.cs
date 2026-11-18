@@ -42,7 +42,8 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
     public FakeTimeProvider Time { get; }
     public HubTestWorld World { get; } = new();
     public HubTestReplica Replica { get; }
-    public ErrorLogs Logs { get; } = new();
+    public ErrorLogs Logs { get; }
+    public FormatterLogs Formatted { get; }
     public IServiceProvider Services => _app.Services;
     public string CookieName => Policy.CookieName;
     public string OtherName => Policy.AllowInsecureHttp ? "__Host-skein.sid" : "skein.sid";
@@ -76,7 +77,7 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
     }
 
     private SessionPipelineHost(WebApplication app, HttpClient client, ConnectionMultiplexer mux, DbProxy faults,
-        RedisTicketStore store, SessionCookiePolicy policy, FakeTimeProvider time, HubTestReplica replica, ErrorLogs logs)
+        RedisTicketStore store, SessionCookiePolicy policy, FakeTimeProvider time, HubTestReplica replica, ErrorLogs logs, FormatterLogs formatted)
     {
         _app = app;
         _client = client;
@@ -87,6 +88,7 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         Time = time;
         Replica = replica;
         Logs = logs;
+        Formatted = formatted;
     }
 
     /// <param name="insecureHttp">The Development insecure-http mode.</param>
@@ -108,6 +110,8 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Trace);
         builder.Logging.AddProvider(logs);
+        var formatted = new FormatterLogs();
+        builder.Logging.AddProvider(formatted);
 
         var services = builder.Services;
         services.AddSingleton(fakeMux);
@@ -156,6 +160,14 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
             await issuer.RotateAsync(ctx, PrincipalOf(user), new AuthenticationProperties(), "Test");
             var connection = await ConnectAsync(ctx.User);
             return Results.Json(new { key = SessionPrincipal.SessionKeyOf(ctx.User), connection });
+        });
+        app.MapGet("/test/revoke-then-issue", async (HttpContext ctx, SessionIssuer issuer, Guid user) =>
+        {
+            // The two steps the password-reset sequence calls on their own.
+            issuer.MarkSessionWriteSuppressed(ctx);
+            await issuer.RevokeIncomingAsync(ctx);
+            await issuer.IssueAsync(ctx, PrincipalOf(user), new AuthenticationProperties(), "Reset");
+            return Results.Ok();
         });
         app.MapGet("/test/issue-twice", async (HttpContext ctx, SessionIssuer issuer, Guid user) =>
         {
@@ -243,7 +255,7 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
             BaseAddress = new Uri(app.Urls.First()),
         };
         var store = app.Services.GetRequiredService<RedisTicketStore>();
-        return new SessionPipelineHost(app, client, mux, faults, store, policy, time, replica, logs);
+        return new SessionPipelineHost(app, client, mux, faults, store, policy, time, replica, logs, formatted);
     }
 
     // ---- client ----------------------------------------------------------------------------------

@@ -2,6 +2,9 @@ using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
+using SkeinWeb.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using SkeinWeb.Auth;
@@ -159,5 +162,48 @@ public class DbProxy : DispatchProxy
         var value = await task;
         await after(name, args);
         return value;
+    }
+}
+
+/// <summary>Feeds every log call to the real <see cref="SkeinConsoleFormatter"/> and keeps its output lines.</summary>
+internal sealed class FormatterLogs : ILoggerProvider, ISupportExternalScope
+{
+    private readonly SkeinConsoleFormatter _formatter = new();
+    private IExternalScopeProvider _scopes = new LoggerExternalScopeProvider();
+    private readonly StringWriter _output = new();
+
+    public string Output
+    {
+        get
+        {
+            lock (_output)
+            {
+                return _output.ToString();
+            }
+        }
+    }
+
+    public ILogger CreateLogger(string categoryName) => new Capture(this, categoryName);
+
+    public void SetScopeProvider(IExternalScopeProvider scopeProvider) => _scopes = scopeProvider;
+
+    public void Dispose()
+    {
+    }
+
+    private sealed class Capture(FormatterLogs owner, string category) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => owner._scopes.Push(state);
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            lock (owner._output)
+            {
+                owner._formatter.Write(new LogEntry<TState>(logLevel, category, eventId, state, exception, formatter), owner._scopes, owner._output);
+            }
+        }
     }
 }

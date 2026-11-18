@@ -126,15 +126,31 @@ public sealed class SessionLogRedactionTest
         var entry = Assert.Single(events);
         Assert.Contains(Alice.ToString(), entry.Text);
         Assert.Contains("surface=Test", entry.Text);
-        Assert.Contains("hadPreviousKey=True", entry.Text);
+        Assert.Contains("previousSession=True", entry.Text);
         var everything = string.Join('\n', host.Logs.Entries.Select(e => e.Text));
         Assert.DoesNotContain("alice@example.com", everything);
         Assert.DoesNotContain("skein:session:", everything);
         Assert.DoesNotContain(secondSet.Value, everything);
         Assert.DoesNotContain(Uri.UnescapeDataString(secondSet.Value), everything);
 
+        // The line the formatter really prints: the flag is a value, not masked.
+        Assert.Contains("previousSession=True", host.Formatted.Output);
+        Assert.DoesNotContain("previousSession=***", host.Formatted.Output);
+
         var fresh = await host.SendAsync($"/test/issue?user={Alice}");
         Assert.Single(fresh.Sessions(host.CookieName));
-        Assert.Contains(host.Logs.Entries, e => e.Text.Contains("hadPreviousKey=False"));
+        Assert.Contains(host.Logs.Entries, e => e.Text.Contains("previousSession=False"));
+    }
+
+    [RedisFact]
+    public async Task APublicIssueAfterARevocation_LogsThatAPreviousSessionExisted()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var (cookie, _, _) = await host.SignInAsync(Alice);
+        host.Logs.Entries.Clear();
+
+        await host.SendAsync($"/test/revoke-then-issue?user={Alice}", cookie);
+
+        Assert.Contains(host.Logs.Entries, e => e.Text.Contains("surface=Reset") && e.Text.Contains("previousSession=True"));
     }
 }
