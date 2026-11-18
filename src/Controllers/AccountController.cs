@@ -512,7 +512,7 @@ public sealed class AccountController : ControllerBase
             async ok =>
             {
                 var body = Deserialize<InvitationSignupResponse>(ok.Body);
-                if (body is null || body.Space is null)
+                if (body is null || body.Space is not { Id.Length: > 0, Slug.Length: > 0, Name.Length: > 0 })
                 {
                     return SessionNotIssued("invitation-signup", "200 without the user or the space");
                 }
@@ -620,6 +620,7 @@ public sealed class AccountController : ControllerBase
     /// </summary>
     private ObjectResult PasswordChangedNotIssued(string what)
     {
+        _issuer.MarkSessionWriteSuppressed(HttpContext);
         _logger.LogError("password-reset-complete: the password was changed but no session was issued ({What})", what);
         return Problem(
             statusCode: StatusCodes.Status502BadGateway,
@@ -631,7 +632,7 @@ public sealed class AccountController : ControllerBase
 
     /// <summary>Whether the user of a confirmed answer carries everything a session principal needs.</summary>
     private static bool IsIssuable(UserDto? user) =>
-        user is { Id.Length: > 0, Email: not null, Username: not null, Name: not null, Role: not null };
+        user is { Id: not null, Email: not null, Username: not null, Name: not null, Role: not null } && Guid.TryParse(user.Id, out _);
 
     /// <summary>
     /// Issues the session of a just created account under a NEW key; the key the request carried is
@@ -660,6 +661,8 @@ public sealed class AccountController : ControllerBase
     /// </summary>
     private ObjectResult SessionNotIssued(string action, string what)
     {
+        // The request's own session must not be renewed late next to this refusal.
+        _issuer.MarkSessionWriteSuppressed(HttpContext);
         _logger.LogError("{Action}: the account was created but no session was issued ({What})", action, what);
         return Problem(
             statusCode: StatusCodes.Status502BadGateway,

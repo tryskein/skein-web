@@ -240,6 +240,8 @@ public sealed class SessionSurfacesTest
     [InlineData(1, "no-user")]
     [InlineData(1, "no-epoch")]
     [InlineData(1, "no-space")]
+    [InlineData(0, "bad-id")]
+    [InlineData(1, "empty-space")]
     public async Task Registration_ConfirmedWithUnusableData_IsAccountCreatedNotSignedIn(int which, string kind)
     {
         await using var host = await SurfacesHost.StartAsync();
@@ -249,14 +251,17 @@ public sealed class SessionSurfacesTest
         {
             "no-user" => "{}",
             "no-epoch" => user.Replace(",\"sessionEpoch\":4", ""),
+            "bad-id" => user.Replace(A.ToString(), "not-a-uuid"),
+            "empty-space" => user.Replace("{\"id\":\"k3x9p2qa\",\"slug\":\"acme\",\"name\":\"Acme\"}", "{}"),
             _ => user.Replace(",\"space\":{\"id\":\"k3x9p2qa\",\"slug\":\"acme\",\"name\":\"Acme\"}", ""),
         };
         host.Api.Override = Answer("/signup", HttpStatusCode.OK, body);
+        await PasswordResetSessionTest.MakeSlidingDueAsync(host, key); // a sliding renewal is due on the incoming session
 
         var reply = await host.SendAsync(HttpMethod.Post, Registrations[which].Path, Registrations[which].Body, cookie);
 
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
-        Assert.Empty(reply.Cookies);
+        Assert.Empty(reply.Cookies); // and it is not written beside the refusal
         var problem = Json(reply);
         Assert.Equal("upstream_unavailable", problem.GetProperty("error").GetString());
         Assert.EndsWith("/account-created-session-not-issued", problem.GetProperty("type").GetString());

@@ -116,7 +116,7 @@ public sealed class PasswordResetSessionTest
         Assert.Contains(Token, host.Api.SpentTokens);      // and the token is spent
     }
 
-    private static async Task MakeSlidingDueAsync(SurfacesHost host, string key)
+    internal static async Task MakeSlidingDueAsync(SurfacesHost host, string key)
     {
         var store = host.Services.GetRequiredService<RedisTicketStore>();
         var ticket = (await store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None))!;

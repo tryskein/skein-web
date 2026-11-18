@@ -705,8 +705,11 @@ public class AccountControllerTest
     [Theory]
     [InlineData("signup", "{}")]
     [InlineData("signup", "{\"id\":\"0199a1b2-0000-7000-8000-000000000001\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\"}")]
+    [InlineData("signup", "{\"id\":\"not-a-uuid\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\",\"sessionEpoch\":4}")]
     [InlineData("invitations/{token}/signup", "{}")]
     [InlineData("invitations/{token}/signup", "{\"id\":\"0199a1b2-0000-7000-8000-000000000001\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\",\"isExternal\":false,\"sessionEpoch\":4}")]
+    [InlineData("invitations/{token}/signup", "{\"id\":\"not-a-uuid\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\",\"isExternal\":false,\"sessionEpoch\":4,\"space\":{\"id\":\"k3x9p2qa\",\"slug\":\"acme\",\"name\":\"Acme\"}}")]
+    [InlineData("invitations/{token}/signup", "{\"id\":\"0199a1b2-0000-7000-8000-000000000001\",\"email\":\"d@c.io\",\"username\":\"d\",\"name\":\"d\",\"role\":\"user\",\"isExternal\":false,\"sessionEpoch\":4,\"space\":{}}")]
     public async Task Registration_ConfirmedWithUnusableData_IsAccountCreatedNotSignedIn(string name, string body)
     {
         var route = ByName(name);
@@ -722,6 +725,7 @@ public class AccountControllerTest
         Assert.Equal(StatusCodes.Status502BadGateway, StatusOf(result));
         Assert.Equal("https://skein.local/errors/account-created-session-not-issued", TypeOf(result));
         Assert.Empty(h.SignIns);
+        Assert.True(SessionRequestState.Of(h.Controller.HttpContext).SuppressMainWrite); // no late renewal beside the refusal
         Assert.Contains(h.Logs.Entries, e => e.Level == LogLevel.Error);
     }
 
