@@ -289,7 +289,7 @@ public sealed class SsoSessionIntegrationTest
     // ---- R60: the confirmation fails -------------------------------------------------------------------
 
     [RedisTheory]
-    [InlineData("server-error", 502, "sso_provisioning_failed")]
+    [InlineData("server-error", 502, "sso_unavailable")]
     [InlineData("not-provisioned", 403, "user_not_provisioned")]
     public async Task AFailedConfirmation_WithASlidingRenewalDue_KeepsTheStatusAndCode_WritesNoCookie_AndLeavesTheRow(
         string failure, int status, string code)

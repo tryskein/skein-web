@@ -201,7 +201,8 @@ public sealed class RedisTicketStoreTest : IDisposable
         var store = Store();
         var owner = NewUser();
         var key = await IssueAsync(store, TestRedis.Ticket(owner));
-        var t0 = DateTimeOffset.UtcNow;
+        var now = DateTimeOffset.UtcNow;
+        var t0 = new DateTimeOffset(now.Ticks - now.Ticks % TimeSpan.TicksPerSecond, TimeSpan.Zero); // the row keeps whole seconds
         var window = TimeSpan.FromHours(24);
 
         async Task<AuthenticationTicket> RenewAtAsync(TimeSpan after)
