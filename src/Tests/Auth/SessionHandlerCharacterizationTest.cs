@@ -262,7 +262,7 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         var (cookie, oldKey) = await stand.SeedAsync();
         stand.Time.Advance(TimeSpan.FromHours(13));
 
-        var reply = await stand.GetAsync("/rotate?revoke=0&suppress=0", cookie);
+        var reply = await stand.GetAsync("/rotate?revoke=false&suppress=false", cookie);
         Dump(stand, reply, oldKey);
 
         Assert.Equal(2, reply.SessionCookies(stand.CookieName).Count);
@@ -276,7 +276,7 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         stand.Time.Advance(TimeSpan.FromHours(13));
         stand.Store.ResetCounters();
 
-        var reply = await stand.GetAsync("/rotate?revoke=1&suppress=1", cookie);
+        var reply = await stand.GetAsync("/rotate?revoke=true&suppress=true", cookie);
         Dump(stand, reply, oldKey);
 
         var set = Assert.Single(reply.SessionCookies(stand.CookieName));
