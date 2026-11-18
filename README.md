@@ -127,6 +127,35 @@ process in the umbrella's
 Each `/api/auth/*` action is documented in code with Swashbuckle annotations;
 in `Development` the spec and UI are at `/swagger`.
 
+## Session cookie, HTTPS and early failures
+
+The browser session cookie is `__Host-skein.sid`: `Secure`, `HttpOnly`, `Path=/`, no `Domain`,
+`SameSite=Lax`. A browser sends a `Secure` cookie only over HTTPS, so the deployment must be served over
+HTTPS end to end as the browser sees it; behind a TLS-terminating edge, make sure the edge tells skein-web
+the scheme (forwarded headers from a trusted proxy). A deployment served over plain http would let users
+sign in and then lose the session at once; skein-web logs a warning (at most once a minute) when it issues a
+session on a request it sees as http.
+
+For local work over plain http there is one switch, `SKEIN_ALLOW_INSECURE_HTTP`, valid only in the
+`Development` environment: the cookie becomes `skein.sid` without `Secure`. It is not a production
+setting, and it is not needed for a self-signed HTTPS certificate. Its full description is in
+[`docs/env-reference.md`](docs/env-reference.md), the only place settings are described.
+
+Every new sign-in (password login, sign-up, sign-up by invitation, the end of a password reset, native OIDC,
+trust-headers sign-in) is stored under a new random key, and the key the browser sent is revoked first.
+
+When the session store (Redis) is technically unavailable while the session is read, traffic that passes
+the session cookie handler is refused early with `502` and no `Set-Cookie`, instead of an unhandled error:
+the `/api/v1` proxy, the hub and the `/api/auth/*` endpoints. The body depends on the request:
+
+- `application/problem+json` with `error` `upstream_unavailable` (login carries no `error`);
+- in the trust-headers mode, a request from a trusted proxy peer with both identity headers gets
+  `{"error":"sso_unavailable","message":...}`; a failure to establish the session from the identity
+  headers is `sso_provisioning_failed`.
+
+`/mcp` is not in this list: it is served before the session handler and authenticates separately with
+`X-Skein-Api-Key`, so a session store outage does not touch it.
+
 ## Configuration
 
 Every setting — environment variables and their `appsettings.json` spelling —
@@ -171,7 +200,7 @@ mode, realm `end_session` via `/api/auth/oidc-signout` in native mode).
 authenticating proxy in front of a trust-headers deployment. The proxy, not
 skein-web, owns the session that lets a user in, and its sign-out address
 depends on your topology, so there is no default. Left unset, logout still
-clears the `skein.sid` cookie but returns no `redirectTo`, and a startup warning
+clears the session cookie (`__Host-skein.sid`, or `skein.sid` with the Development-only insecure-http setting) but returns no `redirectTo`, and a startup warning
 says the external session survives logout. The value is also published to the
 SPA on `GET /api/auth/config` as `logoutRedirectUrl` and is the only absolute
 URL the client follows after logout (same-origin `/oauth2/*` paths are always
