@@ -2,6 +2,7 @@ using System.Net;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Http;
+using Moq;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using SkeinWeb.Auth;
@@ -207,6 +208,49 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.False(await Db.KeyExistsAsync(legacy));
         Assert.True(await _mux.GetDatabase(0).KeyExistsAsync(elsewhere));
+    }
+
+
+    [RedisTheory]
+    [InlineData(false)] // no primary known
+    [InlineData(true)]  // a known primary that is not connected
+    public async Task Cleanup_WithoutEveryPrimaryReachable_FailsTheStart_AndWritesNoMarker(bool knownButDisconnected)
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var servers = new List<IServer>();
+        if (knownButDisconnected)
+        {
+            var server = new Moq.Mock<IServer>();
+            server.SetupGet(x => x.IsConnected).Returns(false);
+            server.SetupGet(x => x.IsReplica).Returns(false);
+            servers.Add(server.Object);
+        }
+        var mux = new Moq.Mock<IConnectionMultiplexer>();
+        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(Db);
+        mux.Setup(m => m.GetServers()).Returns(servers.ToArray());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Migration(mux.Object).RunAsync(Wait, CancellationToken.None));
+
+        Assert.True(await Db.KeyExistsAsync(legacy));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.LockKey)); // the lock was released
+    }
+
+    [RedisFact]
+    public async Task ATimeoutOfTheClient_IsTheSameStartupFailure_NotTheRawException()
+    {
+        var db = new Moq.Mock<IDatabase>();
+        db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisTimeoutException("timed out", CommandStatus.Unknown));
+        var mux = new Moq.Mock<IConnectionMultiplexer>();
+        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            new SessionStoreMigration(mux.Object, TimeProvider.System, NullLogger<SessionStoreMigration>.Instance)
+                .RunAsync(TimeSpan.FromSeconds(1), CancellationToken.None));
+
+        Assert.Null(ex.InnerException);
     }
 
     // ---- R31 ----------------------------------------------------------------------------------

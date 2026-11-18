@@ -111,7 +111,7 @@ public sealed class SessionStoreMigration(
                 await Task.Delay(LockPollInterval, timeProvider, cancellationToken);
             }
         }
-        catch (Exception ex) when (ex is RedisException)
+        catch (Exception ex) when (ex is RedisException or RedisTimeoutException)
         {
             logger.LogError(
                 "session store migration failed exceptionType={ExceptionType}", ex.GetType().Name);
@@ -131,7 +131,14 @@ public sealed class SessionStoreMigration(
 
             var removed = 0;
             var batch = new List<RedisKey>(BatchSize);
-            foreach (var server in redis.GetServers().Where(s => s is { IsConnected: true, IsReplica: false }))
+            // Every primary that is known must be scanned: a marker written after a partial scan would
+            // hide the rows of the one that was not reached. No primary, or one not connected, stops the start.
+            var primaries = redis.GetServers().Where(s => !s.IsReplica).ToList();
+            if (primaries.Count == 0 || primaries.Any(s => !s.IsConnected))
+            {
+                throw new InvalidOperationException("The session store cleanup could not reach every Redis primary.");
+            }
+            foreach (var server in primaries)
             {
                 await foreach (var key in server.KeysAsync(db.Database, SessionKeyPattern, BatchSize).WithCancellation(ct))
                 {
@@ -159,7 +166,7 @@ public sealed class SessionStoreMigration(
             {
                 await db.ScriptEvaluateAsync(ReleaseLockScript, [(RedisKey)LockKey], [(RedisValue)token]);
             }
-            catch (RedisException ex)
+            catch (Exception ex) when (ex is RedisException or RedisTimeoutException)
             {
                 // The lock expires by itself; nothing waits on it once the marker is written.
                 logger.LogWarning("session store migration: lock not released exceptionType={ExceptionType}", ex.GetType().Name);
