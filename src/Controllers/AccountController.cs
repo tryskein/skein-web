@@ -67,6 +67,7 @@ public sealed class AccountController : ControllerBase
     private readonly SkeinApiOptions _apiOptions;
     private readonly IUserSessionRevoker _sessions;
     private readonly ConnectionRegistry _hubConnections;
+    private readonly SessionIssuer _issuer;
     private readonly ILogger<AccountController> _logger;
 
     public AccountController(
@@ -75,6 +76,7 @@ public sealed class AccountController : ControllerBase
         IOptions<SkeinApiOptions> apiOptions,
         IUserSessionRevoker sessions,
         ConnectionRegistry hubConnections,
+        SessionIssuer issuer,
         ILogger<AccountController> logger)
     {
         _api = api;
@@ -82,6 +84,7 @@ public sealed class AccountController : ControllerBase
         _apiOptions = apiOptions.Value;
         _sessions = sessions;
         _hubConnections = hubConnections;
+        _issuer = issuer;
         _logger = logger;
     }
 
@@ -103,7 +106,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Body not of the declared shape (BFF) or <c>invalid_request</c> (skein-api).</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c> — BFF limiter or skein-api backstop.</response>
-    /// <response code="502"><c>upstream_unavailable</c> — skein-api unreachable or answered outside the contract. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
+    /// <response code="502"><c>upstream_unavailable</c> — skein-api unreachable or answered outside the contract. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie. Account created but no session issued (a confirmed answer that cannot yield a session, or a failed revocation or issue): ProblemDetails of type …/account-created-session-not-issued with error=upstream_unavailable and no Set-Cookie; the account exists and the new credentials work for a normal sign-in.</response>
     [HttpPost("signup")]
     [ExplicitSignIn(Surface.Signup)]
     [ProducesResponseType(typeof(UserDto), StatusCodes.Status200OK)]
@@ -139,16 +142,19 @@ public sealed class AccountController : ControllerBase
             async ok =>
             {
                 var user = Deserialize<UserDto>(ok.Body);
-                if (user?.Id is null)
+                if (!IsIssuable(user))
                 {
-                    return UpstreamBroken("signup", "200 without a user");
+                    return SessionNotIssued("signup", "200 without a usable user");
                 }
                 if (SessionEpochOf(ok) is not { } epoch)
                 {
-                    return UpstreamBroken("signup", "200 without sessionEpoch — no session issued");
+                    return SessionNotIssued("signup", "200 without sessionEpoch");
                 }
-                await SignInAsync(user, epoch);
-                _logger.LogInformation("signup success for {UserId}", user.Id);
+                if (!await IssueNewSessionAsync(user!, epoch, nameof(Surface.Signup)))
+                {
+                    return SessionNotIssued("signup", "the session could not be issued");
+                }
+                _logger.LogInformation("signup success for {UserId}", user!.Id);
                 return Ok(user);
             },
             "signup",
@@ -448,7 +454,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Body not of the declared shape.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie. Account created but no session issued (a confirmed answer that cannot yield a session, or a failed revocation or issue): ProblemDetails of type …/account-created-session-not-issued with error=upstream_unavailable and no Set-Cookie; the account exists and the new credentials work for a normal sign-in.</response>
     [HttpPost("invitations/{token}/signup")]
     [ExplicitSignIn(Surface.InvitationSignup)]
     [ProducesResponseType(typeof(InvitationSignupResponse), StatusCodes.Status200OK)]
@@ -460,7 +466,7 @@ public sealed class AccountController : ControllerBase
         Summary = "Register by invitation",
         Description =
             "Forwards to skein-api POST /ui/v1/auth/invitations/{token}/signup. On success the " +
-            "user is logged in (session cookie) and the joined space is returned for the " +
+            "user is logged in (a new session key; the key the request carried is revoked first) and the joined space is returned for the " +
             "redirect. Rate limit per client IP only." +
             " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "InvitationSignup")]
@@ -481,19 +487,25 @@ public sealed class AccountController : ControllerBase
             async ok =>
             {
                 var body = Deserialize<InvitationSignupResponse>(ok.Body);
-                if (body?.Id is null || body.Space is null)
+                if (body is null || body.Space is null)
                 {
-                    return UpstreamBroken("invitation-signup", "200 without the user or the space");
+                    return SessionNotIssued("invitation-signup", "200 without the user or the space");
+                }
+                var invited = new UserDto(
+                    body.Id, body.Email, body.Username, body.Name, body.Role,
+                    body.CreatedAt, body.LastLoginAt, body.IsExternal);
+                if (!IsIssuable(invited))
+                {
+                    return SessionNotIssued("invitation-signup", "200 without a usable user");
                 }
                 if (SessionEpochOf(ok) is not { } epoch)
                 {
-                    return UpstreamBroken("invitation-signup", "200 without sessionEpoch — no session issued");
+                    return SessionNotIssued("invitation-signup", "200 without sessionEpoch");
                 }
-                await SignInAsync(
-                    new UserDto(
-                        body.Id, body.Email, body.Username, body.Name, body.Role,
-                        body.CreatedAt, body.LastLoginAt, body.IsExternal),
-                    epoch);
+                if (!await IssueNewSessionAsync(invited, epoch, nameof(Surface.InvitationSignup)))
+                {
+                    return SessionNotIssued("invitation-signup", "the session could not be issued");
+                }
                 _logger.LogInformation("invitation signup success for {UserId}", body.Id);
                 return Ok(body);
             },
@@ -596,6 +608,46 @@ public sealed class AccountController : ControllerBase
         _logger.LogInformation(
             "password-reset-complete: other sessions of {UserId} ended tickets={Removed} hubConnections={Closed}",
             user.Id, result.Removed, closed);
+    }
+
+    /// <summary>Whether the user of a confirmed answer carries everything a session principal needs.</summary>
+    private static bool IsIssuable(UserDto? user) =>
+        user is { Id.Length: > 0, Email: not null, Username: not null, Name: not null, Role: not null };
+
+    /// <summary>
+    /// Issues the session of a just created account under a NEW key; the key the request carried is
+    /// revoked first. False when the revocation or the issue failed, with no cookie written.
+    /// </summary>
+    private async Task<bool> IssueNewSessionAsync(UserDto user, long epoch, string surface)
+    {
+        try
+        {
+            await _issuer.RotateAsync(
+                HttpContext,
+                SessionPrincipal.Create(user, epoch),
+                new AuthenticationProperties { IsPersistent = true, AllowRefresh = true },
+                surface);
+            return true;
+        }
+        catch (SessionIssueException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The account exists but no session can be issued: a named outcome, neither a success nor the
+    /// generic upstream failure. The new credentials work for a normal sign-in.
+    /// </summary>
+    private ObjectResult SessionNotIssued(string action, string what)
+    {
+        _logger.LogError("{Action}: the account was created but no session was issued ({What})", action, what);
+        return Problem(
+            statusCode: StatusCodes.Status502BadGateway,
+            title: "Account created, session not issued",
+            detail: "The account was created, but signing it in failed. Sign in with the new credentials.",
+            type: "https://skein.local/errors/account-created-session-not-issued",
+            extensions: new Dictionary<string, object?> { ["error"] = "upstream_unavailable" });
     }
 
     private async Task SignInAsync(UserDto user, long sessionEpoch)

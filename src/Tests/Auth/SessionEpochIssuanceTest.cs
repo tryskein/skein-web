@@ -218,6 +218,7 @@ public class SessionEpochIssuanceTest
         ApiOptions(),
         CompleteRevoker(),
         new ConnectionRegistry(TimeProvider.System),
+        TestRedis.Issuer(),
         Logger<AccountController>(log));
 
     private static async Task<Outcome> Signup(bool withEpoch)

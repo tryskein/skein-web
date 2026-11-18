@@ -239,6 +239,7 @@ public class AccountControllerTest
             provider.GetRequiredService<IOptions<SkeinApiOptions>>(),
             sessions.Object,
             hub,
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(),
             new LoggerFactory([logs]).CreateLogger<AccountController>());
         var harness = new Harness
         {
