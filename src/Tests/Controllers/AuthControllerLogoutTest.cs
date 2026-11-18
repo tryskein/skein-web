@@ -50,7 +50,7 @@ public class AuthControllerLogoutTest
             new WebAuthMode(Enum.Parse<WebAuthKind>(mode), Hybrid: false),
             sso,
             apiOpts,
-            NullLogger<AuthController>.Instance);
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(), NullLogger<AuthController>.Instance);
 
         // Logout only needs SignOutAsync on the cookie scheme to succeed.
         var authService = new Mock<IAuthenticationService>();

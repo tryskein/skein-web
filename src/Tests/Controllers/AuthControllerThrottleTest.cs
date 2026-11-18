@@ -118,7 +118,7 @@ public class AuthControllerThrottleTest
 
         var controller = new AuthController(
             apiClient, new LoginRateLimiter(StatefulMux().Object), LocalMode, sso, apiOpts,
-            NullLogger<AuthController>.Instance);
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(), NullLogger<AuthController>.Instance);
 
         var services = new ServiceCollection();
         services.AddSingleton(Mock.Of<IAuthenticationService>());
@@ -217,7 +217,7 @@ public class AuthControllerThrottleTest
         var apiOpts = Options.Create(new SkeinApiOptions { Url = "http://skein-api.test", InternalSecret = "s" });
 
         var controller = new AuthController(apiClient, new LoginRateLimiter(mux.Object), LocalMode, sso, apiOpts,
-            NullLogger<AuthController>.Instance);
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(), NullLogger<AuthController>.Instance);
         var services = new ServiceCollection();
         services.AddSingleton(Mock.Of<IAuthenticationService>());
         var ctx = new DefaultHttpContext { RequestServices = services.BuildServiceProvider() };

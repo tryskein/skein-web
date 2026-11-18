@@ -140,6 +140,7 @@ public class SessionEpochIssuanceTest
             new WebAuthMode(WebAuthKind.Local, Hybrid: false),
             Options.Create(new SsoOptions()),
             ApiOptions(),
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(),
             Logger<AuthController>(log));
         var (ctx, signIns) = Context(new ServiceCollection());
         controller.ControllerContext = new ControllerContext { HttpContext = ctx };

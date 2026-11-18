@@ -28,6 +28,7 @@ public sealed class AuthController : ControllerBase
     private readonly WebAuthMode _mode;
     private readonly SsoOptions _sso;
     private readonly SkeinApiOptions _apiOptions;
+    private readonly SessionIssuer _issuer;
 
     public AuthController(
         SkeinApiClient api,
@@ -35,6 +36,7 @@ public sealed class AuthController : ControllerBase
         WebAuthMode mode,
         IOptions<SsoOptions> sso,
         IOptions<SkeinApiOptions> apiOptions,
+        SessionIssuer issuer,
         ILogger<AuthController> logger)
     {
         _api = api;
@@ -42,6 +44,7 @@ public sealed class AuthController : ControllerBase
         _mode = mode;
         _sso = sso.Value;
         _apiOptions = apiOptions.Value;
+        _issuer = issuer;
         _logger = logger;
     }
 
@@ -166,11 +169,11 @@ public sealed class AuthController : ControllerBase
     /// </remarks>
     /// <param name="req">Login credentials.</param>
     /// <param name="ct">Cancellation token tied to the request.</param>
-    /// <response code="200">Login succeeded. Body is the authenticated user; cookie is set.</response>
+    /// <response code="200">Login succeeded. Body is the authenticated user; a new session cookie is set. The session key the request carried, if any, is revoked first; the new session has a new key.</response>
     /// <response code="400">Request body validation failed (malformed JSON, missing fields).</response>
     /// <response code="422">Invalid credentials — same response for unknown email and wrong password.</response>
     /// <response code="429">Too many failed attempts for this email; locked out for 60 seconds.</response>
-    /// <response code="502">Upstream skein-api was unreachable, returned an unexpected status, or answered 200 without <c>sessionEpoch</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, no <c>error</c> member). No Set-Cookie.</response>
+    /// <response code="502">Upstream skein-api was unreachable, returned an unexpected status, or answered 200 without <c>sessionEpoch</c>; or the previous session could not be revoked or the new one could not be issued (ProblemDetails of type …/upstream-unavailable, no <c>error</c> member, no Set-Cookie; the previous session may stay valid for its previous owner). Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, no <c>error</c> member). No Set-Cookie.</response>
     [HttpPost("login")]
     [ExplicitSignIn(Surface.Login)]
     [AllowAnonymous]
@@ -184,7 +187,9 @@ public sealed class AuthController : ControllerBase
     [SwaggerOperation(
         Summary = "Login with email + password",
         Description =
-            "Verifies credentials via skein-api and sets an encrypted session cookie. " +
+            "Verifies credentials via skein-api and sets an encrypted session cookie. A login is a new authentication: " +
+            "the session key the request carried is revoked and the session is issued under a new key; a failed " +
+            "revocation or issue answers 502 and sets no cookie, and a wrong password leaves an existing session alone. " +
             "Per-email throttle: 10 failed attempts in 60 seconds → 429 lockout for 60 seconds. " +
             "In LOCAL mode every account may password-login. In HYBRID mode (sk-163 S4b) the " +
             "password channel stays open and is forwarded to skein-api, which authenticates only " +
@@ -380,14 +385,27 @@ public sealed class AuthController : ControllerBase
         // Same principal shape as signup and signup by invitation (SessionPrincipal).
         var principal = SessionPrincipal.Create(user, sessionEpoch);
 
-        await HttpContext.SignInAsync(
-            CookieAuthenticationDefaults.AuthenticationScheme,
-            principal,
-            new AuthenticationProperties
-            {
-                IsPersistent = true,
-                AllowRefresh = true,
-            });
+        // A login is a new authentication: the key the request carried (any user's, live or not)
+        // is revoked and the session is issued under a NEW key. Reached only after the credentials
+        // were accepted, so a wrong password never ends a valid session (INV-4). A failure to revoke
+        // or to issue answers with the service error of this surface and writes no cookie.
+        try
+        {
+            await _issuer.RotateAsync(
+                HttpContext,
+                principal,
+                new AuthenticationProperties { IsPersistent = true, AllowRefresh = true },
+                nameof(Surface.Login));
+        }
+        catch (SessionIssueException)
+        {
+            _logger.LogError("login: the session could not be issued for {UserId}", user.Id);
+            return Problem(
+                statusCode: StatusCodes.Status502BadGateway,
+                title: "Authentication service unavailable",
+                detail: "The authentication service is temporarily unavailable. Try again in a moment.",
+                type: "https://skein.local/errors/upstream-unavailable");
+        }
 
         _logger.LogInformation("login success for {UserId}", user.Id);
         return Ok(user);

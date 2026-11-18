@@ -83,6 +83,15 @@ internal static class TestRedis
         return Store(mux.Object);
     }
 
+    /// <summary>A session issuer over a store that confirms every revocation, for tests that only build a controller.</summary>
+    public static SessionIssuer Issuer() => new(
+        RevokingStore(),
+        new SkeinWeb.Hubs.ConnectionRegistry(TimeProvider.System),
+        new SessionCookiePolicy(AllowInsecureHttp: true),
+        new TicketDataFormat(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider().CreateProtector("test")),
+        TimeProvider.System,
+        NullLogger<SessionIssuer>.Instance);
+
     public static RedisTicketStore Store(IConnectionMultiplexer mux) =>
         new(mux, NullLogger<RedisTicketStore>.Instance);
 

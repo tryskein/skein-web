@@ -96,7 +96,7 @@ public class AuthControllerMeTest
             WebAuthMode.FromApi("local", null),
             Options.Create(new SsoOptions()),
             options,
-            NullLogger<AuthController>.Instance)
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(), NullLogger<AuthController>.Instance)
         {
             ControllerContext = new ControllerContext { HttpContext = ctx },
         };

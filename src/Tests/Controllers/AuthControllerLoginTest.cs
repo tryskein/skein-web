@@ -131,7 +131,7 @@ public class AuthControllerLoginTest
 
         var controller = new AuthController(
             apiClient, NeverLockedLimiter(), WebAuthMode.FromApi(apiAuthMode, authority), sso, apiOpts,
-            NullLogger<AuthController>.Instance);
+            SkeinWeb.Tests.Auth.TestRedis.Issuer(), NullLogger<AuthController>.Instance);
 
         ClaimsPrincipal? captured = null;
         var authService = new Mock<IAuthenticationService>();
