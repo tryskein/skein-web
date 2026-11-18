@@ -134,7 +134,13 @@ public sealed class UserChangedSubscriberIntegrationTests
 
     private static AuthenticationTicket Ticket(Guid user) => new(
         new ClaimsPrincipal(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, user.ToString())], "Cookies")),
-        new AuthenticationProperties(), CookieAuthenticationDefaults.AuthenticationScheme);
+        new AuthenticationProperties(new Dictionary<string, string?>
+        {
+            // A remembered SSO pair rides in the ticket; the revocation must reach it too.
+            [RedisTicketStore.SsoEmailItem] = $"{user:N}@example.com",
+            [RedisTicketStore.SsoUserItem] = user.ToString("N"),
+        }),
+        CookieAuthenticationDefaults.AuthenticationScheme);
 
     private static string Required(string name) => Environment.GetEnvironmentVariable(name)
         ?? throw new InvalidOperationException($"{name} is required");
