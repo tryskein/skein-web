@@ -862,7 +862,10 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         public async Task<(string Cookie, string Key)> SeedAsync()
         {
             var reply = await GetAsync($"/signin/{Issue}", cookie: null);
-            var set = reply.SessionCookies(CookieName).Single();
+            var set = reply.SessionCookies(CookieName).SingleOrDefault()
+                ?? throw new InvalidOperationException(
+                    $"seed: status {reply.Status}, body '{reply.Body}', Set-Cookie [{string.Join(" | ", reply.Cookies.Select(c => c.Raw))}], " +
+                    $"errors [{string.Join(" | ", Errors.Select(e => e.ToString()))}]");
             return ($"{CookieName}={Uri.EscapeDataString(set.Value)}", KeyOf(set));
         }
 
