@@ -119,7 +119,7 @@ public sealed class AccountController : ControllerBase
         Description =
             "Forwards the form to skein-api POST /ui/v1/auth/signup (no identity headers). " +
             "On success the user is logged in exactly as after POST /api/auth/login " +
-            "(session cookie) and the user is returned. Rate limit per lower-cased email " +
+            "(a new session key; the key the request carried is revoked first) and the user is returned. Rate limit per lower-cased email " +
             "and per client IP (IP only behind a trusted proxy): exceeded → 429 rate_limited " +
             "without calling skein-api. Refusals are ProblemDetails with the skein-api code in " +
             "'error'; username_taken adds 'suggestions'." +
@@ -264,15 +264,17 @@ public sealed class AccountController : ControllerBase
     /// <remarks>
     /// Rate limit: «password-reset-complete + IP» (the token is never part of a
     /// key). skein-api sets the password, uses the token up, raises the
-    /// session epoch — every session of the user ends, API keys keep working —
+    /// session epoch — every session of the user ends there, API keys keep working —
     /// and answers with the authentication response carrying the NEW epoch.
-    /// The BFF answers 204 and, only when this request carries a session of
-    /// the SAME user the token belongs to, re-issues that session with the
-    /// new epoch (same session id, Set-Cookie): the tab that reset its own
-    /// password stays logged in, every other session of the user is refused by
-    /// skein-api from now on (INV-26 "except the current one", plan K-16). Without a
-    /// session, or with a session of another user, no session is issued or
-    /// changed — another user's session is never turned into the token owner's.
+    /// The BFF then revokes locally (INV-13): the key of the session cookie the request
+    /// carried, whoever owns it, and every ticket of the token's user found by the
+    /// user's index; this replica's hub connections of the user close at once. Only
+    /// after a complete revocation a NEW session of the user is issued under a new key
+    /// (204 with Set-Cookie, whatever cookie came in: none, another user's, the user's own).
+    /// An incomplete revocation, an unreadable user id, data unusable for a session or a
+    /// failed issue answer 502 of type …/password-changed-session-not-issued without a cookie
+    /// (the password and the spent token stay); no answer from skein-api is a different 502,
+    /// of type …/upstream-unavailable, that does not claim the change.
     /// Refusal codes: <c>password_login_disabled</c>, <c>email_disabled</c>,
     /// <c>rate_limited</c>, <c>token_invalid</c>, <c>password_weak</c>,
     /// <c>password_pwned</c>, <c>invalid_request</c>.
