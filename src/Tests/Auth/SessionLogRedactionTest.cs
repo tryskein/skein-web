@@ -14,6 +14,7 @@ namespace SkeinWeb.Tests.Auth;
 /// e-mail, session key or cookie value.
 /// </summary>
 [Trait("Category", "Integration")]
+[Collection("session-pipeline")]
 public sealed class SessionLogRedactionTest
 {
     private static readonly Guid Alice = Guid.Parse("0199a1b2-0000-7000-8000-00000000000a");
