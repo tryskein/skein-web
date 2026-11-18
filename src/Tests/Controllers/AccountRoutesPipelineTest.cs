@@ -112,6 +112,8 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
             var db = new Mock<IDatabase>();
             db.Setup(d => d.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>()))
                 .ReturnsAsync(true);
+            db.Setup(d => d.SetMembersAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+                .ReturnsAsync(Array.Empty<RedisValue>()); // an empty index: nothing to revoke
             var mux = new Mock<IConnectionMultiplexer>();
             mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
             services.AddSingleton(mux.Object);
