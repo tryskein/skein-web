@@ -174,6 +174,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Suggest usernames from an email",
         Description =
@@ -228,6 +229,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Request a password reset",
         Description =
@@ -352,6 +354,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status422UnprocessableEntity)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Confirm an email address",
         Description =
@@ -395,6 +398,7 @@ public sealed class AccountController : ControllerBase
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status429TooManyRequests)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
+    [ProducesResponseType(typeof(SkeinWeb.Middleware.SsoUnavailableResponse), StatusCodes.Status502BadGateway, "application/json")]
     [SwaggerOperation(
         Summary = "Preview an invitation",
         Description =

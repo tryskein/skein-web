@@ -73,11 +73,7 @@ public sealed class SessionStoreFailureMiddleware(
             context.Response.ContentType = "application/json";
             await JsonSerializer.SerializeAsync(
                 context.Response.Body,
-                new
-                {
-                    error = "sso_unavailable",
-                    message = "Authentication service is temporarily unavailable.",
-                },
+                new SsoUnavailableResponse("sso_unavailable", "Authentication service is temporarily unavailable."),
                 JsonOpts,
                 context.RequestAborted);
             return;
@@ -102,3 +98,11 @@ public sealed class SessionStoreFailureMiddleware(
         await JsonSerializer.SerializeAsync(context.Response.Body, problem, JsonOpts, context.RequestAborted);
     }
 }
+
+/// <summary>
+/// The JSON 502 a trusted SSO request gets when the session store failed (the machine form of
+/// the <c>sso_unavailable</c> answer, shared with the OpenAPI contract of the operations that can give it).
+/// </summary>
+/// <param name="Error">Machine code: <c>sso_unavailable</c>.</param>
+/// <param name="Message">Human text of the refusal.</param>
+public sealed record SsoUnavailableResponse(string Error, string Message);
