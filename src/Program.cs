@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.OpenApi;
@@ -94,10 +95,11 @@ builder.Services.AddHealthChecks();
 
 // ---- Authentication: Cookie + RedisTicketStore ------------------------------
 // The cookie carries only an opaque session id; the AuthenticationTicket
-// itself is stored in Redis under skein:session:<sid>. SecurePolicy is
-// SameAsRequest because in dev we ride plain HTTP on localhost:8080;
-// production HTTPS termination at the ingress flips it to Secure
-// automatically.
+// itself is stored in Redis under skein:session:<sid>. The cookie's name and
+// Secure come from SessionCookiePolicy (SKEIN_ALLOW_INSECURE_HTTP and the
+// environment), never from the request scheme or X-Forwarded-Proto: normally
+// __Host-skein.sid with Secure, in the Development insecure-http mode
+// skein.sid without it.
 //
 // TODO R5+: add Antiforgery double-submit cookie. We currently rely on
 // SameSite=Lax + same-origin to block CSRF, which is fine for a same-
@@ -286,6 +288,7 @@ builder.Services.Configure<SsoOptions>(builder.Configuration.GetSection(SsoOptio
 // McpProxyMiddleware) so its IServiceProvider dependency stays scoped
 // per-request.
 builder.Services.AddTransient<SsoSessionMiddleware>();
+builder.Services.AddTransient<SessionStoreFailureMiddleware>();
 
 // ---- Login rate limiter -----------------------------------------------------
 builder.Services.AddSingleton<LoginRateLimiter>();
@@ -431,7 +434,7 @@ if (authMode.IsKeycloakMode && string.IsNullOrWhiteSpace(ssoSnapshot.LogoutRedir
     app.Logger.LogWarning(
         "Authentication__LogoutRedirectUrl is empty in the legacy trust-headers mode " +
         "(skein-api SKEIN_AUTH_MODE=keycloak|hybrid, no Authentication__Oidc__Authority) " +
-        "— logout clears the local skein.sid cookie only and returns no redirect. The " +
+        "— logout clears the local session cookie only and returns no redirect. The " +
         "EXTERNAL proxy session survives, so the user is signed straight back in on the " +
         "next request. Set Authentication__LogoutRedirectUrl to the sign-out endpoint of " +
         "the proxy in front of this deployment (for an oauth2-proxy edge: " +
@@ -494,6 +497,12 @@ app.UseMiddleware<McpProxyMiddleware>();
 // traffic still flows through UseAuthentication below.
 app.UseMiddleware<AgentProxyMiddleware>();
 
+// Early refusal when the session store fails technically while the session is
+// read: 502 before UseAuthentication's exception can escape, without Set-Cookie
+// and before skein-api is called. Between UseRouting (endpoint metadata is
+// available) and UseAuthentication (the first read happens inside next).
+app.UseMiddleware<SessionStoreFailureMiddleware>();
+
 app.UseAuthentication();
 
 // R5.1 — SSO session bootstrapper. In keycloak mode this middleware
@@ -521,8 +530,14 @@ app.UseAuthorization();
 // storms). Readiness today only confirms Redis is reachable; the DB
 // is on skein-api, not directly on us.
 app.MapGet("/healthz", () => Results.Json(new { status = "ok" }))
-   .AllowAnonymous();
-app.MapGet("/ready", ReadinessEndpoint.CheckAsync).AllowAnonymous();
+   .AllowAnonymous()
+   .Produces<ProblemDetails>(StatusCodes.Status502BadGateway, "application/problem+json")
+   .WithDescription("Liveness probe: 200 while the process runs, no dependency is checked. " +
+       "Refused before the operation when the session store failed technically while the session was read: ProblemDetails 502 (type https://skein.local/errors/upstream-unavailable, error=upstream_unavailable). No Set-Cookie.");
+app.MapGet("/ready", ReadinessEndpoint.CheckAsync)
+   .AllowAnonymous()
+   .Produces<ProblemDetails>(StatusCodes.Status502BadGateway, "application/problem+json")
+   .WithDescription("Readiness probe. Refused before the operation when the session store failed technically while the session was read: ProblemDetails 502 (type https://skein.local/errors/upstream-unavailable, error=upstream_unavailable). No Set-Cookie.");
 app.MapMetrics();
 
 // sk-9 — Native OIDC challenge endpoint. Same path the SPA already
@@ -549,7 +564,9 @@ app.MapGet("/oauth2/start", (HttpContext http, string? rd) =>
     return Results.Challenge(
         new AuthenticationProperties { RedirectUri = returnPath },
         new[] { OpenIdConnectDefaults.AuthenticationScheme });
-}).AllowAnonymous();
+}).AllowAnonymous()
+  .Produces<ProblemDetails>(StatusCodes.Status502BadGateway, "application/problem+json")
+  .WithDescription("Starts the native OIDC sign-in (404 outside KeycloakOidc mode). Refused before the operation when the session store failed technically while the session was read: ProblemDetails 502 (type https://skein.local/errors/upstream-unavailable, error=upstream_unavailable); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON 502 {error: sso_unavailable, message} instead. No Set-Cookie.");
 
 app.MapControllers();
 

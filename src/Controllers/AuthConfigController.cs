@@ -107,11 +107,14 @@ public sealed class AuthConfigController : ControllerBase
     /// logout target" and "MCP is same-origin" respectively. Neither is a
     /// secret: both are public endpoints a browser is about to be pointed at.
     /// </para>
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="ct">Request abort.</param>
     /// <response code="200">Auth mode, addresses and behaviour flags.</response>
     /// <response code="503">skein-api did not hand out its settings; ProblemDetails, <c>error = "upstream_unavailable"</c>.</response>
+    /// <response code="502">Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
     [HttpGet("config")]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
     [AllowAnonymous]
     [ProducesResponseType(typeof(AuthConfigResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status503ServiceUnavailable)]
@@ -132,7 +135,8 @@ public sealed class AuthConfigController : ControllerBase
             "the client will follow after logout (null when this deployment has no " +
             "external session to end); mcpUrl is where agents reach MCP (null when " +
             "that is this same origin). Safe to fetch unauthenticated — every value " +
-            "is a public endpoint address.",
+            "is a public endpoint address." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable), no Set-Cookie.",
         OperationId = "GetAuthConfig")]
     public async Task<ActionResult<AuthConfigResponse>> Get(CancellationToken ct)
     {

@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 
@@ -30,9 +31,11 @@ public static class AuthenticationRegistration
     /// Validates the OIDC-client settings for <paramref name="mode"/>, registers
     /// <paramref name="mode"/> as a singleton, and adds the authentication schemes:
     /// <list type="bullet">
-    ///   <item>always — the cookie scheme (<c>skein.sid</c>, server-side
-    ///         tickets in <see cref="RedisTicketStore"/>, 401/403 instead of
-    ///         redirects), the only scheme a session is signed into;</item>
+    ///   <item>always — the two cookie schemes (<see cref="SessionSchemes.Main"/>, which reads,
+    ///         renews and ends the session, and <see cref="SessionSchemes.Issue"/>, which every
+    ///         new authentication is signed into; name and <c>Secure</c> from
+    ///         <see cref="SessionCookiePolicy"/>, server-side tickets in
+    ///         <see cref="RedisTicketStore"/>, 401/403 instead of redirects);</item>
     ///   <item><see cref="WebAuthKind.KeycloakOidc"/> only — the OpenIdConnect
     ///         scheme (Authorization Code + PKCE, group gate, provisioning via
     ///         skein-api, cookie principal of the password-login shape).</item>
@@ -67,41 +70,9 @@ public static class AuthenticationRegistration
         services.AddSingleton(mode);
 
         var authBuilder = services
-            .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
-            .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
-            {
-                options.Cookie.Name = "skein.sid";
-                options.Cookie.HttpOnly = true;
-                options.Cookie.SameSite = SameSiteMode.Lax;
-                options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
-                options.ExpireTimeSpan = TimeSpan.FromHours(24);
-                options.SlidingExpiration = true;
-
-                // SessionStore is set via a closure on the built service provider
-                // because options-configuration runs before DI is final. Resolving
-                // RedisTicketStore lazily here mirrors what AddCookie examples do
-                // when wiring server-side ticket storage.
-                options.Events.OnSigningIn = ctx =>
-                {
-                    // No-op hook reserved for audit logging in R5+. Required to be
-                    // declared so the events object is not null.
-                    return Task.CompletedTask;
-                };
-
-                // Return 401/403 instead of redirecting to /login — we are an API,
-                // not a server-rendered app. The React client interprets a 401 as
-                // "show the login screen".
-                options.Events.OnRedirectToLogin = ctx =>
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
-                    return Task.CompletedTask;
-                };
-                options.Events.OnRedirectToAccessDenied = ctx =>
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
-                    return Task.CompletedTask;
-                };
-            });
+            .AddAuthentication(SessionSchemes.Main)
+            .AddCookie(SessionSchemes.Main, ConfigureSessionCookieStatics)
+            .AddCookie(SessionSchemes.Issue, ConfigureSessionCookieStatics);
 
         // sk-9 — Native OIDC handler. Only registered in KeycloakOidc mode;
         // the legacy trust-headers Keycloak mode keeps its existing flow
@@ -327,13 +298,61 @@ public static class AuthenticationRegistration
             });
         }
 
-        // Wire SessionStore after the service provider is fully built. This is
-        // the standard recipe for ITicketStore: configure-options resolves the
-        // store from DI, but only on first use.
-        services.AddOptions<CookieAuthenticationOptions>(CookieAuthenticationDefaults.AuthenticationScheme)
-            .Configure<RedisTicketStore>((opts, store) => opts.SessionStore = store);
+        // The cookie name and Secure come from the policy, the store and the ticket format
+        // from DI; both are resolved on first use, after the service provider is built. The
+        // two schemes share the store and the ticket format (one purpose, so a value issued
+        // by an earlier version is rejected whatever its cookie name); they differ only in
+        // the cookie manager: Main reads the incoming cookie, Issue never does.
+        services.AddSingleton(sp => new TicketDataFormat(
+            sp.GetRequiredService<IDataProtectionProvider>().CreateProtector("Skein.Session.Cookie", "v3")));
+        services.AddOptions<CookieAuthenticationOptions>(SessionSchemes.Main)
+            .Configure<RedisTicketStore, SessionCookiePolicy, TicketDataFormat>((opts, store, policy, format) =>
+                ConfigureSessionCookie(opts, store, policy, format, new SessionCookieManager(new ChunkingCookieManager())));
+        services.AddOptions<CookieAuthenticationOptions>(SessionSchemes.Issue)
+            .Configure<RedisTicketStore, SessionCookiePolicy, TicketDataFormat>((opts, store, policy, format) =>
+                ConfigureSessionCookie(opts, store, policy, format, new IssueCookieManager(new ChunkingCookieManager())));
 
         return authBuilder;
+    }
+
+    // What does not depend on the policy: the attributes both schemes share, and 401/403
+    // instead of redirects — we are an API, not a server-rendered app; the React client
+    // interprets a 401 as "show the login screen".
+    private static void ConfigureSessionCookieStatics(CookieAuthenticationOptions options)
+    {
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Lax;
+        options.Cookie.Path = "/";
+        options.ExpireTimeSpan = TimeSpan.FromHours(24);
+        options.SlidingExpiration = true;
+
+        options.Events.OnRedirectToLogin = ctx =>
+        {
+            ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return Task.CompletedTask;
+        };
+        options.Events.OnRedirectToAccessDenied = ctx =>
+        {
+            ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return Task.CompletedTask;
+        };
+    }
+
+    // The name and Secure come from the policy, never from the request scheme or from
+    // X-Forwarded-Proto. No Domain: with Path=/ and Secure that is what the __Host- prefix
+    // requires.
+    private static void ConfigureSessionCookie(
+        CookieAuthenticationOptions options,
+        RedisTicketStore store,
+        SessionCookiePolicy policy,
+        TicketDataFormat format,
+        ICookieManager manager)
+    {
+        options.Cookie.Name = policy.CookieName;
+        options.Cookie.SecurePolicy = policy.Secure ? CookieSecurePolicy.Always : CookieSecurePolicy.None;
+        options.SessionStore = store;
+        options.TicketDataFormat = format;
+        options.CookieManager = manager;
     }
 
     // Strip the leading slash Keycloak prepends to realm-group path claims

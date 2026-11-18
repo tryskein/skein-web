@@ -246,7 +246,7 @@ public sealed record AuthConfigResponse(
 /// <list type="table">
 ///   <listheader><term>Route</term><description>Body → success</description></listheader>
 ///   <item><term><c>POST /api/auth/signup</c></term>
-///         <description><see cref="SignupRequest"/> → 200 <see cref="UserDto"/>; the user is logged in (Set-Cookie <c>skein.sid</c>) exactly as after <c>POST /api/auth/login</c>.</description></item>
+///         <description><see cref="SignupRequest"/> → 200 <see cref="UserDto"/>; the user is logged in (Set-Cookie of the session cookie, <c>__Host-skein.sid</c> or <c>skein.sid</c> in the Development insecure-http mode) exactly as after <c>POST /api/auth/login</c>.</description></item>
 ///   <item><term><c>GET /api/auth/username-suggestions?email=</c></term>
 ///         <description>→ 200 <see cref="UsernameSuggestionsResponse"/> ("Generate from email").</description></item>
 ///   <item><term><c>POST /api/auth/password-reset</c></term>

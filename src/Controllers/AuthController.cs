@@ -19,7 +19,7 @@ namespace SkeinWeb.Controllers;
 [ApiController]
 [Route("api/auth")]
 [SwaggerTag("BFF authentication: cookie-backed login / logout / me. " +
-            "Sets the skein.sid cookie on login (session id only — full ticket lives in Redis).")]
+            "Sets the session cookie on login (__Host-skein.sid, or skein.sid in the Development insecure-http mode; session id only — full ticket lives in Redis).")]
 public sealed class AuthController : ControllerBase
 {
     private readonly SkeinApiClient _api;
@@ -152,16 +152,17 @@ public sealed class AuthController : ControllerBase
     ///    502, no session. On 200: clear the failure counter, build a
     ///    ClaimsPrincipal with the user's id/email/username/name/role and the
     ///    session epoch of the answer, SignIn under the "Cookies"
-    ///    scheme (this writes the skein.sid cookie + stores the ticket in
+    ///    scheme (this writes the session cookie + stores the ticket in
     ///    Redis via RedisTicketStore), and return the user JSON.
     ///
     /// Side effects:
-    /// - Writes <c>skein.sid</c> HttpOnly cookie (SameSite=Lax, Secure on HTTPS).
+    /// - Writes the session cookie (<c>__Host-skein.sid</c>; <c>skein.sid</c> in the Development insecure-http mode): HttpOnly, Secure (not in that mode), Path=/, SameSite=Lax.
     /// - Writes a session blob to Redis under <c>skein:session:&lt;sid&gt;</c>
     ///   with sliding 24h TTL.
     /// - Increments <c>skein:login:fail:&lt;email&gt;</c> on failure or DELs on success.
     ///
     /// Logging never includes email or password — sanitiser-friendly.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="req">Login credentials.</param>
     /// <param name="ct">Cancellation token tied to the request.</param>
@@ -169,7 +170,7 @@ public sealed class AuthController : ControllerBase
     /// <response code="400">Request body validation failed (malformed JSON, missing fields).</response>
     /// <response code="422">Invalid credentials — same response for unknown email and wrong password.</response>
     /// <response code="429">Too many failed attempts for this email; locked out for 60 seconds.</response>
-    /// <response code="502">Upstream skein-api was unreachable, returned an unexpected status, or answered 200 without <c>sessionEpoch</c>.</response>
+    /// <response code="502">Upstream skein-api was unreachable, returned an unexpected status, or answered 200 without <c>sessionEpoch</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, no <c>error</c> member). No Set-Cookie.</response>
     [HttpPost("login")]
     [ExplicitSignIn(Surface.Login)]
     [AllowAnonymous]
@@ -191,7 +192,8 @@ public sealed class AuthController : ControllerBase
             "In pure KEYCLOAK/OIDC mode the request is forwarded to skein-api, which returns 410 " +
             "Gone for a non-break-glass account (clients navigate to /oauth2/start) but still lets " +
             "the break-glass admin sign in; a 403 with error=sso_required steers an account to SSO " +
-            "without a loop.",
+            "without a loop." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails (type upstream-unavailable, no error member) before the operation, no Set-Cookie.",
         OperationId = "Login")]
     public async Task<ActionResult<UserDto>> Login(
         [FromBody, SwaggerRequestBody("Login credentials", Required = true)] LoginRequest req,
@@ -412,25 +414,29 @@ public sealed class AuthController : ControllerBase
     /// 302 — same-origin fetch follows redirects opaquely and would
     /// not actually navigate the browser.
     /// </para>
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="ct">Cancellation token.</param>
     /// <response code="200">Session terminated. Body carries a redirectTo URL in keycloak mode; empty in local mode.</response>
     /// <response code="401">Not authenticated.</response>
+    /// <response code="502">Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpPost("logout")]
+    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status502BadGateway)]
     [Authorize]
     [ProducesResponseType(typeof(LogoutResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status401Unauthorized)]
     [SwaggerOperation(
         Summary = "Logout",
         Description =
-            "Clears the skein.sid cookie, deletes the Redis session row and closes " +
+            "Clears the session cookie, deletes the Redis session row and closes " +
             "the SignalR connections opened with that session. " +
             "Response body carries a redirectTo URL the SPA should navigate to so " +
             "the upstream session is also terminated: the configured " +
             "Authentication:LogoutRedirectUrl in legacy Keycloak mode (null when it " +
             "is unset — the external session then survives, see the startup " +
             "warning), same-origin /api/auth/oidc-signout in native KeycloakOidc " +
-            "mode (initiates RP-logout against the realm), or null in local mode.",
+            "mode (initiates RP-logout against the realm), or null in local mode." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable; JSON error=sso_unavailable in the legacy trust-headers mode for a trusted proxy with both identity headers), no Set-Cookie.",
         OperationId = "Logout")]
     public async Task<ActionResult<LogoutResponse>> Logout(CancellationToken ct)
     {
@@ -547,11 +553,12 @@ public sealed class AuthController : ControllerBase
     /// to the login screen. skein-api unreachable or answering outside its
     /// contract → 502 <c>upstream_unavailable</c>, never the cookie's claims
     /// as a fallback.</para>
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="ct">Request abort.</param>
     /// <response code="200">The user of the session.</response>
     /// <response code="401">No session, or skein-api revoked it (<c>error = session_revoked</c>; the cookie is cleared).</response>
-    /// <response code="502">skein-api unreachable or outside its contract.</response>
+    /// <response code="502">skein-api unreachable or outside its contract. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpGet("me")]
     [Authorize]
     [ProducesResponseType(typeof(UserDto), StatusCodes.Status200OK)]
@@ -563,7 +570,8 @@ public sealed class AuthController : ControllerBase
             "Asks skein-api GET /ui/v1/auth/me on behalf of the session (identity headers + " +
             "X-Skein-Session-Epoch) and returns its user. A session skein-api revoked " +
             "(401 session_revoked) is ended here — cookie cleared — and answered 401 with " +
-            "error=session_revoked; skein-api unavailable → 502 upstream_unavailable.",
+            "error=session_revoked; skein-api unavailable → 502 upstream_unavailable." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable; JSON error=sso_unavailable in the legacy trust-headers mode for a trusted proxy with both identity headers), no Set-Cookie.",
         OperationId = "Me")]
     public async Task<ActionResult<UserDto>> Me(CancellationToken ct)
     {

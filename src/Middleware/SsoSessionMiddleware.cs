@@ -11,7 +11,7 @@ namespace SkeinWeb.Middleware;
 /// R5.1 — auto-create a skein cookie session from the trust headers
 /// (<c>X-Auth-Request-User</c> + <c>X-Auth-Request-Email</c>) injected
 /// by oauth2-proxy when the user is authenticated upstream but does not
-/// yet have a skein.sid cookie. R5.x adds a TTL refresh fallback that
+/// yet have a session cookie. R5.x adds a TTL refresh fallback that
 /// periodically re-syncs cookie claims from skein-api.
 /// </summary>
 /// <remarks>

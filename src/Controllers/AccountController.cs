@@ -48,7 +48,7 @@ namespace SkeinWeb.Controllers;
 ///         ProblemDetails <c>error = upstream_unavailable</c>.</item>
 /// </list>
 /// <para>Signup and signup by invitation log the user in exactly as a password
-/// login does (<see cref="SessionPrincipal"/>, cookie <c>skein.sid</c>,
+/// login does (<see cref="SessionPrincipal"/>, the session cookie,
 /// ticket in Redis), with the <c>sessionEpoch</c> of skein-api's answer in the
 /// session (plan K-16); an answer without it issues no session (502, logged as
 /// Error).</para>
@@ -90,11 +90,12 @@ public sealed class AccountController : ControllerBase
     /// Rate limit: «signup + email» and «signup + IP». On skein-api's 200 the
     /// account, its personal space and the consent record exist and a
     /// confirmation email is queued (skein-api side); the BFF then signs the
-    /// user in (Set-Cookie <c>skein.sid</c>) and returns the user.
+    /// user in (Set-Cookie of the session cookie) and returns the user.
     /// Refusal codes: <c>signup_disabled</c>, <c>rate_limited</c>,
     /// <c>captcha_failed</c>, <c>terms_required</c>, <c>username_invalid</c>,
     /// <c>password_weak</c>, <c>password_pwned</c>, <c>email_taken</c>,
     /// <c>username_taken</c> (+ <c>suggestions</c>), <c>invalid_request</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="req">Registration form.</param>
     /// <param name="ct">Request abort.</param>
@@ -102,7 +103,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Body not of the declared shape (BFF) or <c>invalid_request</c> (skein-api).</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c> — BFF limiter or skein-api backstop.</response>
-    /// <response code="502"><c>upstream_unavailable</c> — skein-api unreachable or answered outside the contract.</response>
+    /// <response code="502"><c>upstream_unavailable</c> — skein-api unreachable or answered outside the contract. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
     [HttpPost("signup")]
     [ExplicitSignIn(Surface.Signup)]
     [ProducesResponseType(typeof(UserDto), StatusCodes.Status200OK)]
@@ -115,10 +116,11 @@ public sealed class AccountController : ControllerBase
         Description =
             "Forwards the form to skein-api POST /ui/v1/auth/signup (no identity headers). " +
             "On success the user is logged in exactly as after POST /api/auth/login " +
-            "(skein.sid cookie) and the user is returned. Rate limit per lower-cased email " +
+            "(session cookie) and the user is returned. Rate limit per lower-cased email " +
             "and per client IP (IP only behind a trusted proxy): exceeded → 429 rate_limited " +
             "without calling skein-api. Refusals are ProblemDetails with the skein-api code in " +
-            "'error'; username_taken adds 'suggestions'.",
+            "'error'; username_taken adds 'suggestions'." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "Signup")]
     public async Task<ActionResult<UserDto>> Signup(
         [FromBody, SwaggerRequestBody("Registration form", Required = true)] SignupRequest req,
@@ -157,6 +159,7 @@ public sealed class AccountController : ControllerBase
     /// <remarks>
     /// Rate limit: «username-suggestions + email» and «… + IP». Refusal codes:
     /// <c>signup_disabled</c>, <c>rate_limited</c>, <c>invalid_request</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="email">Email whose local part seeds the suggestions.</param>
     /// <param name="ct">Request abort.</param>
@@ -164,7 +167,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Email missing or malformed.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpGet("username-suggestions")]
     [ProducesResponseType(typeof(UsernameSuggestionsResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
@@ -175,7 +178,8 @@ public sealed class AccountController : ControllerBase
         Summary = "Suggest usernames from an email",
         Description =
             "Forwards to skein-api GET /ui/v1/auth/username-suggestions. Rate limit per " +
-            "lower-cased email and per client IP; exceeded → 429 rate_limited.",
+            "lower-cased email and per client IP; exceeded → 429 rate_limited." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable; JSON error=sso_unavailable in the legacy trust-headers mode for a trusted proxy with both identity headers), no Set-Cookie.",
         OperationId = "GetUsernameSuggestions")]
     public async Task<ActionResult<UsernameSuggestionsResponse>> UsernameSuggestions(
         [FromQuery, Required, EmailAddress, StringLength(320, MinimumLength = 3),
@@ -209,6 +213,7 @@ public sealed class AccountController : ControllerBase
     /// identical whether or not an account with the email exists. Refusal
     /// codes (independent of the email): <c>password_login_disabled</c>,
     /// <c>email_disabled</c>, <c>rate_limited</c>, <c>invalid_request</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="req">Email and the interface language of the email.</param>
     /// <param name="ct">Request abort.</param>
@@ -216,7 +221,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Body not of the declared shape.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpPost("password-reset")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
@@ -227,7 +232,8 @@ public sealed class AccountController : ControllerBase
         Summary = "Request a password reset",
         Description =
             "Forwards to skein-api POST /ui/v1/auth/password-reset; 204 whether or not the " +
-            "account exists. Rate limit per lower-cased email and per client IP.",
+            "account exists. Rate limit per lower-cased email and per client IP." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable; JSON error=sso_unavailable in the legacy trust-headers mode for a trusted proxy with both identity headers), no Set-Cookie.",
         OperationId = "RequestPasswordReset")]
     public async Task<ActionResult> PasswordReset(
         [FromBody, SwaggerRequestBody("Email and email language", Required = true)] PasswordResetRequest req,
@@ -264,6 +270,7 @@ public sealed class AccountController : ControllerBase
     /// Refusal codes: <c>password_login_disabled</c>, <c>email_disabled</c>,
     /// <c>rate_limited</c>, <c>token_invalid</c>, <c>password_weak</c>,
     /// <c>password_pwned</c>, <c>invalid_request</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="token">Token from the reset link.</param>
     /// <param name="req">The new password.</param>
@@ -272,7 +279,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Body not of the declared shape.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
     [HttpPost("password-reset/{token}")]
     [ExplicitSignIn(Surface.PasswordResetComplete)]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
@@ -289,7 +296,8 @@ public sealed class AccountController : ControllerBase
             "logged in; a session of another user is left as it is. The user's other session " +
             "tickets are removed and this replica's hub connections of those sessions are " +
             "closed (other replicas close theirs on the next access re-check, within 30 s). " +
-            "Rate limit per client IP only.",
+            "Rate limit per client IP only." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "CompletePasswordReset")]
     public async Task<ActionResult> PasswordResetComplete(
         [FromRoute, StringLength(512, MinimumLength = 1), SwaggerParameter("Token from the reset link", Required = true)] string token,
@@ -329,6 +337,7 @@ public sealed class AccountController : ControllerBase
     /// Rate limit: «confirm-email + IP». No session is issued or changed.
     /// Refusal codes: <c>email_disabled</c>, <c>rate_limited</c>,
     /// <c>token_invalid</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="token">Token from the confirmation email.</param>
     /// <param name="ct">Request abort.</param>
@@ -336,7 +345,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Token malformed.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpPost("confirm-email/{token}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
@@ -347,7 +356,8 @@ public sealed class AccountController : ControllerBase
         Summary = "Confirm an email address",
         Description =
             "Forwards to skein-api POST /ui/v1/auth/confirm-email/{token}; 204 on success. " +
-            "Rate limit per client IP only.",
+            "Rate limit per client IP only." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable; JSON error=sso_unavailable in the legacy trust-headers mode for a trusted proxy with both identity headers), no Set-Cookie.",
         OperationId = "ConfirmEmail")]
     public async Task<ActionResult> ConfirmEmail(
         [FromRoute, StringLength(512, MinimumLength = 1), SwaggerParameter("Token from the confirmation email", Required = true)] string token,
@@ -372,13 +382,14 @@ public sealed class AccountController : ControllerBase
     /// Rate limit: «invitation-preview + IP». Opening the link changes
     /// nothing; every invitation state is a 200. Refusal codes:
     /// <c>rate_limited</c>, <c>invalid_request</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="token">Token from the invitation link.</param>
     /// <param name="ct">Request abort.</param>
     /// <response code="200">Invitation state.</response>
     /// <response code="400">Token malformed.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>); in the legacy trust-headers mode, for a trusted proxy with both identity headers, JSON <c>{ "error": "sso_unavailable", "message": … }</c> instead. No Set-Cookie.</response>
     [HttpGet("invitations/{token}")]
     [ProducesResponseType(typeof(InvitationPreviewResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
@@ -389,7 +400,8 @@ public sealed class AccountController : ControllerBase
         Description =
             "Forwards to skein-api GET /ui/v1/auth/invitations/{token}. For a visitor without " +
             "a session; a logged-in tab uses GET /api/v1/invitations/{token}. Rate limit per " +
-            "client IP only.",
+            "client IP only." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 before the operation (ProblemDetails error=upstream_unavailable; JSON error=sso_unavailable in the legacy trust-headers mode for a trusted proxy with both identity headers), no Set-Cookie.",
         OperationId = "GetInvitationPreview")]
     public async Task<ActionResult<InvitationPreviewResponse>> Invitation(
         [FromRoute, StringLength(512, MinimumLength = 1), SwaggerParameter("Token from the invitation link", Required = true)] string token,
@@ -427,6 +439,7 @@ public sealed class AccountController : ControllerBase
     /// <c>terms_required</c>, <c>username_invalid</c>, <c>password_weak</c>,
     /// <c>password_pwned</c>, <c>email_taken</c>, <c>username_taken</c>
     /// (+ <c>suggestions</c>), <c>invalid_request</c>.
+    /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
     /// </remarks>
     /// <param name="token">Token from the invitation link.</param>
     /// <param name="req">Registration form.</param>
@@ -435,7 +448,7 @@ public sealed class AccountController : ControllerBase
     /// <response code="400">Body not of the declared shape.</response>
     /// <response code="422">Business refusal; code in <c>error</c>.</response>
     /// <response code="429"><c>rate_limited</c>.</response>
-    /// <response code="502"><c>upstream_unavailable</c>.</response>
+    /// <response code="502"><c>upstream_unavailable</c>. Refused before the operation when the session store failed technically while the session was read: ProblemDetails (<c>type</c> …/upstream-unavailable, <c>error = upstream_unavailable</c>). No Set-Cookie.</response>
     [HttpPost("invitations/{token}/signup")]
     [ExplicitSignIn(Surface.InvitationSignup)]
     [ProducesResponseType(typeof(InvitationSignupResponse), StatusCodes.Status200OK)]
@@ -447,8 +460,9 @@ public sealed class AccountController : ControllerBase
         Summary = "Register by invitation",
         Description =
             "Forwards to skein-api POST /ui/v1/auth/invitations/{token}/signup. On success the " +
-            "user is logged in (skein.sid cookie) and the joined space is returned for the " +
-            "redirect. Rate limit per client IP only.",
+            "user is logged in (session cookie) and the joined space is returned for the " +
+            "redirect. Rate limit per client IP only." +
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "InvitationSignup")]
     public async Task<ActionResult<InvitationSignupResponse>> InvitationSignup(
         [FromRoute, StringLength(512, MinimumLength = 1), SwaggerParameter("Token from the invitation link", Required = true)] string token,
