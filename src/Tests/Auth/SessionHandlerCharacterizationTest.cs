@@ -760,6 +760,7 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
                     o.SignOutScheme = Main;
                     o.TimeProvider = time;
                     o.StateDataFormat = new PropertiesDataFormat(provider.CreateProtector("spike.state"));
+                    o.Events = new RemoteAuthenticationEvents();
                     o.Events.OnTicketReceived = async ctx =>
                     {
                         ctx.HandleResponse();
