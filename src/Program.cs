@@ -73,17 +73,11 @@ builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
 // ---- Redis: shared multiplexer ---------------------------------------------
 // One IConnectionMultiplexer per process — SE.Redis is internally
-// thread-safe and connects lazily per endpoint. Used by IDistributedCache,
-// DataProtection, and LoginRateLimiter (the last needs raw IDatabase access
-// for atomic INCR which IDistributedCache cannot express).
+// thread-safe and connects lazily per endpoint. Used by RedisTicketStore (the
+// session rows), DataProtection and LoginRateLimiter (the last needs raw
+// IDatabase access for atomic INCR).
 var muxer = ConnectionMultiplexer.Connect(redisConfig);
 builder.Services.AddSingleton<IConnectionMultiplexer>(muxer);
-
-// IDistributedCache backed by Redis — used by RedisTicketStore.
-builder.Services.AddStackExchangeRedisCache(o =>
-{
-    o.ConnectionMultiplexerFactory = () => Task.FromResult<IConnectionMultiplexer>(muxer);
-});
 
 // DataProtection: persist the AES keyring to Redis. This is what makes
 // multi-replica skein-web deployments work — without it, each pod

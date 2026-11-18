@@ -4,7 +4,6 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -30,10 +29,7 @@ public sealed class UserChangedSubscriberIntegrationTests
         var redisUrl = Required("TEST_REDIS_URL");
         using var monitor = new HttpClient { BaseAddress = new Uri(Required("TEST_NATS_MONITOR_URL")) };
         await using var redis = await ConnectionMultiplexer.ConnectAsync(redisUrl);
-        var options = Options.Create(new RedisCacheOptions { Configuration = redisUrl });
-        using var cache = new RedisCache(options);
-        var store = new RedisTicketStore(cache, redis, new ConnectionRegistry(TimeProvider.System),
-            options, NullLogger<RedisTicketStore>.Instance);
+        var store = new RedisTicketStore(redis, NullLogger<RedisTicketStore>.Instance);
         var connections = new List<NatsConnection>();
         var bridges = new List<NatsBridge>();
         var subscribers = new List<UserChangedSubscriber>();

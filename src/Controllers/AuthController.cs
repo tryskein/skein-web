@@ -397,7 +397,7 @@ public sealed class AuthController : ControllerBase
     /// </summary>
     /// <remarks>
     /// <para>
-    /// SignOutAsync triggers <see cref="RedisTicketStore.RemoveAsync"/>,
+    /// SignOutAsync triggers <see cref="RedisTicketStore.RemoveAsync(string)"/>,
     /// hard-deleting the session row in Redis. Even if the user keeps the
     /// cookie value, RetrieveAsync will return null and the cookie is
     /// rejected on the next request.

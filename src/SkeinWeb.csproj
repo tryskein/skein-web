@@ -22,11 +22,10 @@
 
     <!-- Redis: session ticket store + DataProtection key ring + login rate limiter.
          StackExchange.Redis is the low-level client (used directly for atomic INCR
-         in LoginRateLimiter). Caching.StackExchangeRedis wires IDistributedCache
-         on top. DataProtection.StackExchangeRedis persists the AES keyring so
+         in LoginRateLimiter and for the session rows in RedisTicketStore).
+         DataProtection.StackExchangeRedis persists the AES keyring so
          multiple skein-web replicas share a single set of cookie-encryption keys. -->
     <PackageReference Include="StackExchange.Redis" Version="3.4.35" />
-    <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.15" />
     <PackageReference Include="Microsoft.AspNetCore.DataProtection.StackExchangeRedis" Version="10.0.15" />
 
     <!-- Polly retry policy for the typed SkeinApiClient HttpClient. -->

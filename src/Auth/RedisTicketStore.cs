@@ -2,307 +2,416 @@ using System.Security.Claims;
 using System.Security.Cryptography;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
-using Microsoft.Extensions.Caching.Distributed;
-using Microsoft.Extensions.Caching.StackExchangeRedis;
-using Microsoft.Extensions.Options;
-using SkeinWeb.Hubs;
 using StackExchange.Redis;
 
 namespace SkeinWeb.Auth;
 
 /// <summary>
-/// Server-side session store for the cookie auth scheme. The browser
-/// cookie carries only an opaque session id (32 random bytes,
-/// base64url-encoded); the actual <see cref="AuthenticationTicket"/> —
-/// claims, expiry, properties — lives in Redis under
-/// <c>skein:session:{sid}</c> with a sliding TTL.
+/// Server-side session store for the cookie auth scheme. The browser cookie carries only an
+/// opaque session key (32 random bytes, base64url, generated here); the
+/// <see cref="AuthenticationTicket"/> — claims, expiry, properties — is a Redis string under
+/// <c>skein:session:{key}</c> with a sliding 24 h lifetime.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Why server-side storage? With ticket-only cookies the entire principal
-/// rides in the cookie; logout cannot revoke a token (the browser still
-/// holds a valid blob), and large claim sets blow past the 4 KiB cookie
-/// limit. Storing the ticket in Redis lets us hard-invalidate sessions
-/// (RemoveAsync deletes the row), keep the cookie tiny, and share state
-/// across multiple skein-web replicas without sticky sessions.
+/// Rows are written straight to Redis, not through <c>IDistributedCache</c>, because the
+/// session rules need atomic decisions: an issue is <c>SET NX</c> (a key is never overwritten),
+/// a renewal is a compare-and-set against the bytes it read (it never creates an absent key and
+/// never changes the owner of a live one), a revocation reads and deletes in one step.
 /// </para>
 /// <para>
-/// Sid generation uses RandomNumberGenerator (CSPRNG); 32 bytes is 256 bits
-/// of entropy — equivalent to a session token in any production-grade
-/// session library. base64url encoding keeps it cookie-safe (no padding,
-/// no <c>+</c>/<c>/</c>).
+/// REVERSE INDEX: next to each row the store keeps <c>skein:user-tickets:{userId}</c>, a Set of
+/// the user's session keys, written on every issue and successful renewal (best-effort) and
+/// walked by <see cref="RemoveUserSessionsAsync"/>. It drives event-driven invalidation and the
+/// hub's ownership probe.
 /// </para>
 /// <para>
-/// REVERSE INDEX: alongside each <c>skein:session:{sid}</c> entry the
-/// store maintains <c>skein:user-tickets:{userId}</c> — a Redis Set of
-/// every active session key belonging to that user. Populated on
-/// <see cref="StoreAsync"/> / <see cref="RenewAsync"/>, pruned on
-/// <see cref="RemoveAsync"/>, walked on <see cref="RemoveByUserIdAsync"/>.
-/// The reverse index drives event-driven session invalidation: when
-/// skein-api publishes a <c>skein.user.{uid}.field.role</c> (or
-/// <c>deactivated-at</c>, <c>name</c>, <c>username</c>) event the
-/// <see cref="SkeinWeb.Auth.UserChangedSubscriber"/> can wipe every
-/// active ticket for that user in O(N) without scanning the entire
-/// session keyspace.
+/// The request-level decisions (suppressed late write, renewal outcome, issued key, removed
+/// keys, no-cancellation) are read from and written to <see cref="SessionRequestState"/> by the
+/// overloads that take an <see cref="HttpContext"/>; the cookie handler calls those.
+/// </para>
+/// <para>
+/// DIAGNOSTICS: an exception raised by an operation on a session key can carry the key in its
+/// text, so such exceptions are never logged or passed on as an inner exception. The store logs
+/// the operation, the exception type and a short code, and throws
+/// <see cref="SessionStoreUnavailableException"/>.
 /// </para>
 /// </remarks>
 public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessionTicketProbe
 {
-    /// <summary>Redis key prefix; combined with the random sid to form the lookup key.</summary>
+    /// <summary>Remembered SSO e-mail of a session, kept in <see cref="AuthenticationProperties.Items"/>.</summary>
+    public const string SsoEmailItem = "skein.sso.email";
+
+    /// <summary>Remembered SSO user name of a session, kept in <see cref="AuthenticationProperties.Items"/>.</summary>
+    public const string SsoUserItem = "skein.sso.user";
+
+    /// <summary>
+    /// Marker an explicit SSO confirmation puts into the properties of a renewal: the pair of
+    /// that ticket replaces the stored one. The store strips it; it is never persisted.
+    /// </summary>
+    public const string SsoPairWriteMarker = "skein.sso.pair-write";
+
+    /// <summary>Redis key prefix; combined with the random key to form the row's Redis key.</summary>
     private const string KeyPrefix = "skein:session:";
 
-    /// <summary>Reverse-index key prefix; combined with the user UUID to form a Set of ticket keys.</summary>
+    /// <summary>Reverse-index key prefix; combined with the user UUID to form a Set of session keys.</summary>
     private const string UserIndexPrefix = "skein:user-tickets:";
 
     /// <summary>Sliding session lifetime. 24h matches the cookie ExpireTimeSpan.</summary>
     private static readonly TimeSpan SessionLifetime = TimeSpan.FromHours(24);
 
-    private readonly IDistributedCache _cache;
+    /// <summary>Compare-and-set attempts of a renewal on a live key before it reports <see cref="RenewOutcome.CasExhausted"/>.</summary>
+    private const int CasAttempts = 3;
+
+    /// <summary>Attempts to find an unused key at issue (a collision of 256-bit keys does not happen; the bound is a guard).</summary>
+    private const int IssueAttempts = 3;
+
+    /// <summary>Attempts of one Redis step of a mass removal (index read, one ticket delete) before it counts as failed.</summary>
+    private const int RemovalAttempts = 3;
+
+    /// <summary>Pause before the second attempt of a removal step; doubled before the third.</summary>
+    private static readonly TimeSpan RemovalRetryDelay = TimeSpan.FromMilliseconds(100);
+
+    // Replace the row only if it still holds the bytes the renewal read.
+    private const string CompareAndSetScript =
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then " +
+        "redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]) return 1 end return 0";
+
+    // Delete the row and hand back what it held: nil = there was no row, integer 1 = a row of
+    // a kind this store cannot read (a hash of the former format) was deleted, otherwise the bytes.
+    private const string GetAndDeleteScript =
+        "local v = redis.pcall('GET', KEYS[1]) " +
+        "if type(v) == 'table' then redis.call('DEL', KEYS[1]) return 1 end " +
+        "if v then redis.call('DEL', KEYS[1]) return v end return false";
+
     private readonly IConnectionMultiplexer _redis;
-    private readonly ConnectionRegistry _hubConnections;
-    private readonly string _cacheKeyPrefix;
     private readonly ILogger<RedisTicketStore> _logger;
 
     /// <summary>Creates the store.</summary>
-    /// <param name="cache">Ticket rows.</param>
-    /// <param name="redis">Reverse index.</param>
-    /// <param name="hubConnections">This replica's hub connections: a ticket key
-    /// renewed for another user closes the connections of the previous owner
-    /// opened with it (INV-26).</param>
-    /// <param name="cacheOptions">Options of the Redis cache behind <paramref name="cache"/>:
-    /// its <see cref="RedisCacheOptions.InstanceName"/> prefixes every cache key
-    /// in Redis, which <see cref="ExistsAsync"/> needs to find a ticket's key.</param>
+    /// <param name="redis">Rows and reverse index.</param>
     /// <param name="logger">Logger.</param>
-    public RedisTicketStore(
-        IDistributedCache cache,
-        IConnectionMultiplexer redis,
-        ConnectionRegistry hubConnections,
-        IOptions<RedisCacheOptions> cacheOptions,
-        ILogger<RedisTicketStore> logger)
+    public RedisTicketStore(IConnectionMultiplexer redis, ILogger<RedisTicketStore> logger)
     {
-        _cache = cache;
         _redis = redis;
-        _hubConnections = hubConnections;
-        _cacheKeyPrefix = cacheOptions.Value.InstanceName ?? "";
         _logger = logger;
     }
 
+    // ---- ITicketStore: overloads without a request (no request decision exists) -------------
+
+    /// <inheritdoc />
+    public Task<string> StoreAsync(AuthenticationTicket ticket) =>
+        StoreCoreAsync(ticket, new SessionRequestState(), CancellationToken.None);
+
+    /// <inheritdoc />
+    public Task RenewAsync(string key, AuthenticationTicket ticket) =>
+        RenewCoreAsync(key, ticket, new SessionRequestState { ExplicitRenewal = true }, CancellationToken.None);
+
+    /// <inheritdoc />
+    public Task<AuthenticationTicket?> RetrieveAsync(string key) =>
+        RetrieveCoreAsync(key, CancellationToken.None);
+
+    /// <inheritdoc />
+    public Task RemoveAsync(string key) =>
+        RevokeCoreAsync(key, new SessionRequestState(), CancellationToken.None);
+
+    // ---- ITicketStore: overloads the cookie handler calls ----------------------------------
+
     /// <summary>
-    /// Persist a freshly-issued ticket and return its server-side key
-    /// (which becomes the cookie value). The key is generated server-side
-    /// — the caller has no influence over it. Also registers the key in
-    /// the per-user reverse index so <see cref="RemoveByUserIdAsync"/>
-    /// can revoke every active session for that user later.
+    /// Persist a freshly issued ticket under a new random key and return the key (the cookie
+    /// value). <c>SET NX</c> with the session lifetime: an existing row is never overwritten. The
+    /// key is recorded in <see cref="SessionRequestState.IssuedKey"/>;
+    /// <see cref="SessionRequestState.RenewOutcome"/> is not set.
     /// </summary>
-    public async Task<string> StoreAsync(AuthenticationTicket ticket)
+    public Task<string> StoreAsync(AuthenticationTicket ticket, HttpContext httpContext, CancellationToken cancellationToken)
     {
-        var sid = NewSessionId();
-        var key = KeyPrefix + sid;
-        var bytes = TicketSerializer.Default.Serialize(WithSessionKey(ticket, key));
-
-        await _cache.SetAsync(key, bytes, new DistributedCacheEntryOptions
-        {
-            SlidingExpiration = SessionLifetime,
-        });
-
-        await TryIndexAsync(ticket, key);
-
-        return key;
+        var state = SessionRequestState.Of(httpContext);
+        return StoreCoreAsync(ticket, state, state.Effective(cancellationToken));
     }
 
     /// <summary>
-    /// Re-persist a ticket under the same key (used when claims rotate or
-    /// the cookie middleware refreshes expiry). Resets the sliding TTL on
-    /// both the session row and the reverse-index entry — without the
-    /// latter the index expires on its own clock and a long-lived session
-    /// would silently drop out of <see cref="RemoveByUserIdAsync"/>'s
-    /// reach.
+    /// Renew the row of <paramref name="key"/> as the request decided. Never creates an absent
+    /// key and never changes the owner of a live one; the result is in
+    /// <see cref="SessionRequestState.RenewOutcome"/>. A technical failure is absorbed as
+    /// <see cref="RenewOutcome.TechnicalFailure"/> unless <see cref="SessionRequestState.ExplicitRenewal"/>
+    /// is set, in which case it is thrown.
     /// </summary>
-    public async Task RenewAsync(string key, AuthenticationTicket ticket)
+    public Task RenewAsync(string key, AuthenticationTicket ticket, HttpContext httpContext, CancellationToken cancellationToken)
     {
-        // sk-674.18 (K-16): the cookie handler also renews the CURRENT key
-        // when a sign-in happens on a request that already carries a session
-        // — the password-reset re-issue of the same user, but equally a signup,
-        // an invitation signup or a login made in a tab that is logged in as
-        // somebody else. In that last case the key changes owner: it must
-        // leave the previous owner's reverse index, or revoking the previous
-        // owner (RemoveByUserIdAsync) would delete the new owner's session.
-        await PruneIndexOnOwnerChangeAsync(key, ticket);
-        // The same key renewed for another user: a hub connection of the
-        // previous owner opened with it must not go on receiving the previous
-        // owner's frames in the tab now logged in as somebody else (INV-26).
-        // Here at once on this replica; on the others by the re-check, whose
-        // probe sees the key leave the previous owner's index.
-        if (TryReadUserId(ticket.Principal) is { } newOwner)
+        var state = SessionRequestState.Of(httpContext);
+        return RenewCoreAsync(key, ticket, state, state.Effective(cancellationToken));
+    }
+
+    /// <summary>
+    /// Look up a ticket by its key and slide its lifetime. Null when the key is unknown, expired,
+    /// of a kind this store cannot read (a hash of the former format) or its bytes are unusable.
+    /// </summary>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
+    public Task<AuthenticationTicket?> RetrieveAsync(string key, HttpContext httpContext, CancellationToken cancellationToken)
+    {
+        var state = SessionRequestState.Of(httpContext);
+        return RetrieveCoreAsync(key, state.Effective(cancellationToken));
+    }
+
+    /// <summary>
+    /// Remove the row of <paramref name="key"/>. A key already removed in this request
+    /// (<see cref="SessionRequestState.RemovedKeys"/>) is a no-op that does not call the store.
+    /// </summary>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
+    public Task RemoveAsync(string key, HttpContext httpContext, CancellationToken cancellationToken)
+    {
+        var state = SessionRequestState.Of(httpContext);
+        return RevokeCoreAsync(key, state, state.Effective(cancellationToken));
+    }
+
+    /// <summary>
+    /// Revoke the session of <paramref name="key"/>: <c>DEL</c> that reports whether a row was
+    /// there. "No such key" is a success (<c>false</c>), and the key is recorded in
+    /// <see cref="SessionRequestState.RemovedKeys"/> either way; the owner's index entry is removed
+    /// best-effort.
+    /// </summary>
+    /// <returns>True when a row existed and was deleted.</returns>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
+    public Task<bool> RevokeAsync(string key, HttpContext httpContext, CancellationToken cancellationToken)
+    {
+        var state = SessionRequestState.Of(httpContext);
+        return RevokeCoreAsync(key, state, state.Effective(cancellationToken));
+    }
+
+    // ---- Issue ---------------------------------------------------------------------------------
+
+    private async Task<string> StoreCoreAsync(AuthenticationTicket ticket, SessionRequestState state, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var stored = StripPairMarker(ticket);
+        try
         {
-            _hubConnections.AbortSessionNotOwnedBy(key, newOwner);
+            var db = _redis.GetDatabase();
+            for (var attempt = 1; attempt <= IssueAttempts; attempt++)
+            {
+                var key = KeyPrefix + NewSessionId();
+                var bytes = TicketSerializer.Default.Serialize(SessionPrincipal.WithSessionKey(stored, key));
+                if (await db.StringSetAsync(key, bytes, SessionLifetime, When.NotExists).WaitAsync(ct))
+                {
+                    state.IssuedKey = key;
+                    await TryIndexAsync(ticket, key);
+                    return key;
+                }
+            }
         }
-
-        var bytes = TicketSerializer.Default.Serialize(WithSessionKey(ticket, key));
-        await _cache.SetAsync(key, bytes, new DistributedCacheEntryOptions
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            SlidingExpiration = SessionLifetime,
-        });
-
-        // Refresh the index — same set semantics as StoreAsync, so a
-        // claim-rotation flow (SsoSessionMiddleware re-SignInAsync on
-        // role change) keeps the key reachable from the user UUID.
-        await TryIndexAsync(ticket, key);
+            LogFailure("store", ex);
+        }
+        throw new SessionStoreUnavailableException();
     }
 
-    /// <summary>
-    /// Look up a ticket by its key. Returns null when the key is unknown,
-    /// expired, or the stored bytes are malformed (defensive — a Redis
-    /// rewrite or partial write should result in a 401, not a 500).
-    /// </summary>
-    public async Task<AuthenticationTicket?> RetrieveAsync(string key)
+    // ---- Renewal -------------------------------------------------------------------------------
+
+    private async Task RenewCoreAsync(string key, AuthenticationTicket ticket, SessionRequestState state, CancellationToken ct)
     {
-        var bytes = await _cache.GetAsync(key);
-        if (bytes is null || bytes.Length == 0)
+        ct.ThrowIfCancellationRequested();
+
+        if (state.SuppressMainWrite)
         {
-            return null;
+            state.RenewOutcome = RenewOutcome.Suppressed;
+            return;
         }
 
         try
         {
-            var ticket = TicketSerializer.Default.Deserialize(bytes);
-            // A ticket stored before keys were stamped (an earlier release —
-            // tickets outlive a deploy in Redis) gets its key here, so every
-            // principal read from the store knows its ticket: its hub
-            // connections are tied to it and a password reset can keep it
-            // apart from the user's other sessions (INV-26). Nothing is written.
-            return ticket is not null && SessionPrincipal.SessionKeyOf(ticket.Principal) is null
-                ? WithSessionKey(ticket, key)
-                : ticket;
+            state.RenewOutcome = await TryRenewAsync(key, ticket, ct);
         }
-        catch (Exception ex)
+        catch (RedisServerException ex) when (IsWrongType(ex))
         {
-            _logger.LogWarning(ex, "failed to deserialize session ticket; treating as logged out");
+            // A row of the former format (a hash) is not a session of this store.
+            state.RenewOutcome = RenewOutcome.KeyAbsent;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogFailure("renew", ex);
+            if (state.ExplicitRenewal)
+            {
+                throw new SessionStoreUnavailableException();
+            }
+            state.RenewOutcome = RenewOutcome.TechnicalFailure;
+        }
+    }
+
+    private async Task<RenewOutcome> TryRenewAsync(string key, AuthenticationTicket ticket, CancellationToken ct)
+    {
+        var db = _redis.GetDatabase();
+        var newOwner = TryReadUserId(ticket.Principal);
+
+        for (var attempt = 1; attempt <= CasAttempts; attempt++)
+        {
+            byte[]? current = await db.StringGetAsync(key).WaitAsync(ct);
+            if (current is null)
+            {
+                return RenewOutcome.KeyAbsent;
+            }
+
+            var stored = TryDeserialize(current);
+            if (stored is null)
+            {
+                return RenewOutcome.KeyAbsent;
+            }
+            if (TryReadUserId(stored.Principal) != newOwner)
+            {
+                return RenewOutcome.OwnerMismatch;
+            }
+
+            var merged = SessionPrincipal.WithSessionKey(MergePair(ticket, stored), key);
+            var bytes = TicketSerializer.Default.Serialize(merged);
+            var result = await db.ScriptEvaluateAsync(
+                CompareAndSetScript,
+                [(RedisKey)key],
+                [(RedisValue)current, (RedisValue)bytes, (RedisValue)(long)SessionLifetime.TotalSeconds]).WaitAsync(ct);
+            if ((long)result == 1)
+            {
+                await TryIndexAsync(ticket, key);
+                return RenewOutcome.Written;
+            }
+        }
+
+        return RenewOutcome.CasExhausted;
+    }
+
+    /// <summary>
+    /// The ticket to write on a renewal. With <see cref="SsoPairWriteMarker"/> the pair of
+    /// <paramref name="incoming"/> is an explicit confirmation and replaces the stored one;
+    /// without it the pair is the one already stored (the incoming properties are a clone of an
+    /// older read and must not overwrite a newer confirmation). The marker is never kept.
+    /// </summary>
+    private static AuthenticationTicket MergePair(AuthenticationTicket incoming, AuthenticationTicket stored)
+    {
+        var properties = incoming.Properties.Clone();
+        var confirmed = properties.Items.Remove(SsoPairWriteMarker);
+        if (!confirmed)
+        {
+            properties.Items.Remove(SsoEmailItem);
+            properties.Items.Remove(SsoUserItem);
+            foreach (var item in new[] { SsoEmailItem, SsoUserItem })
+            {
+                if (stored.Properties.Items.TryGetValue(item, out var value))
+                {
+                    properties.Items[item] = value;
+                }
+            }
+        }
+        return new AuthenticationTicket(incoming.Principal, properties, incoming.AuthenticationScheme);
+    }
+
+    private static AuthenticationTicket StripPairMarker(AuthenticationTicket ticket)
+    {
+        if (!ticket.Properties.Items.ContainsKey(SsoPairWriteMarker))
+        {
+            return ticket;
+        }
+        var properties = ticket.Properties.Clone();
+        properties.Items.Remove(SsoPairWriteMarker);
+        return new AuthenticationTicket(ticket.Principal, properties, ticket.AuthenticationScheme);
+    }
+
+    // ---- Read ----------------------------------------------------------------------------------
+
+    private async Task<AuthenticationTicket?> RetrieveCoreAsync(string key, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            var db = _redis.GetDatabase();
+            byte[]? bytes = await db.StringGetAsync(key).WaitAsync(ct);
+            if (bytes is null || bytes.Length == 0)
+            {
+                return null;
+            }
+
+            var ticket = TryDeserialize(bytes);
+            if (ticket is not null)
+            {
+                await db.KeyExpireAsync(key, SessionLifetime).WaitAsync(ct);
+            }
+            return ticket;
+        }
+        catch (RedisServerException ex) when (IsWrongType(ex))
+        {
+            // A row of the former format (a hash): not a session of this store.
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogFailure("retrieve", ex);
+            throw new SessionStoreUnavailableException();
+        }
+    }
+
+    private AuthenticationTicket? TryDeserialize(byte[] bytes)
+    {
+        try
+        {
+            return TicketSerializer.Default.Deserialize(bytes);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning("session ticket cannot be read; treated as no session exceptionType={ExceptionType}", ex.GetType().Name);
             return null;
         }
     }
 
-    /// <summary>
-    /// Hard-revoke the session. Called by the cookie middleware on
-    /// SignOutAsync; afterwards the cookie value points at nothing. Also
-    /// prunes the per-user reverse-index entry so the soon-to-expire
-    /// ticket key is not left dangling in a Set.
-    /// </summary>
-    public async Task RemoveAsync(string key)
+    // ---- Revocation ----------------------------------------------------------------------------
+
+    private async Task<bool> RevokeCoreAsync(string key, SessionRequestState state, CancellationToken ct)
     {
-        // Read the ticket FIRST so we know which user-index to prune. If
-        // the key is already gone we have no way to recover the user id
-        // — accept the orphaned entry, it expires with the Set TTL.
-        Guid? userId = null;
+        if (state.RemovedKeys.Contains(key))
+        {
+            return false;
+        }
+        ct.ThrowIfCancellationRequested();
+
+        bool existed;
+        Guid? owner = null;
         try
         {
-            var ticket = await RetrieveAsync(key);
-            if (ticket?.Principal is { } principal)
+            var result = await _redis.GetDatabase().ScriptEvaluateAsync(GetAndDeleteScript, [(RedisKey)key]).WaitAsync(ct);
+            existed = !result.IsNull;
+            if (existed && result.Resp3Type != ResultType.Integer && (byte[]?)result is { } bytes)
             {
-                userId = TryReadUserId(principal);
+                owner = TryDeserialize(bytes) is { } ticket ? TryReadUserId(ticket.Principal) : null;
             }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogDebug(ex, "RemoveAsync: failed to pre-read ticket for user-index pruning (key suffix len={Suffix})", key.Length);
+            LogFailure("revoke", ex);
+            throw new SessionStoreUnavailableException();
         }
 
-        await _cache.RemoveAsync(key);
-
-        if (userId.HasValue)
+        state.RemovedKeys.Add(key);
+        if (owner is { } userId)
         {
-            try
-            {
-                var db = _redis.GetDatabase();
-                await db.SetRemoveAsync(UserIndexPrefix + userId.Value, key);
-            }
-            catch (Exception ex)
-            {
-                // Pruning is best-effort — the entry will TTL out with the
-                // session lifetime even if we miss it here. Don't fail the
-                // logout / cookie-refresh flow on a Redis hiccup.
-                _logger.LogWarning(ex, "RemoveAsync: failed to prune user-index entry for {UserId}", userId.Value);
-            }
+            await TryUnindexAsync(userId, key);
         }
+        return existed;
     }
 
     /// <summary>
-    /// Hard-revoke EVERY active session belonging to <paramref name="userId"/>.
-    /// Reads the <c>skein:user-tickets:{userId}</c> set, deletes each
-    /// referenced session row, then drops the set itself. Returns the
-    /// number of session keys that were enumerated (which is the upper
-    /// bound on how many tickets were revoked — concurrent expirations
-    /// may have already removed some).
+    /// Hard-revoke EVERY active session of <paramref name="userId"/> and return how many session
+    /// keys were enumerated. Used by <see cref="UserChangedSubscriber"/> when the claims baked into
+    /// a cookie principal change.
     /// </summary>
-    /// <remarks>
-    /// Used by <see cref="SkeinWeb.Auth.UserChangedSubscriber"/> in
-    /// response to <c>skein.user.{uid}.field.role</c> /
-    /// <c>field.deactivated-at</c> / <c>field.name</c> /
-    /// <c>field.username</c> NATS events — any of these change the
-    /// claims baked into the cookie principal, so the existing tickets
-    /// must die. After this call the affected user's next request will
-    /// either (a) fail authentication and bounce to login (local mode)
-    /// or (b) re-provision via <see cref="SkeinWeb.Middleware.SsoSessionMiddleware"/>
-    /// against skein-api and mint a fresh ticket with the new claims
-    /// (keycloak mode — the trust headers are still present).
-    /// </remarks>
     /// <param name="userId">UUID of the user whose sessions to invalidate.</param>
     /// <param name="ct">Cancellation token.</param>
-    /// <returns>The count of ticket keys read from the reverse-index set.</returns>
     public async Task<int> RemoveByUserIdAsync(Guid userId, CancellationToken ct) =>
         (await RemoveUserSessionsAsync(userId, keepKey: null, ct)).Removed;
 
     /// <inheritdoc />
     /// <remarks>
     /// Each Redis step — the index read, every ticket delete — is tried
-    /// <see cref="RemovalAttempts"/> times. The reverse index keeps the kept key
-    /// and every key whose delete failed, so a later revocation still finds them.
+    /// <see cref="RemovalAttempts"/> times. After the walk only the members that were processed
+    /// leave the index (<c>SREM</c>); the kept key, every key whose delete failed and every member
+    /// added meanwhile stay, so a later revocation still finds them.
     /// </remarks>
     public Task<SessionRemovalResult> RemoveSessionsAsync(Guid userId, string? keepKey, CancellationToken ct) =>
         RemoveUserSessionsAsync(userId, keepKey, ct);
-
-    /// <summary>
-    /// Whether the ticket <paramref name="key"/> is still stored (sk-674.18
-    /// INV-26) — false once the session was signed out, revoked or removed, or
-    /// has expired. The hub's access re-check closes connections whose ticket
-    /// is gone.
-    /// </summary>
-    /// <remarks>
-    /// Probes the ticket's Redis key (<c>EXISTS</c>) instead of reading the
-    /// ticket: a read through <see cref="IDistributedCache"/> would refresh the
-    /// sliding lifetime, and a session with an open hub connection would never
-    /// expire. The Redis key is the cache key prefixed with
-    /// <see cref="RedisCacheOptions.InstanceName"/>, as the cache stores it.
-    /// </remarks>
-    /// <exception cref="Exception">The store is unreachable; the caller decides.</exception>
-    public Task<bool> ExistsAsync(string key, CancellationToken ct)
-    {
-        ct.ThrowIfCancellationRequested();
-        return _redis.GetDatabase().KeyExistsAsync(_cacheKeyPrefix + key);
-    }
-
-    /// <inheritdoc />
-    /// <remarks>
-    /// Ownership is read from the reverse index: the key is in
-    /// <c>skein:user-tickets:{userId}</c>. A renewal for another user takes it
-    /// out of the previous owner's set (<see cref="RenewAsync"/>), a revocation
-    /// of the user's sessions drops the set.
-    /// </remarks>
-    public async Task<bool> IsSessionOfAsync(string key, Guid userId, CancellationToken ct)
-    {
-        var db = _redis.GetDatabase();
-        if (!await db.SetContainsAsync(UserIndexPrefix + userId, key))
-        {
-            return false;
-        }
-        return await ExistsAsync(key, ct);
-    }
-
-    /// <summary>Attempts of one Redis step of a removal (index read, one ticket delete) before it counts as failed.</summary>
-    private const int RemovalAttempts = 3;
-
-    /// <summary>Pause before the second attempt; doubled before the third.</summary>
-    private static readonly TimeSpan RemovalRetryDelay = TimeSpan.FromMilliseconds(100);
 
     private async Task<SessionRemovalResult> RemoveUserSessionsAsync(Guid userId, string? keepKey, CancellationToken ct)
     {
@@ -316,22 +425,21 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         {
             try
             {
-                members = await db.SetMembersAsync(indexKey);
+                members = await db.SetMembersAsync(indexKey).WaitAsync(ct);
             }
             catch (Exception ex) when (attempt < RemovalAttempts && ex is not OperationCanceledException)
             {
-                _logger.LogWarning(ex, "session removal: user-index read failed, retrying userId={UserId} attempt={Attempt}",
-                    userId, attempt);
+                LogFailure("index-read-retry", ex);
                 await Task.Delay(RemovalRetryDelay * attempt, ct);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _logger.LogError(ex, "session removal: failed to read user-index userId={UserId}", userId);
+                LogFailure("index-read", ex);
                 return new SessionRemovalResult(0, 0, IndexRead: false);
             }
         }
 
-        var removedKeys = new List<RedisValue>();
+        var processed = new List<RedisValue>();
         var failed = 0;
         foreach (var member in members)
         {
@@ -341,9 +449,9 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             {
                 continue;
             }
-            if (await TryRemoveTicketAsync(key, userId, ct))
+            if (await TryDeleteRowAsync(key, ct))
             {
-                removedKeys.Add(member);
+                processed.Add(member);
             }
             else
             {
@@ -351,46 +459,35 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             }
         }
 
-        // The index keeps exactly the keys still to be dealt with: the kept one
-        // and any whose removal failed, so a later revocation still finds them.
-        // Only a complete removal without a kept key drops the whole set.
-        try
+        if (processed.Count > 0)
         {
-            if (keepKey is null && failed == 0)
+            try
             {
-                await db.KeyDeleteAsync(indexKey);
+                await db.SetRemoveAsync(indexKey, processed.ToArray()).WaitAsync(ct);
             }
-            else
+            catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                foreach (var key in removedKeys)
-                {
-                    await db.SetRemoveAsync(indexKey, key);
-                }
+                LogFailure("index-prune", ex);
             }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "session removal: failed to prune user-index set userId={UserId}", userId);
         }
 
-        return new SessionRemovalResult(removedKeys.Count, failed, IndexRead: true);
+        return new SessionRemovalResult(processed.Count, failed, IndexRead: true);
     }
 
-    private async Task<bool> TryRemoveTicketAsync(string key, Guid userId, CancellationToken ct)
+    private async Task<bool> TryDeleteRowAsync(string key, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                await _cache.RemoveAsync(key, ct);
+                await _redis.GetDatabase().KeyDeleteAsync(key).WaitAsync(ct);
                 return true;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 if (attempt >= RemovalAttempts)
                 {
-                    _logger.LogWarning(ex, "session removal: ticket not removed userId={UserId} attempts={Attempts}",
-                        userId, attempt);
+                    LogFailure("delete", ex);
                     return false;
                 }
                 await Task.Delay(RemovalRetryDelay * attempt, ct);
@@ -398,93 +495,76 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         }
     }
 
-    /// <summary>
-    /// The ticket with <see cref="SessionPrincipal.SessionKeyClaim"/> set to
-    /// <paramref name="key"/> (exactly one such claim), so the principal read
-    /// back from the store knows its own ticket key.
-    /// </summary>
-    private static AuthenticationTicket WithSessionKey(AuthenticationTicket ticket, string key)
-    {
-        var identities = ticket.Principal.Identities.Select(i => i.Clone()).ToList();
-        if (identities.Count == 0)
-        {
-            return ticket;
-        }
-        foreach (var identity in identities)
-        {
-            foreach (var stale in identity.FindAll(SessionPrincipal.SessionKeyClaim).ToArray())
-            {
-                identity.RemoveClaim(stale);
-            }
-        }
-        identities[0].AddClaim(new Claim(SessionPrincipal.SessionKeyClaim, key));
-        return new AuthenticationTicket(new ClaimsPrincipal(identities), ticket.Properties, ticket.AuthenticationScheme);
-    }
+    // ---- Probes ---------------------------------------------------------------------------------
 
     /// <summary>
-    /// SADD the session key into the per-user reverse-index Set and refresh
-    /// its TTL to match <see cref="SessionLifetime"/>. Defensive: any
-    /// failure here is logged at debug and swallowed — losing an index
-    /// entry only weakens event-driven invalidation (the TTL refresh
-    /// fallback in SsoSessionMiddleware still catches stale claims
-    /// within 5 minutes).
+    /// Whether the row <paramref name="key"/> is still stored — false once the session was signed
+    /// out, revoked or removed, or has expired. Uses <c>EXISTS</c>, not a read, so it does not
+    /// slide the lifetime: a session with an open hub connection must still expire.
+    /// </summary>
+    /// <exception cref="Exception">The store is unreachable; the caller decides.</exception>
+    public Task<bool> ExistsAsync(string key, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        return _redis.GetDatabase().KeyExistsAsync(key);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Ownership is read from the reverse index: the key is in <c>skein:user-tickets:{userId}</c>.
+    /// A revocation of the user's sessions drops the member.
+    /// </remarks>
+    public async Task<bool> IsSessionOfAsync(string key, Guid userId, CancellationToken ct)
+    {
+        var db = _redis.GetDatabase();
+        if (!await db.SetContainsAsync(UserIndexPrefix + userId, key))
+        {
+            return false;
+        }
+        return await ExistsAsync(key, ct);
+    }
+
+    // ---- Index ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// SADD the key into the user's reverse-index Set and set its TTL to the session lifetime.
+    /// Best-effort: a failure only weakens event-driven invalidation (the SSO refresh fallback
+    /// still catches stale claims), so it is logged and swallowed.
     /// </summary>
     private async Task TryIndexAsync(AuthenticationTicket ticket, string key)
     {
-        var userId = TryReadUserId(ticket.Principal);
-        if (!userId.HasValue)
+        if (TryReadUserId(ticket.Principal) is not { } userId)
         {
-            // Anonymous / pre-auth ticket — nothing to index against.
             return;
         }
 
         try
         {
             var db = _redis.GetDatabase();
-            var indexKey = UserIndexPrefix + userId.Value;
+            var indexKey = UserIndexPrefix + userId;
             await db.SetAddAsync(indexKey, key);
-            // Refresh TTL on the set so it does not outlive the session
-            // it points to. Sliding TTL on the session itself extends on
-            // every RenewAsync, which calls back here — that path keeps
-            // the index live as long as the user is active.
             await db.KeyExpireAsync(indexKey, SessionLifetime);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogDebug(ex, "TryIndexAsync: failed to add session to user-index for {UserId}", userId.Value);
+            LogFailure("index-add", ex);
         }
     }
 
-    /// <summary>
-    /// Before <see cref="RenewAsync"/> overwrites <paramref name="key"/>: when
-    /// the ticket stored there belongs to another user than
-    /// <paramref name="ticket"/>, drop the key from that user's reverse index.
-    /// Best-effort like the rest of the index upkeep — a failure is logged and
-    /// the renewal proceeds.
-    /// </summary>
-    private async Task PruneIndexOnOwnerChangeAsync(string key, AuthenticationTicket ticket)
+    private async Task TryUnindexAsync(Guid userId, string key)
     {
         try
         {
-            var previous = await RetrieveAsync(key);
-            var previousUserId = previous?.Principal is { } principal ? TryReadUserId(principal) : null;
-            if (previousUserId.HasValue && previousUserId != TryReadUserId(ticket.Principal))
-            {
-                var db = _redis.GetDatabase();
-                await db.SetRemoveAsync(UserIndexPrefix + previousUserId.Value, key);
-            }
+            await _redis.GetDatabase().SetRemoveAsync(UserIndexPrefix + userId, key);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogWarning(ex, "RenewAsync: failed to prune the previous owner's user-index entry");
+            LogFailure("index-prune", ex);
         }
     }
 
-    /// <summary>
-    /// Read <see cref="ClaimTypes.NameIdentifier"/> off the principal and
-    /// parse it as a UUID. Returns null on any shape mismatch so callers
-    /// can no-op without an exception.
-    /// </summary>
+    // ---- Helpers --------------------------------------------------------------------------------
+
     private static Guid? TryReadUserId(ClaimsPrincipal principal)
     {
         var raw = principal.FindFirstValue(ClaimTypes.NameIdentifier);
@@ -495,6 +575,37 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         return Guid.TryParse(raw, out var uid) ? uid : null;
     }
 
+    private static bool IsWrongType(RedisServerException ex) =>
+        ex.Message.StartsWith("WRONGTYPE", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Log a failed operation by operation name, exception type and code only. The exception
+    /// itself is never passed on: its text can contain the session key.
+    /// </summary>
+    private void LogFailure(string operation, Exception ex) =>
+        _logger.LogWarning(
+            "session store operation failed operation={Operation} exceptionType={ExceptionType} code={Code}",
+            operation, ex.GetType().Name, CodeOf(ex));
+
+    private static string CodeOf(Exception ex) => ex switch
+    {
+        RedisServerException server => ServerErrorCode(server.Message),
+        RedisConnectionException connection => connection.FailureType.ToString(),
+        RedisTimeoutException => "TIMEOUT",
+        _ => "-",
+    };
+
+    // The code of a Redis error reply is its first word in capitals (WRONGTYPE, LOADING, NOSCRIPT…).
+    private static string ServerErrorCode(string message)
+    {
+        var end = 0;
+        while (end < message.Length && message[end] is >= 'A' and <= 'Z')
+        {
+            end++;
+        }
+        return end == 0 ? "-" : message[..end];
+    }
+
     /// <summary>
     /// Generate a 32-byte (256-bit) cryptographically random session id and
     /// encode it base64url (no padding) for cookie-safe transport.
@@ -503,12 +614,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     {
         Span<byte> raw = stackalloc byte[32];
         RandomNumberGenerator.Fill(raw);
-        return Base64UrlEncode(raw);
-    }
-
-    private static string Base64UrlEncode(ReadOnlySpan<byte> bytes)
-    {
-        var b64 = Convert.ToBase64String(bytes);
+        var b64 = Convert.ToBase64String(raw);
         // RFC 4648 §5 (base64url): + → -, / → _, drop trailing =
         return b64.TrimEnd('=').Replace('+', '-').Replace('/', '_');
     }

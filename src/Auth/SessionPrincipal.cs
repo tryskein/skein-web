@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 
 namespace SkeinWeb.Auth;
@@ -38,6 +39,28 @@ public static class SessionPrincipal
     {
         var key = principal?.FindFirstValue(SessionKeyClaim);
         return string.IsNullOrEmpty(key) ? null : key;
+    }
+
+    /// <summary>
+    /// The ticket with <see cref="SessionKeyClaim"/> set to <paramref name="key"/> (exactly one
+    /// such claim), so the principal read back from the store knows its own ticket key.
+    /// </summary>
+    public static AuthenticationTicket WithSessionKey(AuthenticationTicket ticket, string key)
+    {
+        var identities = ticket.Principal.Identities.Select(i => i.Clone()).ToList();
+        if (identities.Count == 0)
+        {
+            return ticket;
+        }
+        foreach (var identity in identities)
+        {
+            foreach (var stale in identity.FindAll(SessionKeyClaim).ToArray())
+            {
+                identity.RemoveClaim(stale);
+            }
+        }
+        identities[0].AddClaim(new Claim(SessionKeyClaim, key));
+        return new AuthenticationTicket(new ClaimsPrincipal(identities), ticket.Properties, ticket.AuthenticationScheme);
     }
 
     /// <summary>

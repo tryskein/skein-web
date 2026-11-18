@@ -534,7 +534,7 @@ public sealed class AccountController : ControllerBase
     /// closed at once — skein-api already refuses them (new epoch), and a
     /// connection of a removed ticket is closed on every other replica by the
     /// access re-check. Every session read from the store knows its ticket key
-    /// (<see cref="RedisTicketStore.RetrieveAsync"/> adds it to tickets of an
+    /// (<see cref="RedisTicketStore.RetrieveAsync(string)"/> adds it to tickets of an
     /// earlier release); should a re-issued session still lack one, it cannot be
     /// told apart from the others and every session of the user ends, the
     /// current one included — the user logs in again with the new password.

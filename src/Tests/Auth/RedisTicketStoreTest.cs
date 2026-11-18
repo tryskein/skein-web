@@ -3,7 +3,6 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.Caching.StackExchangeRedis;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -81,10 +80,7 @@ public class RedisTicketStoreTest
     {
         var rows = cache ?? new MemoryDistributedCache(Options.Create(new MemoryDistributedCacheOptions()));
         return new RedisTicketStore(
-            rows,
             FakeRedisSets(rows, failSetReads, instanceName),
-            hubConnections ?? new ConnectionRegistry(TimeProvider.System),
-            Options.Create(new RedisCacheOptions { InstanceName = instanceName == "" ? null : instanceName }),
             NullLogger<RedisTicketStore>.Instance);
     }
 

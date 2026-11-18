@@ -265,19 +265,6 @@ public sealed class ConnectionRegistry
     }
 
     /// <summary>
-    /// Closes every connection of this replica opened with the session ticket
-    /// <paramref name="sessionKey"/> by a user other than <paramref name="owner"/>
-    /// — the ticket key now belongs to <paramref name="owner"/> (a login or
-    /// signup in a tab logged in as somebody else). Returns how many were closed.
-    /// </summary>
-    public int AbortSessionNotOwnedBy(string sessionKey, Guid owner)
-    {
-        ArgumentException.ThrowIfNullOrEmpty(sessionKey);
-        return AbortWhere(_byConnection.Values,
-            s => s.UserId != owner && string.Equals(s.SessionKey, sessionKey, StringComparison.Ordinal));
-    }
-
-    /// <summary>
     /// Closes every connection of <paramref name="userId"/> on this replica
     /// except those opened with the session ticket <paramref name="keepSessionKey"/>
     /// (null — closes all of them). Returns how many were closed.
