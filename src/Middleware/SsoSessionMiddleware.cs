@@ -55,7 +55,7 @@ namespace SkeinWeb.Middleware;
 ///         from skein-api via <c>OidcProvisionAsync</c>.</item>
 ///   <item>Diff against the current cookie claims (role / username /
 ///         name / email). If anything changed → <c>SignInAsync</c> with
-///         the fresh tuple, which rotates the Valkey ticket and rolls
+///         the fresh tuple, which renews the Valkey ticket under the same key and rolls
 ///         the cookie. If nothing changed → still <c>SignInAsync</c>
 ///         with the same claims to refresh the timestamp (cheaper than
 ///         a custom claims-only update, and keeps the renewal logic in
@@ -352,7 +352,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
         if (changed)
         {
             _logger.LogInformation(
-                "sso: TTL refresh detected claim drift for {UserId}; cookie rotated",
+                "sso: TTL refresh detected claim drift for {UserId}; ticket renewed",
                 fresh.Id);
         }
         else

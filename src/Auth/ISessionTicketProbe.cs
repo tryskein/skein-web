@@ -5,9 +5,9 @@ namespace SkeinWeb.Auth;
 /// user (sk-674.18 INV-26). Implemented by <see cref="RedisTicketStore"/>;
 /// consumed by the hub's access re-check, which closes connections whose
 /// session ticket is gone — signed out, revoked by skein-api
-/// (<c>session_revoked</c>), removed by a password reset or a deactivation,
-/// expired — or now belongs to ANOTHER user (a login or signup in a tab that
-/// was logged in renews the same ticket key for the new user).
+/// (<c>session_revoked</c>), removed by a password reset, a new sign-in on the
+/// same browser (the previous key is revoked) or a deactivation, expired — or
+/// is not in the user's reverse index any more.
 /// </summary>
 public interface ISessionTicketProbe
 {

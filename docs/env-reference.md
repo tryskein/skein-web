@@ -115,6 +115,8 @@ spellings are shown below; the environment form is the one used in deployments.
   about that option.
 - **Careful:** Redis holds sessions *and* cookie-encryption keys. A Redis without
   persistence logs everyone out when it restarts.
+- **Topology:** one Redis (a single primary) is supported; Redis Cluster is not (the
+  session-format cleanup and the session scripts address several keys at once).
 - **Session format marker:** at startup, before the first request, skein-web
   deletes once per deployment the session rows of the former format (Redis
   hashes under `skein:session:*`), so every session issued before the update

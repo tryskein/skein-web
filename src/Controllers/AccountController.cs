@@ -551,9 +551,9 @@ public sealed class AccountController : ControllerBase
     /// tickets are removed, and this replica's hub connections of them are
     /// closed at once — skein-api already refuses them (new epoch), and a
     /// connection of a removed ticket is closed on every other replica by the
-    /// access re-check. Every session read from the store knows its ticket key
-    /// (<see cref="RedisTicketStore.RetrieveAsync(string)"/> adds it to tickets of an
-    /// earlier release); should a re-issued session still lack one, it cannot be
+    /// access re-check. Every session stored by this version carries its ticket key
+    /// (<see cref="SessionPrincipal.WithSessionKey"/> stamps it on issue and renewal); should a
+    /// re-issued session still lack one, it cannot be
     /// told apart from the others and every session of the user ends, the
     /// current one included — the user logs in again with the new password.
     /// <para>A removal that does not complete — the user's index unreadable or a
