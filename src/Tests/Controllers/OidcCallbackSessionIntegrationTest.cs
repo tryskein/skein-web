@@ -129,6 +129,12 @@ public sealed class OidcCallbackSessionIntegrationTest
             response.Headers.Location?.OriginalString);
     }
 
+    private static void AssertChallengeCookiesDeleted(SessionPipelineHost.Reply reply)
+    {
+        Assert.Contains(reply.Cookies, c => c.IsDeletion && c.Name.StartsWith(".AspNetCore.Correlation.", StringComparison.Ordinal));
+        Assert.Contains(reply.Cookies, c => c.IsDeletion && c.Name.StartsWith(".AspNetCore.OpenIdConnect.Nonce.", StringComparison.Ordinal));
+    }
+
     [RedisTheory]
     [InlineData("another-users-live", "/after")]
     [InlineData("own-live", "/after")]
@@ -149,7 +155,7 @@ public sealed class OidcCallbackSessionIntegrationTest
         Assert.Equal(HttpStatusCode.Redirect, reply.Status);
         Assert.Equal(returnUri.Length == 0 ? "/" : returnUri, location);
         var set = Assert.Single(reply.Sessions(host.CookieName)); // the correlation and nonce deletions are not session cookies
-        Assert.Contains(reply.Cookies, c => c.IsDeletion && c.Name.StartsWith(".AspNetCore.Correlation.", StringComparison.Ordinal));
+        AssertChallengeCookiesDeleted(reply);
         Assert.DoesNotContain("expires=", set.Raw, StringComparison.OrdinalIgnoreCase); // a browser-session cookie, as the challenge made it
         var fresh = host.KeyOf(set);
         Assert.NotEqual(old, fresh);
@@ -196,6 +202,7 @@ public sealed class OidcCallbackSessionIntegrationTest
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Equal("OIDC sign-in failed. Contact your administrator.", reply.Body);
         Assert.Empty(reply.Sessions(host.CookieName));
+        AssertChallengeCookiesDeleted(reply); // the one-time cookies of the challenge go even when the issue fails
         Assert.Equal(failing == "write", !await host.Db.KeyExistsAsync(old)); // delete failed → alive; write failed after delete → dead
     }
 

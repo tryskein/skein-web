@@ -213,6 +213,7 @@ public sealed class SessionSurfacesTest
         var set = Assert.Single(reply.Sessions(host.CookieName));
         var fresh = host.KeyOf(set);
         Assert.NotEqual(old, fresh);
+        Assert.Equal(1, host.Api.Calls.Count(c => c.EndsWith("/signup", StringComparison.Ordinal))); // created exactly once
         if (old != "-")
         {
             Assert.False(await host.Db.KeyExistsAsync(old));
@@ -287,6 +288,7 @@ public sealed class SessionSurfacesTest
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Empty(reply.Cookies);
         Assert.EndsWith("/account-created-session-not-issued", Json(reply).GetProperty("type").GetString());
+        Assert.Equal(1, host.Api.Calls.Count(c => c.EndsWith("/signup", StringComparison.Ordinal))); // the account is created once, not retried
     }
 
     [RedisTheory]
