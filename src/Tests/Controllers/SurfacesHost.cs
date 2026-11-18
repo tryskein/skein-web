@@ -272,11 +272,6 @@ internal sealed class SurfacesHost : IAsyncDisposable
                 new AuthenticationProperties { RedirectUri = OidcReturnPath.Resolve(rd, http.Request.Scheme, http.Request.Host.Value ?? string.Empty) },
                 new[] { Microsoft.AspNetCore.Authentication.OpenIdConnect.OpenIdConnectDefaults.AuthenticationScheme }))
                 .AllowAnonymous();
-            app.MapGet("/test/oidc-signout", async (HttpContext ctx) =>
-            {
-                await ctx.SignOutAsync(Microsoft.AspNetCore.Authentication.OpenIdConnect.OpenIdConnectDefaults.AuthenticationScheme);
-                return Results.Ok();
-            });
         }
         app.MapControllers();
         app.UseMiddleware<ApiProxyMiddleware>();

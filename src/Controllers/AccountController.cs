@@ -1,9 +1,7 @@
 using System.ComponentModel.DataAnnotations;
 using System.Net;
-using System.Security.Claims;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
-using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
@@ -148,11 +146,11 @@ public sealed class AccountController : ControllerBase
                 }
                 if (SessionEpochOf(ok) is not { } epoch)
                 {
-                    return SessionNotIssued("signup", "200 without sessionEpoch");
+                    return SessionNotIssued("signup", "200 without sessionEpoch", user!.Id);
                 }
                 if (!await IssueNewSessionAsync(user!, epoch, nameof(Surface.Signup)))
                 {
-                    return SessionNotIssued("signup", "the session could not be issued");
+                    return SessionNotIssued("signup", "the session could not be issued", user!.Id);
                 }
                 _logger.LogInformation("signup success for {UserId}", user!.Id);
                 return Ok(user);
@@ -339,11 +337,11 @@ public sealed class AccountController : ControllerBase
                 var user = Deserialize<UserDto>(ok.Body);
                 if (!revoked)
                 {
-                    return PasswordChangedNotIssued("the previous sessions could not all be revoked");
+                    return PasswordChangedNotIssued("the previous sessions could not all be revoked", userId);
                 }
                 if (!IsIssuable(user) || SessionEpochOf(ok) is not { } epoch)
                 {
-                    return PasswordChangedNotIssued("200 without usable data for a session");
+                    return PasswordChangedNotIssued("200 without usable data for a session", userId);
                 }
                 try
                 {
@@ -355,7 +353,7 @@ public sealed class AccountController : ControllerBase
                 }
                 catch (SessionIssueException)
                 {
-                    return PasswordChangedNotIssued("the new session could not be issued");
+                    return PasswordChangedNotIssued("the new session could not be issued", userId);
                 }
                 return NoContent();
             },
@@ -525,11 +523,11 @@ public sealed class AccountController : ControllerBase
                 }
                 if (SessionEpochOf(ok) is not { } epoch)
                 {
-                    return SessionNotIssued("invitation-signup", "200 without sessionEpoch");
+                    return SessionNotIssued("invitation-signup", "200 without sessionEpoch", invited.Id);
                 }
                 if (!await IssueNewSessionAsync(invited, epoch, nameof(Surface.InvitationSignup)))
                 {
-                    return SessionNotIssued("invitation-signup", "the session could not be issued");
+                    return SessionNotIssued("invitation-signup", "the session could not be issued", invited.Id);
                 }
                 _logger.LogInformation("invitation signup success for {UserId}", body.Id);
                 return Ok(body);
@@ -618,10 +616,10 @@ public sealed class AccountController : ControllerBase
     /// The password change is confirmed but no session is issued: a named outcome, distinct from "no
     /// confirmation of the change". The password and the spent token stay as they are.
     /// </summary>
-    private ObjectResult PasswordChangedNotIssued(string what)
+    private ObjectResult PasswordChangedNotIssued(string what, Guid? userId = null)
     {
         _issuer.MarkSessionWriteSuppressed(HttpContext);
-        _logger.LogError("password-reset-complete: the password was changed but no session was issued ({What})", what);
+        _logger.LogError("password-reset-complete: the password was changed but no session was issued ({What}) for {UserId}", what, userId?.ToString() ?? "unknown");
         return Problem(
             statusCode: StatusCodes.Status502BadGateway,
             title: "Password changed, session not issued",
@@ -659,11 +657,11 @@ public sealed class AccountController : ControllerBase
     /// The account exists but no session can be issued: a named outcome, neither a success nor the
     /// generic upstream failure. The new credentials work for a normal sign-in.
     /// </summary>
-    private ObjectResult SessionNotIssued(string action, string what)
+    private ObjectResult SessionNotIssued(string action, string what, string? userId = null)
     {
         // The request's own session must not be renewed late next to this refusal.
         _issuer.MarkSessionWriteSuppressed(HttpContext);
-        _logger.LogError("{Action}: the account was created but no session was issued ({What})", action, what);
+        _logger.LogError("{Action}: the account was created but no session was issued ({What}) for {UserId}", action, what, userId ?? "unknown");
         return Problem(
             statusCode: StatusCodes.Status502BadGateway,
             title: "Account created, session not issued",

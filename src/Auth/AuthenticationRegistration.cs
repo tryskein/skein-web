@@ -305,7 +305,7 @@ public static class AuthenticationRegistration
                         {
                             ctx.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>()
                                 .CreateLogger("Oidc")
-                                .LogError("oidc: the session could not be issued; no cookie written");
+                                .LogError("oidc: the session could not be issued; no cookie written for {UserId}", ctx.Principal?.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? "unknown");
                             ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
                             ctx.Response.ContentType = "text/plain";
                             await ctx.Response.WriteAsync(
