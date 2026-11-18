@@ -137,7 +137,9 @@ public sealed class PasswordResetSessionTest
         // The key cannot be deleted by either of the two ways the sequence has: the revocation of the incoming
         // key and the removal by the user's index.
         host.Faults.Before = (name, args) =>
-            name == nameof(IDatabase.ScriptEvaluateAsync)
+            // Only the revoking script (the one that DELs) fails; the compare-and-set of the sliding renewal
+            // keeps working, so a lost suppression of the late write would rewrite the row and show here.
+            (name == nameof(IDatabase.ScriptEvaluateAsync) && args[0] is string script && script.Contains("DEL", StringComparison.Ordinal))
             || (name == nameof(IDatabase.KeyDeleteAsync) && ((RedisKey)args[0]!).ToString() == key)
                 ? new InvalidOperationException("injected") : null;
 
