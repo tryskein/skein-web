@@ -236,7 +236,8 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
     // sk-998 row 15 (INV-2, SC-004, edge "browser forges the marker"): the
     // /api/v1 proxy — the real AddProxyHttpClient with InternalApiHandler —
     // forwards a browser request that sent the marker without it.
-    [Theory]
+    [Trait("Category", "Integration")]
+    [RedisTheory]
     [InlineData("X-Skein-Service-Call")]
     [InlineData("x-skein-service-call")]
     public async Task ProxiedRequest_WithAForgedMarker_ReachesApiWithoutIt(string headerName)
