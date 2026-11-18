@@ -164,35 +164,103 @@ public sealed class SessionStoreMigrationTest : IDisposable
         Assert.True(await Db.KeyExistsAsync(legacy));
     }
 
-    [RedisFact]
-    public async Task AnOwnerThatLostItsLock_DeletesNothing_ReleasesNothingOfTheNewOwner_AndTheNextStartFinishes()
+    private static bool IsScript(string name, object?[] args, string fragment) =>
+        name == nameof(IDatabase.ScriptEvaluateAsync) && args[0] is string text && text.Contains(fragment, StringComparison.Ordinal);
+
+    // The lock is taken over right before one chosen script of the cleanup runs.
+    private async Task<(DbProxy Proxy, IDatabase Db)> StealBeforeAsync(string scriptFragment)
     {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
         var db = DbProxy.Create(Db, out var proxy);
-        proxy.Before = (name, _) =>
+        proxy.Before = (name, args) =>
         {
-            if (name == nameof(IDatabase.ScriptEvaluateAsync) && proxy.Before is not null)
+            if (IsScript(name, args, scriptFragment))
             {
-                // The first script of the cleanup is the lock extension: the lock is taken over first.
                 proxy.Before = null;
                 Db.StringSet(SessionStoreMigration.LockKey, "thief", TimeSpan.FromMinutes(1));
             }
             return null;
         };
+        await Task.CompletedTask;
+        return (proxy, db);
+    }
+
+    [RedisFact]
+    public async Task LockLostBeforeTheExtension_StopsTheCleanup_AndTheNextStartFinishesIt()
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var (_, db) = await StealBeforeAsync("PEXPIRE");
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
 
         Assert.True(await Db.KeyExistsAsync(legacy));
         Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey));
+        Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey)); // not released by the loser
 
         await Db.KeyDeleteAsync(SessionStoreMigration.LockKey);
         await Migration().RunAsync(Wait, CancellationToken.None);
 
         Assert.False(await Db.KeyExistsAsync(legacy));
         Assert.Equal(SessionStoreMigration.MarkerValue, await Db.StringGetAsync(SessionStoreMigration.MarkerKey));
+    }
+
+    [RedisFact]
+    public async Task LockLostAfterTheExtension_TheDeleteScriptItselfChecksTheToken_AndDeletesNothing()
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var (_, db) = await StealBeforeAsync("TYPE"); // the delete batch: the extension before it already succeeded
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
+
+        Assert.True(await Db.KeyExistsAsync(legacy));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
+    }
+
+    [RedisFact]
+    public async Task LockLostBeforeTheMarkerScript_WritesNoMarker()
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var (_, db) = await StealBeforeAsync("KEYS[2]");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
+
+        Assert.False(await Db.KeyExistsAsync(legacy)); // the deletion was legitimate: the lock was ours then
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
+        Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey));
+    }
+
+    [RedisFact]
+    public async Task TheLockIsExtendedByTheScan()
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var db = DbProxy.Create(Db, out var proxy);
+        TimeSpan? afterExtension = null;
+        proxy.Before = (name, args) =>
+        {
+            if (IsScript(name, args, "PEXPIRE"))
+            {
+                Db.KeyExpire(SessionStoreMigration.LockKey, TimeSpan.FromSeconds(2)); // as if the scan had run long
+            }
+            return null;
+        };
+        proxy.After = (name, args) =>
+        {
+            if (IsScript(name, args, "PEXPIRE"))
+            {
+                afterExtension = Db.KeyTimeToLive(SessionStoreMigration.LockKey);
+            }
+            return Task.CompletedTask;
+        };
+
+        await Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None);
+
+        Assert.True(afterExtension > TimeSpan.FromSeconds(20), "the extension did not renew the lock");
     }
 
     [RedisFact]
