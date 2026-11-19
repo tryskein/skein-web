@@ -306,13 +306,17 @@ public sealed class SsoSessionMiddleware : IMiddleware
     private async Task<bool> RenewSameKeyAsync(
         HttpContext context, AuthenticationProperties? current, Confirmed confirmed, string email, string username)
     {
-        var timeouts = _services.GetRequiredService<SessionTimeouts>();
-        var now = _services.GetRequiredService<TimeProvider>().GetUtcNow();
-        if (current is null
-            || !SessionWindow.TryRead(current, out var window)
-            || !window.TryGetRowLifetime(timeouts, now, out _))
+        if (current is null || !SessionWindow.TryRead(current, out var window))
         {
-            _logger.LogInformation("sso: the session has ended before its renewal; a new session is issued");
+            // Not expected: the store does not authenticate a row without a valid window.
+            _logger.LogWarning("sso: the session read for the renewal has no valid window; a new session is issued");
+            return await RotateToAsync(context, confirmed, email, username);
+        }
+
+        var timeouts = _services.GetRequiredService<SessionTimeouts>();
+        if (!window.TryGetRowLifetime(timeouts, _services.GetRequiredService<TimeProvider>().GetUtcNow(), out _))
+        {
+            // The session has ended by now: a regular end, not logged.
             return await RotateToAsync(context, confirmed, email, username);
         }
 

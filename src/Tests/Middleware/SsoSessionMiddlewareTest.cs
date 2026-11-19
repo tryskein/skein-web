@@ -4,6 +4,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Time.Testing;
@@ -405,12 +406,12 @@ public class SsoSessionMiddlewareTest
     /// success: Main's renewal is written, an issue through the Issue scheme gets a key.
     /// <c>AuthenticateAsync</c> returns the session Main read for the request.
     /// </summary>
-    private sealed class RecordingAuthentication(AuthenticationTicket current) : IAuthenticationService
+    private sealed class RecordingAuthentication(AuthenticationTicket? current) : IAuthenticationService
     {
         public List<(string? Scheme, AuthenticationProperties? Properties)> SignIns { get; } = [];
 
         public Task<AuthenticateResult> AuthenticateAsync(HttpContext context, string? scheme) =>
-            Task.FromResult(AuthenticateResult.Success(current));
+            Task.FromResult(current is null ? AuthenticateResult.NoResult() : AuthenticateResult.Success(current));
 
         public Task SignInAsync(HttpContext context, string? scheme, ClaimsPrincipal principal, AuthenticationProperties? properties)
         {
@@ -434,6 +435,19 @@ public class SsoSessionMiddlewareTest
         public Task SignOutAsync(HttpContext context, string? scheme, AuthenticationProperties? properties) => Task.CompletedTask;
     }
 
+    /// <summary>The entries the middleware logs: level and formatted message.</summary>
+    private sealed class RecordingLogger : ILogger<SsoSessionMiddleware>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Entries.Add((logLevel, formatter(state, exception)));
+    }
+
     /// <summary>skein-api confirming the headers as the session's user, in <paramref name="epoch"/>.</summary>
     private sealed class ConfirmingApi(long epoch) : HttpMessageHandler
     {
@@ -448,10 +462,12 @@ public class SsoSessionMiddlewareTest
     /// A request of the session of <see cref="RenewedUser"/> in epoch 3, with no remembered pair (so the
     /// headers are confirmed), whose ticket carries <paramref name="issued"/> and <paramref name="expires"/>,
     /// on a replica whose clock reads <paramref name="now"/> and whose absolute limit is
-    /// <paramref name="absoluteHours"/>; skein-api answers with <paramref name="confirmedEpoch"/>.
+    /// <paramref name="absoluteHours"/>; skein-api answers with <paramref name="confirmedEpoch"/>. With
+    /// <paramref name="unread"/> Main's read of the request yields no result, so there are no properties.
     /// </summary>
-    private static (SsoSessionMiddleware Middleware, HttpContext Context, RecordingAuthentication Auth) RenewalRequest(
-        int absoluteHours, DateTimeOffset now, DateTimeOffset? issued, DateTimeOffset? expires, long confirmedEpoch = 3)
+    private static (SsoSessionMiddleware Middleware, HttpContext Context, RecordingAuthentication Auth, RecordingLogger Logs) RenewalRequest(
+        int absoluteHours, DateTimeOffset now, DateTimeOffset? issued, DateTimeOffset? expires, long confirmedEpoch = 3,
+        bool unread = false)
     {
         var principal = new ClaimsPrincipal(new ClaimsIdentity(
             [
@@ -463,7 +479,7 @@ public class SsoSessionMiddlewareTest
             authenticationType: "Cookies"));
         var current = new AuthenticationTicket(
             principal, new AuthenticationProperties { IssuedUtc = issued, ExpiresUtc = expires, IsPersistent = true }, SessionSchemes.Main);
-        var auth = new RecordingAuthentication(current);
+        var auth = new RecordingAuthentication(unread ? null : current);
 
         var services = new ServiceCollection();
         services.AddSingleton<IAuthenticationService>(auth);
@@ -488,8 +504,9 @@ public class SsoSessionMiddlewareTest
         ctx.Request.Headers["X-Auth-Request-User"] = "pa";
         ctx.Response.Body = new MemoryStream();
         ctx.User = principal;
-        var middleware = new SsoSessionMiddleware(KeycloakMode, TrustedProxies, provider, NullLogger<SsoSessionMiddleware>.Instance);
-        return (middleware, ctx, auth);
+        var logs = new RecordingLogger();
+        var middleware = new SsoSessionMiddleware(KeycloakMode, TrustedProxies, provider, logs);
+        return (middleware, ctx, auth, logs);
     }
 
     private const long Hour = TimeSpan.TicksPerHour;
@@ -509,7 +526,7 @@ public class SsoSessionMiddlewareTest
     public async Task AnExplicitRenewal_SignsInWithTheSignInTime_AndTheEndOfTheSessionAsOfTheRenewal(
         string _, int absoluteHours, long sinceSignIn, int expectedEndHours)
     {
-        var (middleware, ctx, auth) = RenewalRequest(
+        var (middleware, ctx, auth, _) = RenewalRequest(
             absoluteHours, SignIn.AddTicks(sinceSignIn), SignIn, SignIn.AddHours(720));
 
         var nextCalled = false;
@@ -523,24 +540,28 @@ public class SsoSessionMiddlewareTest
         Assert.True(nextCalled);
     }
 
-    public static TheoryData<string, int, long?, long?, long> EndedRenewals() => new()
+    public static TheoryData<string, int, long?, long?, long, bool> EndedRenewals() => new()
     {
-        // case, absolute limit (h), ticket issued / expires after the sign-in (h; null = absent), time since the sign-in (ticks)
-        { "the end of the written window", 720, 0, 720, 720 * Hour },
-        { "past the end of a lowered limit", 11, 0, 720, 12 * Hour },
-        { "at the end of a lowered limit", 11, 0, 720, 11 * Hour },
-        { "half a millisecond before the end", 11, 0, 720, 11 * Hour - Millisecond / 2 },
-        { "an expiry equal to the issue time", 720, 0, 0, Hour },
-        { "no expiry", 720, 0, null, Hour },
-        { "no issue time", 720, null, 720, Hour },
+        // case, absolute limit (h), ticket issued / expires after the sign-in (h; null = absent),
+        // time since the sign-in (ticks), whether the window is invalid (or there are no properties at all)
+        { "the end of the written window", 720, 0, 720, 720 * Hour, false },
+        { "past the end of a lowered limit", 11, 0, 720, 12 * Hour, false },
+        { "at the end of a lowered limit", 11, 0, 720, 11 * Hour, false },
+        { "half a millisecond before the end", 11, 0, 720, 11 * Hour - Millisecond / 2, false },
+        { "an expiry equal to the issue time", 720, 0, 0, Hour, true },
+        { "no expiry", 720, 0, null, Hour, true },
+        { "no issue time", 720, null, 720, Hour, true },
     };
 
+    // E-8: a session that has ended by the renewal is a regular end — a new session, with no entry of its own.
+    // A window that is not valid is not expected (the store authenticates no such row): one Warning, which
+    // names neither the key nor a claim of the session.
     [Theory]
     [MemberData(nameof(EndedRenewals))]
     public async Task ARenewalOfAnEndedSessionOrOfAnInvalidWindow_DoesNotSignInMain_AndIssuesANewSession(
-        string _, int absoluteHours, long? issuedHours, long? expiresHours, long sinceSignIn)
+        string _, int absoluteHours, long? issuedHours, long? expiresHours, long sinceSignIn, bool invalid)
     {
-        var (middleware, ctx, auth) = RenewalRequest(
+        var (middleware, ctx, auth, logs) = RenewalRequest(
             absoluteHours,
             SignIn.AddTicks(sinceSignIn),
             issuedHours is { } i ? SignIn.AddHours(i) : null,
@@ -548,10 +569,42 @@ public class SsoSessionMiddlewareTest
 
         await middleware.InvokeAsync(ctx, _ => Task.CompletedTask);
 
+        AssertANewSession(ctx, auth);
+        AssertTheLogOfTheEnd(logs, invalid);
+    }
+
+    [Fact]
+    public async Task ARenewalWithoutTheReadOfMain_DoesNotSignInMain_AndIssuesANewSession()
+    {
+        var (middleware, ctx, auth, logs) = RenewalRequest(
+            720, SignIn.AddHours(1), SignIn, SignIn.AddHours(720), unread: true);
+
+        await middleware.InvokeAsync(ctx, _ => Task.CompletedTask);
+
+        AssertANewSession(ctx, auth);
+        AssertTheLogOfTheEnd(logs, invalid: true);
+    }
+
+    private static void AssertANewSession(HttpContext ctx, RecordingAuthentication auth)
+    {
         Assert.DoesNotContain(auth.SignIns, s => s.Scheme == SessionSchemes.Main);
         var (scheme, _) = Assert.Single(auth.SignIns);
         Assert.Equal(SessionSchemes.Issue, scheme); // the branch of an absent key: a new session
         Assert.Equal(200, ctx.Response.StatusCode);
+    }
+
+    private static void AssertTheLogOfTheEnd(RecordingLogger logs, bool invalid)
+    {
+        if (!invalid)
+        {
+            Assert.DoesNotContain(logs.Entries, e => e.Level >= LogLevel.Warning);
+            Assert.Single(logs.Entries, e => e.Level == LogLevel.Information); // the sign-in of the new session only
+            return;
+        }
+        var warning = Assert.Single(logs.Entries, e => e.Level >= LogLevel.Warning);
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.DoesNotContain("skein:session:renewed", warning.Message);
+        Assert.DoesNotContain(RenewedUser.ToString(), warning.Message);
     }
 
     // INV-8: the store compares only the owner of the row, so the epoch is compared before any write of
@@ -559,7 +612,7 @@ public class SsoSessionMiddlewareTest
     [Fact]
     public async Task AConfirmationInAnotherEpoch_SignsInNoScheme()
     {
-        var (middleware, ctx, auth) = RenewalRequest(720, SignIn.AddHours(1), SignIn, SignIn.AddHours(720), confirmedEpoch: 4);
+        var (middleware, ctx, auth, _) = RenewalRequest(720, SignIn.AddHours(1), SignIn, SignIn.AddHours(720), confirmedEpoch: 4);
 
         var nextCalled = false;
         await middleware.InvokeAsync(ctx, _ => { nextCalled = true; return Task.CompletedTask; });
