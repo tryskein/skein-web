@@ -40,7 +40,7 @@ public sealed class SessionLogRedactionTest
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
         var formatted = new FormatterLogs();
         using var factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Trace).AddProvider(formatted));
-        var store = new RedisTicketStore(mux.Object, factory.CreateLogger<RedisTicketStore>());
+        var store = new RedisTicketStore(mux.Object, TestRedis.DefaultTimeouts, TimeProvider.System, factory.CreateLogger<RedisTicketStore>());
 
         var ex = operation == "retrieve"
             ? await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.RetrieveAsync(Key, new DefaultHttpContext(), CancellationToken.None))

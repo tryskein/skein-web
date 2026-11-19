@@ -27,7 +27,7 @@ public class RedisTicketStoreFailureTest
         var db = new Mock<IDatabase>();
         var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
-        return (new RedisTicketStore(mux.Object, NullLogger<RedisTicketStore>.Instance), db);
+        return (TestRedis.Store(mux.Object), db);
     }
 
     private static AuthenticationTicket Ticket() => new(
@@ -172,7 +172,7 @@ public class RedisTicketStoreFailureTest
         db.Setup(d => d.SetContainsAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
         var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
-        var store = new RedisTicketStore(mux.Object, factory.CreateLogger<RedisTicketStore>());
+        var store = new RedisTicketStore(mux.Object, TestRedis.DefaultTimeouts, TimeProvider.System, factory.CreateLogger<RedisTicketStore>());
 
         var exists = await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.ExistsAsync(Key, CancellationToken.None));
         var owner = await Assert.ThrowsAsync<SessionStoreUnavailableException>(() => store.IsSessionOfAsync(Key, Owner, CancellationToken.None));

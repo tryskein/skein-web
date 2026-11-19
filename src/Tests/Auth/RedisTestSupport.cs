@@ -93,14 +93,32 @@ internal static class TestRedis
         new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours),
         NullLogger<SessionIssuer>.Instance);
 
-    public static RedisTicketStore Store(IConnectionMultiplexer mux) =>
-        new(mux, NullLogger<RedisTicketStore>.Instance);
+    /// <summary>The limits a store gets when a test names none: the defaults of the settings.</summary>
+    public static SessionTimeouts DefaultTimeouts { get; } =
+        new(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours);
+
+    public static RedisTicketStore Store(IConnectionMultiplexer mux, SessionTimeouts? timeouts = null, TimeProvider? time = null) =>
+        new(mux, timeouts ?? DefaultTimeouts, time ?? TimeProvider.System, NullLogger<RedisTicketStore>.Instance);
+
+    /// <summary>
+    /// Gives <paramref name="properties"/> the window of a sign-in at <paramref name="signIn"/>
+    /// (now when omitted) under <paramref name="timeouts"/> (the defaults when omitted): the valid
+    /// window a ticket needs to be read back by the store. The seeds of the tests take it from here.
+    /// </summary>
+    public static AuthenticationProperties WithWindow(
+        AuthenticationProperties properties, DateTimeOffset? signIn = null, SessionTimeouts? timeouts = null)
+    {
+        var window = SessionWindow.ForSignIn(timeouts ?? DefaultTimeouts, signIn ?? DateTimeOffset.UtcNow);
+        properties.IssuedUtc = window.IssuedUtc;
+        properties.ExpiresUtc = window.ExpiresUtc;
+        return properties;
+    }
 
     public static AuthenticationTicket Ticket(Guid user, string? pairEmail = null, string? pairUser = null, params Claim[] extra)
     {
         var claims = new List<Claim> { new(ClaimTypes.NameIdentifier, user.ToString()) };
         claims.AddRange(extra);
-        var properties = new AuthenticationProperties();
+        var properties = WithWindow(new AuthenticationProperties());
         if (pairEmail is not null)
         {
             properties.Items[RedisTicketStore.SsoEmailItem] = pairEmail;

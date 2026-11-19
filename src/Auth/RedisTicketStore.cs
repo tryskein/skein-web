@@ -9,8 +9,9 @@ namespace SkeinWeb.Auth;
 /// <summary>
 /// Server-side session store for the cookie auth scheme. The browser cookie carries only an
 /// opaque session key (32 random bytes, base64url, generated here); the
-/// <see cref="AuthenticationTicket"/> — claims, expiry, properties — is a Redis string under
-/// <c>skein:session:{key}</c> with a sliding 24 h lifetime.
+/// <see cref="AuthenticationTicket"/> — claims, window, properties — is a Redis string under
+/// <c>skein:session:{key}</c>. The row lives for the idle lifetime of <see cref="SessionWindow"/>
+/// from its last lifetime write and never past the end of its session.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -20,13 +21,21 @@ namespace SkeinWeb.Auth;
 /// never changes the owner of a live one), a revocation reads and deletes in one step.
 /// </para>
 /// <para>
-/// REVERSE INDEX: next to each row the store keeps <c>skein:user-tickets:{userId}</c>, a Set of
-/// the user's session keys, written on every issue and successful renewal (best-effort) and
-/// walked by <see cref="RemoveUserSessionsAsync"/>. It drives event-driven invalidation and the
-/// hub's ownership probe.
+/// READ: every read checks the window of the ticket (<see cref="SessionWindow.TryRead"/>) and the
+/// end of the session under the limits of this process. A row without a valid window, or whose
+/// session has ended, is deleted and the read finds no session; otherwise one script moves the
+/// row's lifetime (<c>PEXPIRE</c>) and maintains the reverse index. A row that disappeared before
+/// that script ran is no session either.
 /// </para>
 /// <para>
-/// The request-level decisions (suppressed late write, renewal outcome, issued key, removed
+/// REVERSE INDEX: next to each row the store keeps <c>skein:user-tickets:{userId}</c>, a Set of
+/// the user's session keys, walked by <see cref="RemoveUserSessionsAsync"/>. It drives
+/// event-driven invalidation and the hub's ownership probe. The script that writes a row's
+/// lifetime also adds the key to the index and lifts the index lifetime to the row's actual one
+/// (<see cref="IndexMaintain"/>), so the index never expires before a live row of its user.
+/// </para>
+/// <para>
+/// The request-level decisions (suppressed write, renewal outcome, issued key, removed
 /// keys, no-cancellation) are read from and written to <see cref="SessionRequestState"/> by the
 /// overloads that take an <see cref="HttpContext"/>; the cookie handler calls those.
 /// </para>
@@ -84,15 +93,55 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         "if type(v) == 'table' then redis.call('DEL', KEYS[1]) return 1 end " +
         "if v then redis.call('DEL', KEYS[1]) return v end return false";
 
+    /// <summary>
+    /// Maintenance of the reverse index inside a script that has just written the lifetime of the
+    /// row <c>KEYS[1]</c> (the row exists at this point): adds the member <c>ARGV[2]</c> to the
+    /// index <c>KEYS[2]</c> and gives the index the actual <c>PTTL</c> of the row when the index
+    /// has no lifetime or a shorter one. Runs under <c>redis.pcall</c>: a failure returns
+    /// <see cref="RowWriteIndexFailed"/> and leaves the written row as it is. Without
+    /// <c>KEYS[2]</c> (a ticket without a user) there is no index to maintain.
+    /// </summary>
+    private const string IndexMaintain =
+        "if #KEYS < 2 then return 1 end " +
+        "local added = redis.pcall('SADD', KEYS[2], ARGV[2]) " +
+        "if type(added) == 'table' and added.err then return 2 end " +
+        "local row = redis.call('PTTL', KEYS[1]) " +
+        "local index = redis.pcall('PTTL', KEYS[2]) " +
+        "if type(index) == 'table' and index.err then return 2 end " +
+        "if row > 0 and (index == -1 or row > index) then " +
+        "local set = redis.pcall('PEXPIRE', KEYS[2], row) " +
+        "if type(set) == 'table' and set.err then return 2 end end " +
+        "return 1";
+
+    // The lifetime write of a read: PEXPIRE of the row (ARGV[1] milliseconds), then the index.
+    // A row that is gone is not recreated and gets no index member.
+    private const string ReadLifetimeScript =
+        "if redis.call('PEXPIRE', KEYS[1], ARGV[1]) == 0 then return 0 end " + IndexMaintain;
+
+    /// <summary>Outcome of a lifetime-writing script: the row is not there; nothing was written.</summary>
+    private const long RowWriteAbsent = 0;
+
+    /// <summary>Outcome of a lifetime-writing script: the row is written and the index maintained.</summary>
+    private const long RowWriteIndexed = 1;
+
+    /// <summary>Outcome of a lifetime-writing script: the row is written; the index part failed.</summary>
+    private const long RowWriteIndexFailed = 2;
+
     private readonly IConnectionMultiplexer _redis;
+    private readonly SessionTimeouts _timeouts;
+    private readonly TimeProvider _time;
     private readonly ILogger<RedisTicketStore> _logger;
 
     /// <summary>Creates the store.</summary>
     /// <param name="redis">Rows and reverse index.</param>
+    /// <param name="timeouts">The session limits of this process: the end of a session and the row lifetime.</param>
+    /// <param name="time">Clock of the end-of-session check and of the row lifetime.</param>
     /// <param name="logger">Logger.</param>
-    public RedisTicketStore(IConnectionMultiplexer redis, ILogger<RedisTicketStore> logger)
+    public RedisTicketStore(IConnectionMultiplexer redis, SessionTimeouts timeouts, TimeProvider time, ILogger<RedisTicketStore> logger)
     {
         _redis = redis;
+        _timeouts = timeouts;
+        _time = time;
         _logger = logger;
     }
 
@@ -142,8 +191,12 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     }
 
     /// <summary>
-    /// Look up a ticket by its key and slide its lifetime. Null when the key is unknown, expired,
-    /// of a kind this store cannot read (a hash of the former format) or its bytes are unusable.
+    /// Look up a ticket by its key and write the row's lifetime anew (min(idle limit, time left
+    /// until the end of the session), <see cref="SessionWindow.TryGetRowLifetime"/>). Null when the
+    /// key is unknown or expired in Redis, of a kind this store cannot read (a hash of the former
+    /// format), without a valid window (unreadable bytes included), when its session has ended under
+    /// the limits of this process, or when the row disappeared before its lifetime was written. A row
+    /// without a valid window or of an ended session is deleted.
     /// </summary>
     /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
     public Task<AuthenticationTicket?> RetrieveAsync(string key, HttpContext httpContext, CancellationToken cancellationToken)
@@ -340,21 +393,11 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     private async Task<AuthenticationTicket?> RetrieveCoreAsync(string key, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        var db = _redis.GetDatabase();
+        byte[]? bytes;
         try
         {
-            var db = _redis.GetDatabase();
-            byte[]? bytes = await db.StringGetAsync(key).WaitAsync(ct);
-            if (bytes is null || bytes.Length == 0)
-            {
-                return null;
-            }
-
-            var ticket = TryDeserialize(bytes);
-            if (ticket is not null)
-            {
-                await db.KeyExpireAsync(key, SessionLifetime).WaitAsync(ct);
-            }
-            return ticket;
+            bytes = await db.StringGetAsync(key).WaitAsync(ct);
         }
         catch (RedisServerException ex) when (IsWrongType(ex))
         {
@@ -365,6 +408,88 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         {
             LogFailure("retrieve", ex);
             throw new SessionStoreUnavailableException();
+        }
+        if (bytes is null || bytes.Length == 0)
+        {
+            return null;
+        }
+
+        var ticket = TryDeserializeQuietly(bytes);
+        if (ticket is null || !SessionWindow.TryRead(ticket.Properties, out var window))
+        {
+            await DeleteRowAsync(db, key, "retrieve-invalid", ct);
+            _logger.LogWarning(
+                "session row without a valid window deleted; treated as no session reason={Reason}",
+                ticket is null ? "unreadable" : "window");
+            return null;
+        }
+
+        if (!window.TryGetRowLifetime(_timeouts, _time.GetUtcNow(), out var lifetime))
+        {
+            // The session has ended: a regular end, not logged.
+            await DeleteRowAsync(db, key, "retrieve-ended", ct);
+            return null;
+        }
+
+        long outcome;
+        try
+        {
+            var result = await db.ScriptEvaluateAsync(
+                ReadLifetimeScript,
+                LifetimeKeys(key, ticket),
+                [(RedisValue)(long)lifetime.TotalMilliseconds, (RedisValue)key]).WaitAsync(ct);
+            outcome = (long)result;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogFailure("retrieve-lifetime", ex);
+            throw new SessionStoreUnavailableException();
+        }
+
+        if (outcome == RowWriteAbsent)
+        {
+            // The row disappeared between the read and the lifetime write: it does not authenticate.
+            return null;
+        }
+        if (outcome == RowWriteIndexFailed)
+        {
+            LogIndexFailure("retrieve");
+        }
+        return ticket;
+    }
+
+    /// <summary>
+    /// <c>KEYS</c> of a lifetime-writing script: the row and, when the ticket names its user, the
+    /// user's reverse index (<see cref="IndexMaintain"/>).
+    /// </summary>
+    private static RedisKey[] LifetimeKeys(string key, AuthenticationTicket ticket) =>
+        TryReadUserId(ticket.Principal) is { } userId
+            ? [(RedisKey)key, (RedisKey)(UserIndexPrefix + userId)]
+            : [(RedisKey)key];
+
+    /// <summary>Delete a row the read found unusable; a technical failure is a store failure.</summary>
+    private async Task DeleteRowAsync(IDatabase db, string key, string operation, CancellationToken ct)
+    {
+        try
+        {
+            await db.KeyDeleteAsync(key).WaitAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            LogFailure(operation, ex);
+            throw new SessionStoreUnavailableException();
+        }
+    }
+
+    private static AuthenticationTicket? TryDeserializeQuietly(byte[] bytes)
+    {
+        try
+        {
+            return TicketSerializer.Default.Deserialize(bytes);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
         }
     }
 
@@ -523,7 +648,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     /// <summary>
     /// Whether the row <paramref name="key"/> is still stored — false once the session was signed
     /// out, revoked or removed, or has expired. Uses <c>EXISTS</c>, not a read, so it does not
-    /// slide the lifetime: a session with an open hub connection must still expire.
+    /// write the row's lifetime: a session with an open hub connection must still expire.
     /// </summary>
     /// <exception cref="SessionStoreUnavailableException">The store is unreachable; the caller decides.</exception>
     public async Task<bool> ExistsAsync(string key, CancellationToken ct)
@@ -625,6 +750,10 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         _logger.LogWarning(
             "session store operation failed operation={Operation} exceptionType={ExceptionType} code={Code}",
             operation, ex.GetType().Name, CodeOf(ex));
+
+    /// <summary>The index part of a lifetime write failed; logged without the key, the request is not affected.</summary>
+    private void LogIndexFailure(string operation) =>
+        _logger.LogWarning("session index maintenance failed operation={Operation}", operation);
 
     private static string CodeOf(Exception ex) => ex switch
     {

@@ -84,7 +84,7 @@ public class SessionCookiePolicyTest
         services.AddLogging();
         services.AddDataProtection();
         services.AddSingleton(new SessionCookiePolicy(insecure));
-        services.AddSingleton(new RedisTicketStore(new Mock<IConnectionMultiplexer>().Object, NullLogger<RedisTicketStore>.Instance));
+        services.AddSingleton(TestRedis.Store(new Mock<IConnectionMultiplexer>().Object));
         // Not the defaults, and the idle limit different from the absolute one: the lifetime must come
         // from the registered absolute limit, not from a literal or from the idle limit.
         services.AddSingleton(new SessionTimeouts(idleHours: 7, absoluteHours: 11));

@@ -32,7 +32,7 @@ public sealed class UserChangedSubscriberIntegrationTests
         var redisUrl = Required("TEST_REDIS_URL");
         using var monitor = new HttpClient { BaseAddress = new Uri(Required("TEST_NATS_MONITOR_URL")) };
         await using var redis = await ConnectionMultiplexer.ConnectAsync(redisUrl);
-        var store = new RedisTicketStore(redis, NullLogger<RedisTicketStore>.Instance);
+        var store = TestRedis.Store(redis);
         var connections = new List<NatsConnection>();
         var bridges = new List<NatsBridge>();
         var subscribers = new List<UserChangedSubscriber>();
