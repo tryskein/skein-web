@@ -367,7 +367,8 @@ public sealed class SessionSurfacesTest
         "login" => host.LoginAsync("a@x.io", cookie: cookie),
         "signup" => host.SendAsync(HttpMethod.Post, Registrations[0].Path, Registrations[0].Body, cookie),
         "invitation-signup" => host.SendAsync(HttpMethod.Post, Registrations[1].Path, Registrations[1].Body, cookie),
-        _ => host.SendAsync(HttpMethod.Post, "/api/auth/password-reset/tok-reset", new { password = "new password" }, cookie),
+        "password-reset" => host.SendAsync(HttpMethod.Post, "/api/auth/password-reset/tok-reset", new { password = "new password" }, cookie),
+        _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Not a sign-in operation of this test."),
     };
 
     /// <summary>
@@ -414,15 +415,16 @@ public sealed class SessionSurfacesTest
     {
         var (host, clock) = await StartWithClockAsync();
         await using var _ = host;
-        // The incoming session of the same user, signed in ten days ago and still alive.
-        var tenDaysAgo = clock.GetUtcNow().AddDays(-10);
+        // The incoming session of the same user, signed in two hours ago: its window is earlier than
+        // the new one and still live under the stand's limit.
+        var twoHoursAgo = clock.GetUtcNow().AddHours(-2);
         var principal = SessionPrincipal.Create(new UserDto(A.ToString(), "a@x.io", "a", "a", "user", null, null, false), 3);
         var old = await host.Services.GetRequiredService<RedisTicketStore>().StoreAsync(
             new AuthenticationTicket(principal, new AuthenticationProperties
             {
                 IsPersistent = true,
-                IssuedUtc = tenDaysAgo,
-                ExpiresUtc = tenDaysAgo.AddHours(720),
+                IssuedUtc = twoHoursAgo,
+                ExpiresUtc = twoHoursAgo.AddHours(AbsoluteHours),
             }, SessionSchemes.Issue),
             new DefaultHttpContext(), CancellationToken.None);
         var cookie = CookieFor(host, old);
