@@ -72,6 +72,15 @@ var redisConfig = ParseRedisConfig(redisUrl);
 builder.Services.UseHttpClientMetrics();
 builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
 
+// Session limits: idle and absolute, in whole hours. Optional (durations, not
+// addresses or secrets), so each has a default; a set-but-invalid value throws
+// here, before the Redis connection, the instance-config bootstrap and the
+// binding of the port, so a failure of either never hides it. The cookie
+// handler, the session store and the per-user index all read this one object.
+// See docs/env-reference.md, section «Authentication».
+var sessionTimeouts = SessionTimeouts.Parse(builder.Configuration);
+builder.Services.AddSingleton(sessionTimeouts);
+
 // ---- Redis: shared multiplexer ---------------------------------------------
 // One IConnectionMultiplexer per process — SE.Redis is internally
 // thread-safe and connects lazily per endpoint. Used by RedisTicketStore (the
@@ -111,14 +120,6 @@ builder.Services.AddSingleton<SessionIssuer>();
 builder.Services.AddSingleton<SessionStoreMigration>();
 builder.Services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
 builder.Services.AddSingleton<ISessionTicketProbe>(sp => sp.GetRequiredService<RedisTicketStore>());
-
-// Session limits: idle and absolute, in whole hours. Optional (durations, not
-// addresses or secrets), so each has a default; a set-but-invalid value throws
-// here, before the instance-config bootstrap and before the port is bound. The cookie
-// handler, the session store and the per-user index all read this one object.
-// See docs/env-reference.md, section «Authentication».
-var sessionTimeouts = SessionTimeouts.Parse(builder.Configuration);
-builder.Services.AddSingleton(sessionTimeouts);
 
 // ---- Installation settings from skein-api (plan K-12, D-7, E-13) ------------
 // The authentication MODE is skein-api's (SKEIN_AUTH_MODE), not ours: read it
