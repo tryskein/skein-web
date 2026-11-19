@@ -90,6 +90,21 @@ public class SessionWindowTest
         Assert.Equal(SignIn.AddHours(720), DefaultWindow.SessionEnd(raisedBack));
     }
 
+    [Fact]
+    public void TheEndOfASession_NearTheLastRepresentableMoment_IsTheWrittenExpiry_WithoutOverflow()
+    {
+        // Sign-in plus the current limit lies past DateTimeOffset.MaxValue; the written expiry does not.
+        var expires = DateTimeOffset.MaxValue.AddHours(-1);
+        var window = new SessionWindow(expires.AddHours(-10), expires);
+        var timeouts = new SessionTimeouts(120, 8760);
+
+        Assert.Equal(expires, window.SessionEnd(timeouts));
+        Assert.False(window.HasEnded(timeouts, expires.AddSeconds(-1)));
+        Assert.True(window.HasEnded(timeouts, expires));
+        Assert.True(window.TryGetRowLifetime(timeouts, expires.AddSeconds(-1), out var lifetime));
+        Assert.Equal(TimeSpan.FromMilliseconds(1000), lifetime);
+    }
+
     public static TheoryData<string, SessionTimeouts, TimeSpan, long?> RowLifetimes() => new()
     {
         // Time left larger than the idle limit: the idle limit.
