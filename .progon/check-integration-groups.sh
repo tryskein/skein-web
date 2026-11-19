@@ -34,6 +34,13 @@ required=(
   PasswordResetSessionTest
   OidcCallbackSessionIntegrationTest
   SsoSessionIntegrationTest
+  SessionTimeoutsStartupTest
+  SessionExpiryPipelineTest
+  SessionStoreStartupIntegrationTest
+  SessionCleanupPipelineTest
+  SessionCleanupSurfacesTest
+  SessionCleanupProxyTest
+  SessionFormatRejectionTest
 )
 
 # The report is a single XML document in the TRX namespace; work on it as one line of text so a tag is one
