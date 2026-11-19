@@ -1,6 +1,11 @@
 using System.Net;
+using System.Security.Claims;
 using System.Text.Json;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
+using SkeinWeb.Auth;
 using SkeinWeb.Tests.Auth;
 using StackExchange.Redis;
 
@@ -257,7 +262,6 @@ public sealed class SessionSurfacesTest
             _ => user.Replace(",\"space\":{\"id\":\"k3x9p2qa\",\"slug\":\"acme\",\"name\":\"Acme\"}", ""),
         };
         host.Api.Override = Answer("/signup", HttpStatusCode.OK, body);
-        await PasswordResetSessionTest.MakeSlidingDueAsync(host, key); // a sliding renewal is due on the incoming session
 
         var reply = await host.SendAsync(HttpMethod.Post, Registrations[which].Path, Registrations[which].Body, cookie);
 
@@ -350,4 +354,93 @@ public sealed class SessionSurfacesTest
         Assert.Equal(HttpStatusCode.OK, (await host.SendAsync(HttpMethod.Get, "/test/me", cookie: firstSet.AsRequestCookie())).Status);
         Assert.Equal(HttpStatusCode.OK, (await host.SendAsync(HttpMethod.Get, "/test/me", cookie: secondSet.AsRequestCookie())).Status);
     }
+
+    // ---- the window of a new session on every sign-in operation (SC-007, INV-6, INV-7, E-9) -------
+
+    private const int AbsoluteHours = 11;
+
+    /// <summary>The four operations that issue a session, each as the browser calls it.</summary>
+    public static TheoryData<string> SignInOperations() => ["login", "signup", "invitation-signup", "password-reset"];
+
+    private static Task<SessionPipelineHost.Reply> SignInByAsync(SurfacesHost host, string operation, string? cookie) => operation switch
+    {
+        "login" => host.LoginAsync("a@x.io", cookie: cookie),
+        "signup" => host.SendAsync(HttpMethod.Post, Registrations[0].Path, Registrations[0].Body, cookie),
+        "invitation-signup" => host.SendAsync(HttpMethod.Post, Registrations[1].Path, Registrations[1].Body, cookie),
+        _ => host.SendAsync(HttpMethod.Post, "/api/auth/password-reset/tok-reset", new { password = "new password" }, cookie),
+    };
+
+    /// <summary>
+    /// A stand whose cookie schemes and issuer read a controlled clock, set apart from the system
+    /// clock by three days on a whole second, with an absolute limit of 11 h.
+    /// </summary>
+    private static async Task<(SurfacesHost Host, FakeTimeProvider Clock)> StartWithClockAsync()
+    {
+        var start = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds()).AddDays(3);
+        var clock = new FakeTimeProvider(start);
+        var host = await SurfacesHost.StartAsync(configure: services =>
+        {
+            services.AddSingleton<TimeProvider>(clock);
+            services.AddSingleton(new SessionTimeouts(120, AbsoluteHours));
+        });
+        return (host, clock);
+    }
+
+    private static async Task<AuthenticationProperties> RowPropertiesAsync(SurfacesHost host, string key) =>
+        (await host.Services.GetRequiredService<RedisTicketStore>()
+            .RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None))!.Properties;
+
+    [RedisTheory]
+    [MemberData(nameof(SignInOperations))]
+    public async Task EverySignInOperation_SetsAPersistentCookie_ThatExpiresAtTheIssuePlusTheAbsoluteLimit(string operation)
+    {
+        var (host, clock) = await StartWithClockAsync();
+        await using var _ = host;
+        var issuedAt = clock.GetUtcNow();
+
+        var reply = await SignInByAsync(host, operation, cookie: null);
+
+        Assert.True(reply.Status is HttpStatusCode.OK or HttpStatusCode.NoContent, reply.Body);
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        Assert.Equal(issuedAt.AddHours(AbsoluteHours), SessionPipelineIntegrationTest.ExpiresOf(set));
+        var row = await RowPropertiesAsync(host, host.KeyOf(set));
+        Assert.Equal(issuedAt, row.IssuedUtc);
+        Assert.Equal(issuedAt.AddHours(AbsoluteHours), row.ExpiresUtc);
+    }
+
+    [RedisTheory]
+    [MemberData(nameof(SignInOperations))]
+    public async Task EverySignInOperation_OverALiveOldSession_StartsANewWindowUnderANewKey_AndTheOldKeyIsDead(string operation)
+    {
+        var (host, clock) = await StartWithClockAsync();
+        await using var _ = host;
+        // The incoming session of the same user, signed in ten days ago and still alive.
+        var tenDaysAgo = clock.GetUtcNow().AddDays(-10);
+        var principal = SessionPrincipal.Create(new UserDto(A.ToString(), "a@x.io", "a", "a", "user", null, null, false), 3);
+        var old = await host.Services.GetRequiredService<RedisTicketStore>().StoreAsync(
+            new AuthenticationTicket(principal, new AuthenticationProperties
+            {
+                IsPersistent = true,
+                IssuedUtc = tenDaysAgo,
+                ExpiresUtc = tenDaysAgo.AddHours(720),
+            }, SessionSchemes.Issue),
+            new DefaultHttpContext(), CancellationToken.None);
+        var cookie = CookieFor(host, old);
+        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync(HttpMethod.Get, "/test/me", cookie: cookie)).Status); // control: it is live
+        clock.Advance(TimeSpan.FromMinutes(5));
+        var operationAt = clock.GetUtcNow();
+
+        var reply = await SignInByAsync(host, operation, cookie);
+
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        var fresh = host.KeyOf(set);
+        Assert.NotEqual(old, fresh);
+        var row = await RowPropertiesAsync(host, fresh);
+        Assert.Equal(operationAt, row.IssuedUtc);
+        Assert.Equal(operationAt.AddHours(AbsoluteHours), row.ExpiresUtc);
+        Assert.False(await host.Db.KeyExistsAsync(old));
+    }
+
+    private static string CookieFor(SurfacesHost host, string key) =>
+        $"{host.CookieName}={Uri.EscapeDataString(host.Services.GetRequiredService<TicketDataFormat>().Protect(new AuthenticationTicket(new ClaimsPrincipal(new ClaimsIdentity([new Claim("Microsoft.AspNetCore.Authentication.Cookies-SessionId", key)], "Cookies")), "Cookies")))}";
 }

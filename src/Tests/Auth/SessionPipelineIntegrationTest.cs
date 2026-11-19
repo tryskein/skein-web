@@ -26,6 +26,11 @@ namespace SkeinWeb.Tests.Auth;
 /// (database 9, serialised by the collection), a fault-injecting database proxy, and test endpoints
 /// that call the issuer and the revocation on the request context. A hub endpoint registers a
 /// connection through the real <see cref="SkeinHub"/> from <c>context.User</c> of the same request.
+/// The session limits are a parameter (the defaults when not given); the cookie schemes and the
+/// issuer read the clock of the stand (<see cref="Time"/>). <c>/test/issue</c> takes the
+/// persistence and the window of the incoming properties, <c>/test/renew</c> is an explicit
+/// renewal of the request's session through Main, and <c>/test/hold</c> is a protected endpoint
+/// that, once authenticated, waits for the test (<see cref="Hold"/>).
 /// </summary>
 internal sealed class SessionPipelineHost : IAsyncDisposable
 {
@@ -42,11 +47,35 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
     public FakeTimeProvider Time { get; }
     public HubTestWorld World { get; } = new();
     public HubTestReplica Replica { get; }
+    public SessionTimeouts Timeouts { get; }
+    public HoldGate Hold { get; }
     public ErrorLogs Logs { get; }
     public FormatterLogs Formatted { get; }
     public IServiceProvider Services => _app.Services;
     public string CookieName => Policy.CookieName;
     public string OtherName => Policy.AllowInsecureHttp ? "__Host-skein.sid" : "skein.sid";
+
+    /// <summary>
+    /// The gate of <c>/test/hold</c>: the request signals <see cref="Reached"/> once it is
+    /// authenticated and then waits until the test calls <see cref="Release"/>. One use per host.
+    /// </summary>
+    public sealed class HoldGate
+    {
+        private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Completes when a held request has been authenticated.</summary>
+        public Task Reached => _reached.Task;
+
+        /// <summary>Lets the held request finish.</summary>
+        public void Release() => _release.TrySetResult();
+
+        internal async Task WaitAsync(CancellationToken ct)
+        {
+            _reached.TrySetResult();
+            await _release.Task.WaitAsync(TimeSpan.FromSeconds(30), ct);
+        }
+    }
 
     /// <summary>Everything logged at any level, as text (for the redaction checks).</summary>
     public sealed class ErrorLogs : ILoggerProvider
@@ -77,8 +106,10 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
     }
 
     private SessionPipelineHost(WebApplication app, HttpClient client, ConnectionMultiplexer mux, DbProxy faults,
-        RedisTicketStore store, SessionCookiePolicy policy, FakeTimeProvider time, HubTestReplica replica, ErrorLogs logs, FormatterLogs formatted)
+        RedisTicketStore store, SessionCookiePolicy policy, FakeTimeProvider time, HubTestReplica replica, SessionTimeouts timeouts,
+        HoldGate hold, ErrorLogs logs, FormatterLogs formatted)
     {
+        Hold = hold;
         _app = app;
         _client = client;
         Mux = mux;
@@ -87,6 +118,7 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         Policy = policy;
         Time = time;
         Replica = replica;
+        Timeouts = timeouts;
         Logs = logs;
         Formatted = formatted;
     }
@@ -94,9 +126,11 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
     /// <param name="insecureHttp">The Development insecure-http mode.</param>
     /// <param name="apiAuthMode">skein-api <c>authMode</c>; the trust-headers mode is <c>keycloak</c>.</param>
     /// <param name="trustLoopback">Whether the loopback peer is a trusted proxy.</param>
+    /// <param name="timeouts">The session limits; the defaults when not given.</param>
     public static async Task<SessionPipelineHost> StartAsync(
-        bool insecureHttp = false, string apiAuthMode = "local", bool trustLoopback = false)
+        bool insecureHttp = false, string apiAuthMode = "local", bool trustLoopback = false, SessionTimeouts? timeouts = null)
     {
+        timeouts ??= new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours);
         var mux = TestRedis.Connect(Database);
         mux.GetServers().First(s => !s.IsReplica).FlushDatabase(Database);
         var db = DbProxy.Create(mux.GetDatabase(Database), out var faults);
@@ -124,11 +158,13 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         services.AddDataProtection();
         var proxies = TrustedProxyConfig.FromEntries(trustLoopback ? ["127.0.0.1", "::1"] : []);
         services.AddSkeinEdge(proxies, AllowedHostsConfig.Parse(""));
-        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
+        services.AddSingleton(timeouts);
+        var hold = new HoldGate();
+        services.AddSingleton(hold);
         services.AddSkeinAuthentication(WebAuthMode.FromApi(apiAuthMode, oidcAuthority: null), new SsoOptions());
         services.AddSingleton(proxies);
         services.AddTransient<SessionStoreFailureMiddleware>();
-        // The sliding renewal and the expiry read the same clock the test moves.
+        // The cookie handler's expiry check reads the same clock the test moves.
         foreach (var scheme in new[] { SessionSchemes.Main, SessionSchemes.Issue })
         {
             services.PostConfigure<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>(
@@ -150,11 +186,42 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         ClaimsPrincipal PrincipalOf(Guid user, string role = "user") => new(new ClaimsIdentity(
             [new Claim(ClaimTypes.NameIdentifier, user.ToString()), new Claim(ClaimTypes.Role, role), new Claim(ClaimTypes.Email, "alice@example.com")], "test"));
 
-        // ---- issue, end, revoke ---------------------------------------------------------------
-        app.MapGet("/test/issue", async (HttpContext ctx, SessionIssuer issuer, Guid user) =>
+        // ---- issue, renew, end, revoke ---------------------------------------------------------
+        // The incoming properties: persistence and a window (Unix seconds) the caller hands the issuer.
+        app.MapGet("/test/issue", async (HttpContext ctx, SessionIssuer issuer, Guid user, bool? persistent, long? issuedUnix, long? expiresUnix) =>
         {
-            var issued = await issuer.RotateAsync(ctx, PrincipalOf(user), new AuthenticationProperties(), "Test");
+            var properties = new AuthenticationProperties
+            {
+                IsPersistent = persistent == true,
+                IssuedUtc = issuedUnix is { } i ? DateTimeOffset.FromUnixTimeSeconds(i) : null,
+                ExpiresUtc = expiresUnix is { } e ? DateTimeOffset.FromUnixTimeSeconds(e) : null,
+            };
+            var issued = await issuer.RotateAsync(ctx, PrincipalOf(user), properties, "Test");
             return Results.Json(new { key = issued.Key, hadPreviousKey = issued.HadPreviousKey });
+        });
+        // An explicit renewal of the request's session through Main, as the SSO renewal does it: the
+        // properties are the ones Main read for this request.
+        app.MapGet("/test/renew", async (HttpContext ctx) =>
+        {
+            var read = await ctx.AuthenticateAsync(SessionSchemes.Main);
+            if (!read.Succeeded)
+            {
+                return Results.Unauthorized();
+            }
+            var state = SessionRequestState.Of(ctx);
+            state.ExplicitRenewal = true;
+            try
+            {
+                await ctx.SignInAsync(
+                    SessionSchemes.Main,
+                    PrincipalOf(Guid.Parse(read.Principal!.FindFirstValue(ClaimTypes.NameIdentifier)!)),
+                    read.Properties!.Clone());
+            }
+            finally
+            {
+                state.ExplicitRenewal = false;
+            }
+            return Results.Json(new { outcome = state.RenewOutcome?.ToString() });
         });
         app.MapGet("/test/issue-then-hub", async (HttpContext ctx, SessionIssuer issuer, Guid user) =>
         {
@@ -212,6 +279,15 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
             ctx.User.Identity?.IsAuthenticated == true
                 ? Results.Json(new { connection = await ConnectAsync(ctx.User) })
                 : Results.Unauthorized());
+        app.MapGet("/test/hold", async (HttpContext ctx, SessionPipelineHost.HoldGate gate) =>
+        {
+            if (ctx.User.Identity?.IsAuthenticated != true)
+            {
+                return Results.Unauthorized();
+            }
+            await gate.WaitAsync(ctx.RequestAborted);
+            return Results.Json(new { user = ctx.User.FindFirstValue(ClaimTypes.NameIdentifier) });
+        });
 
         // ---- the four explicit operations, with the metadata of the real controllers ----------
         Explicit(app.MapPost("/api/auth/login", () => Results.Ok()), typeof(AuthController), nameof(AuthController.Login));
@@ -256,7 +332,7 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
             BaseAddress = new Uri(app.Urls.First()),
         };
         var store = app.Services.GetRequiredService<RedisTicketStore>();
-        return new SessionPipelineHost(app, client, mux, faults, store, policy, time, replica, logs, formatted);
+        return new SessionPipelineHost(app, client, mux, faults, store, policy, time, replica, timeouts, hold, logs, formatted);
     }
 
     // ---- client ----------------------------------------------------------------------------------
@@ -372,11 +448,103 @@ public sealed class SessionPipelineIntegrationTest
         var issued = Assert.Single(issue.Sessions(host.CookieName));
         AssertAttributes(host, issued);
 
-        // Main path (sliding renewal): the ticket is past half of its lifetime.
-        host.Time.Advance(TimeSpan.FromHours(13));
-        var main = await host.SendAsync("/test/me", issued.AsRequestCookie(), null, headers);
+        // Main path: an explicit renewal of the same key, the one remaining ticket write of Main.
+        var main = await host.SendAsync("/test/renew", issued.AsRequestCookie(), null, headers);
         Assert.Equal(HttpStatusCode.OK, main.Status); // control: the host accepts its own cookie
         AssertAttributes(host, Assert.Single(main.Sessions(host.CookieName)));
+    }
+
+    // D-1: no request without a sign-in writes the ticket or sets a session cookie, past half of the
+    // window and just before its end (absolute limit 11 h, shifts counted from the issued ticket).
+    [RedisFact]
+    public async Task AnOrdinaryRequest_NeverRenewsTheSession_PastHalfOfTheWindowOrJustBeforeItsEnd()
+    {
+        await using var host = await SessionPipelineHost.StartAsync(timeouts: new SessionTimeouts(120, 11));
+        // Control on the same stand: the issue writes the row and sets the cookie.
+        var (cookie, key, _) = await host.SignInAsync(Alice);
+        byte[]? written = await host.Db.StringGetAsync(key);
+        Assert.NotNull(written);
+        var ticket = await host.Store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None);
+        var issuedAt = ticket!.Properties.IssuedUtc!.Value;
+        Assert.Equal(issuedAt.AddHours(11), ticket.Properties.ExpiresUtc);
+
+        foreach (var shift in new[] { TimeSpan.FromHours(6), TimeSpan.FromHours(10) + TimeSpan.FromMinutes(59) })
+        {
+            host.Time.SetUtcNow(issuedAt + shift);
+
+            var reply = await host.SendAsync("/test/me", cookie);
+
+            Assert.Equal(HttpStatusCode.OK, reply.Status);
+            Assert.Empty(reply.Sessions(host.CookieName));
+            Assert.Equal(written, (byte[]?)await host.Db.StringGetAsync(key));
+        }
+    }
+
+    public static TheoryData<string, bool, long?, long?> IncomingWindows()
+    {
+        // Relative to the stand's clock at the issue, in seconds: in the past, in the future, longer
+        // than the limit, and none.
+        var data = new TheoryData<string, bool, long?, long?>();
+        foreach (var persistent in new[] { true, false })
+        {
+            data.Add("in the past", persistent, -10 * 86_400, -9 * 86_400);
+            data.Add("in the future", persistent, 3_600, 7_200);
+            data.Add("longer than the limit", persistent, -60, 400 * 86_400);
+            data.Add("none", persistent, null, null);
+        }
+        return data;
+    }
+
+    // INV-7, INV-6, E-9: the issuer replaces whatever window the incoming properties carry and keeps
+    // their persistence.
+    [RedisTheory]
+    [MemberData(nameof(IncomingWindows))]
+    public async Task AnIssue_StartsTheWindowOfItsOwnMoment_WhateverTheIncomingProperties_AndKeepsThePersistence(
+        string _, bool persistent, long? issuedOffset, long? expiresOffset)
+    {
+        await using var host = await SessionPipelineHost.StartAsync(timeouts: new SessionTimeouts(120, 11));
+        host.Time.Advance(TimeSpan.FromMinutes(42));
+        var now = host.Time.GetUtcNow();
+        var query = $"/test/issue?user={Alice}&persistent={persistent.ToString().ToLowerInvariant()}";
+        if (issuedOffset is { } i && expiresOffset is { } e)
+        {
+            query += $"&issuedUnix={now.ToUnixTimeSeconds() + i}&expiresUnix={now.ToUnixTimeSeconds() + e}";
+        }
+
+        var reply = await host.SendAsync(query);
+
+        Assert.Equal(HttpStatusCode.OK, reply.Status);
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        var key = System.Text.Json.JsonDocument.Parse(reply.Body).RootElement.GetProperty("key").GetString()!;
+        var ticket = await host.Store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None);
+        // The window of the row: [now of the stand, + 11 h]; the ticket keeps times to the second.
+        Assert.Equal(now.ToUnixTimeSeconds(), ticket!.Properties.IssuedUtc!.Value.ToUnixTimeSeconds());
+        Assert.Equal(now.AddHours(11).ToUnixTimeSeconds(), ticket.Properties.ExpiresUtc!.Value.ToUnixTimeSeconds());
+        Assert.Equal(persistent, ticket.Properties.IsPersistent);
+        var expires = ExpiresOf(set);
+        if (persistent)
+        {
+            Assert.Equal(ticket.Properties.ExpiresUtc!.Value.ToUnixTimeSeconds(), expires!.Value.ToUnixTimeSeconds());
+        }
+        else
+        {
+            Assert.Null(expires);
+        }
+    }
+
+    /// <summary>The <c>expires</c> attribute of a Set-Cookie, or null when it has none.</summary>
+    internal static DateTimeOffset? ExpiresOf(SessionPipelineHost.SetCookie set)
+    {
+        foreach (var part in set.Raw.Split(';').Skip(1))
+        {
+            var attribute = part.Trim();
+            if (attribute.StartsWith("expires=", StringComparison.OrdinalIgnoreCase))
+            {
+                return DateTimeOffset.Parse(attribute["expires=".Length..], System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal);
+            }
+        }
+        return null;
     }
 
     [RedisFact]

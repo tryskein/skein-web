@@ -62,7 +62,8 @@ public sealed class OidcCallbackSessionIntegrationTest
         }
     }
 
-    private static async Task<(SurfacesHost Host, FakeIdp Idp)> StartAsync()
+    private static async Task<(SurfacesHost Host, FakeIdp Idp)> StartAsync(
+        Action<IServiceCollection>? extra = null, bool useTokenLifetime = false)
     {
         var idp = new FakeIdp();
         var sso = new SsoOptions();
@@ -71,8 +72,12 @@ public sealed class OidcCallbackSessionIntegrationTest
         sso.Oidc.ClientSecret = "secret";
         sso.Oidc.AllowedGroup = "skein-users";
         var host = await SurfacesHost.StartAsync(WebAuthMode.FromApi("keycloak", Realm), sso, services =>
+        {
+            extra?.Invoke(services);
             services.PostConfigure<OpenIdConnectOptions>(OpenIdConnectDefaults.AuthenticationScheme, options =>
             {
+                // On: the handler puts the token's lifetime into the properties it hands the issuer.
+                options.UseTokenLifetime = useTokenLifetime;
                 options.Backchannel = new HttpClient(idp);
                 options.ConfigurationManager = new StaticConfigurationManager<OpenIdConnectConfiguration>(new OpenIdConnectConfiguration
                 {
@@ -82,7 +87,8 @@ public sealed class OidcCallbackSessionIntegrationTest
                     EndSessionEndpoint = Realm + "/protocol/openid-connect/logout",
                     SigningKeys = { idp.SigningKey },
                 });
-            }));
+            });
+        });
         return (host, idp);
     }
 
@@ -218,6 +224,78 @@ public sealed class OidcCallbackSessionIntegrationTest
 
         Assert.True((int)reply.Status < 500, reply.Body);
         Assert.False(await host.Db.KeyExistsAsync(key));
+    }
+
+    // ---- the window of an OIDC session (INV-7, E-9, SC-007) ---------------------------------------
+
+    private const int AbsoluteHours = 11;
+
+    private static Task<(SurfacesHost Host, FakeIdp Idp)> StartWithClockAsync(
+        Microsoft.Extensions.Time.Testing.FakeTimeProvider clock, bool useTokenLifetime) =>
+        StartAsync(services =>
+        {
+            services.AddSingleton<TimeProvider>(clock);
+            services.AddSingleton(new SessionTimeouts(120, AbsoluteHours));
+        }, useTokenLifetime);
+
+    private static Microsoft.Extensions.Time.Testing.FakeTimeProvider WholeSecondClock() =>
+        new(DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+
+    private static async Task<Microsoft.AspNetCore.Authentication.AuthenticationProperties> RowPropertiesAsync(SurfacesHost host, string key) =>
+        (await host.Services.GetRequiredService<RedisTicketStore>()
+            .RetrieveAsync(key, new Microsoft.AspNetCore.Http.DefaultHttpContext(), CancellationToken.None))!.Properties;
+
+    // The token's own lifetime (exp, expires_in) never becomes the window, whether or not the
+    // handler copies it into the properties; the cookie stays a browser-session one.
+    [RedisTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Callback_SetsABrowserSessionCookie_AndAWindowFromTheSettings_WhateverTheProviderProperties(bool useTokenLifetime)
+    {
+        var clock = WholeSecondClock();
+        var (host, idp) = await StartWithClockAsync(clock, useTokenLifetime);
+        await using var _ = host;
+        var issuedAt = clock.GetUtcNow();
+
+        var (reply, _) = await CallbackAsync(host, idp, "/after", incoming: null);
+
+        Assert.Equal(HttpStatusCode.Redirect, reply.Status);
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        Assert.DoesNotContain("expires=", set.Raw, StringComparison.OrdinalIgnoreCase);
+        var row = await RowPropertiesAsync(host, host.KeyOf(set));
+        Assert.Equal(issuedAt, row.IssuedUtc);
+        Assert.Equal(issuedAt.AddHours(AbsoluteHours), row.ExpiresUtc);
+        Assert.False(row.IsPersistent);
+    }
+
+    [RedisFact]
+    public async Task ARepeatedCallback_OverALiveOldSession_StartsANewWindowUnderANewKey()
+    {
+        var clock = WholeSecondClock();
+        var (host, idp) = await StartWithClockAsync(clock, useTokenLifetime: false);
+        await using var _ = host;
+        var tenDaysAgo = clock.GetUtcNow().AddDays(-10);
+        var principal = SessionPrincipal.Create(
+            new UserDto(A.ToString(), "a@x.io", "alice", "alice", "user", null, null, false), 3);
+        var old = await host.Services.GetRequiredService<RedisTicketStore>().StoreAsync(
+            new Microsoft.AspNetCore.Authentication.AuthenticationTicket(principal,
+                new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IssuedUtc = tenDaysAgo, ExpiresUtc = tenDaysAgo.AddHours(720) },
+                SessionSchemes.Issue),
+            new Microsoft.AspNetCore.Http.DefaultHttpContext(), CancellationToken.None);
+        var cookie = CookieFor(host, old);
+        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync(HttpMethod.Get, "/test/me", cookie: cookie)).Status); // control: it is live
+        clock.Advance(TimeSpan.FromMinutes(5));
+        var callbackAt = clock.GetUtcNow();
+
+        var (reply, _) = await CallbackAsync(host, idp, "/after", cookie);
+
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        var fresh = host.KeyOf(set);
+        Assert.NotEqual(old, fresh);
+        var row = await RowPropertiesAsync(host, fresh);
+        Assert.Equal(callbackAt, row.IssuedUtc);
+        Assert.Equal(callbackAt.AddHours(AbsoluteHours), row.ExpiresUtc);
+        Assert.False(await host.Db.KeyExistsAsync(old));
     }
 
     // ---- helpers: sessions are written straight through the store, as the issuer would ----------
