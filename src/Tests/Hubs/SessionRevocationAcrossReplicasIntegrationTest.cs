@@ -2,7 +2,6 @@ using System.Net;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Logging.Abstractions;
-using SkeinWeb.Auth;
 using SkeinWeb.Hubs;
 using SkeinWeb.Tests.Auth;
 using StackExchange.Redis;
@@ -16,10 +15,17 @@ namespace SkeinWeb.Tests.Hubs;
 /// re-check is nominal, not an upper bound: a probe that fails technically closes nothing, and the next
 /// one that succeeds does. Losing the index member (R-1) may close a connection earlier; a reconnect
 /// that reads the ticket restores the member. A control session of the same user is untouched. The
-/// first replica is the pipeline stand (real rotation, real hub endpoint); the second is another
-/// registry on the same Redis with the real <see cref="AccessRecheckService"/> on the stand's fake
-/// clock and the real store as its probe.
+/// first replica is the pipeline stand (real rotation, real hub endpoint); the sweeps are the real
+/// <see cref="AccessRecheckService"/> on the stand's fake clock, with the real store as their probe,
+/// over the registry of another replica or of the stand's own.
 /// </summary>
+/// <remarks>
+/// A round is observed, never waited for by a pause: the clock moves one period on until the probe of
+/// the key is seen (a tick that lands while the previous sweep still runs is skipped by the service, so
+/// one tick is not enough). Sweeps never overlap, so the start of the next sweep proves the previous one
+/// has handled its answers: "nothing closed" is read at the next sweep's probe of the same key
+/// (<see cref="Sweeper.FenceAsync"/>).
+/// </remarks>
 [Trait("Category", "Integration")]
 [Collection("session-pipeline")]
 public sealed class SessionRevocationAcrossReplicasIntegrationTest
@@ -42,77 +48,114 @@ public sealed class SessionRevocationAcrossReplicasIntegrationTest
     private static string Connection(SessionPipelineHost.Reply reply) =>
         JsonDocument.Parse(reply.Body).RootElement.GetProperty("connection").GetString()!;
 
+    /// <summary>Whether the replica closed <paramref name="connection"/>, read under the lock its closes take.</summary>
+    private static bool Closed(HubTestReplica replica, string connection)
+    {
+        lock (replica.Aborted)
+        {
+            return replica.Aborted.Contains(connection);
+        }
+    }
+
     private static string IndexKey => "skein:user-tickets:" + User;
 
-    /// <summary>The second replica with the real re-check service over its own proxied store, on the stand's clock.</summary>
-    private sealed class SecondReplica : IAsyncDisposable
+    private static bool IsProbeOf(string name, object?[] args, string? key) =>
+        name == nameof(IDatabase.SetContainsAsync)
+        && (key is null || (args[1] is RedisValue member && (string?)member == key));
+
+    /// <summary>The real re-check service over the registry of <paramref name="replica"/>, probing through its own proxied store.</summary>
+    private sealed class Sweeper : IAsyncDisposable
     {
-        private SecondReplica(HubTestReplica replica, DbProxy faults, AccessRecheckService service)
+        private readonly SessionPipelineHost _host;
+        private readonly AccessRecheckService _service;
+
+        private Sweeper(SessionPipelineHost host, HubTestReplica replica, DbProxy faults, AccessRecheckService service)
         {
+            _host = host;
             Replica = replica;
             Faults = faults;
-            Service = service;
+            _service = service;
         }
 
         public HubTestReplica Replica { get; }
         public DbProxy Faults { get; }
-        private AccessRecheckService Service { get; }
 
-        public static async Task<SecondReplica> StartAsync(SessionPipelineHost host)
+        public static async Task<Sweeper> StartAsync(SessionPipelineHost host, HubTestReplica replica)
         {
-            var replica = new HubTestReplica(host.Replica.World, host.Time);
             var db = DbProxy.Create(host.Db, out var faults);
             var service = new AccessRecheckService(replica.Registry, replica.Access, replica.HubContext, replica.Nats, host.Time,
                 NullLogger<AccessRecheckService>.Instance, TestRedis.Store(TestRedis.Over(host.Mux, db)));
             await service.StartAsync(CancellationToken.None);
-            return new SecondReplica(replica, faults, service);
+            return new Sweeper(host, replica, faults, service);
+        }
+
+        /// <summary>Moves the clock one period on at a time until <paramref name="seen"/> completes; false after 10 s.</summary>
+        private async Task<bool> TickUntilAsync(Task seen)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (!seen.IsCompleted && DateTime.UtcNow < deadline)
+            {
+                _host.Time.Advance(AccessRecheckService.Interval);
+                await Task.WhenAny(seen, Task.Delay(100));
+            }
+            return seen.IsCompleted;
         }
 
         /// <summary>
-        /// One round of the session sweep: the clock moves one period on and the probe of <paramref name="key"/>
-        /// is awaited (its ownership lookup completed), then the handling of its answer.
+        /// A round in which the probe of <paramref name="key"/> is sent; with <paramref name="failing"/> it fails
+        /// technically. Returns once the probe has been sent (its answer may still be handled).
         /// </summary>
-        public async Task RoundAsync(SessionPipelineHost host, string key)
-        {
-            var probed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            Faults.After = (name, args) =>
-            {
-                if (name == nameof(IDatabase.SetContainsAsync) && args[1] is RedisValue member && (string?)member == key)
-                {
-                    probed.TrySetResult();
-                }
-                return Task.CompletedTask;
-            };
-            host.Time.Advance(AccessRecheckService.Interval);
-            await probed.Task.WaitAsync(TimeSpan.FromSeconds(10));
-            await Task.Delay(50); // the answer of the probe is handled right after
-            Faults.After = null;
-        }
-
-        /// <summary>A round whose probe of <paramref name="key"/> fails technically.</summary>
-        public async Task FailedRoundAsync(SessionPipelineHost host, string key)
+        public async Task RoundAsync(string key, bool failing = false)
         {
             var probed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             Faults.Before = (name, args) =>
             {
-                if (name == nameof(IDatabase.SetContainsAsync) && args[1] is RedisValue member && (string?)member == key)
+                if (!IsProbeOf(name, args, key))
                 {
-                    probed.TrySetResult();
-                    return new InvalidOperationException("injected");
+                    return null;
                 }
-                return null;
+                probed.TrySetResult();
+                return failing ? new InvalidOperationException("injected") : null;
             };
-            host.Time.Advance(AccessRecheckService.Interval);
-            await probed.Task.WaitAsync(TimeSpan.FromSeconds(10));
-            await Task.Delay(50); // the failed probe is handled right after; nothing may close
+            var ran = await TickUntilAsync(probed.Task);
             Faults.Before = null;
+            Assert.True(ran, "precondition: no round probed the key within 10 s");
+        }
+
+        /// <summary>
+        /// Starts the next sweep and reads, at its probe of <paramref name="key"/> (every probe of it fails, so it
+        /// closes nothing), whether <paramref name="connection"/> was closed: a sweep probes each connection
+        /// once and <paramref name="connection"/> is the only one of that key, so this probe belongs to a later
+        /// sweep, and by then every earlier sweep has handled its answers. A closed connection is not probed
+        /// any more; then no such probe comes and the close is read at the end of the wait.
+        /// </summary>
+        public async Task<bool> FenceAsync(string connection, string key)
+        {
+            var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            Faults.Before = (name, args) =>
+            {
+                if (IsProbeOf(name, args, key))
+                {
+                    started.TrySetResult(Closed(Replica, connection));
+                }
+                return IsProbeOf(name, args, key: null) ? new InvalidOperationException("fence") : null;
+            };
+            var ran = await TickUntilAsync(started.Task);
+            Faults.Before = null;
+            if (!ran)
+            {
+                // No sweep probed the key: only possible when its connection is closed.
+                Assert.True(Closed(Replica, connection), "precondition: no sweep probed the key within 10 s");
+                return true;
+            }
+            return await started.Task;
         }
 
         public async ValueTask DisposeAsync()
         {
-            await Service.StopAsync(CancellationToken.None);
-            Service.Dispose();
-            Replica.Dispose();
+            Faults.Before = null;
+            await _service.StopAsync(CancellationToken.None);
+            _service.Dispose();
         }
     }
 
@@ -120,11 +163,9 @@ public sealed class SessionRevocationAcrossReplicasIntegrationTest
     public async Task ARotation_ClosesAtOnceOnTheRotatingReplica_AndOnTheFirstRoundOfTheOther_WhileTheControlLives()
     {
         await using var host = await SessionPipelineHost.StartAsync();
-        var world = host.Replica.World;
-        world.AccessApi.SetUser(User);
-        using var second = new HubTestReplica(world, host.Time);
-        var secondDb = DbProxy.Create(host.Db, out var secondFaults);
-        var secondStore = TestRedis.Store(TestRedis.Over(host.Mux, secondDb));
+        host.Replica.World.AccessApi.SetUser(User);
+        using var second = new HubTestReplica(host.Replica.World, host.Time);
+        await using var sweeper = await Sweeper.StartAsync(host, second);
 
         var (oldCookie, oldKey, _) = await host.SignInAsync(User);
         var (controlCookie, controlKey, _) = await host.SignInAsync(User);
@@ -133,46 +174,28 @@ public sealed class SessionRevocationAcrossReplicasIntegrationTest
         var oldOn2 = await second.ConnectAsync(User, sessionKey: oldKey);
         var controlOn2 = await second.ConnectAsync(User, sessionKey: controlKey);
 
-        using var service2 = new AccessRecheckService(second.Registry, second.Access, second.HubContext, second.Nats, host.Time,
-            NullLogger<AccessRecheckService>.Instance, secondStore);
-        await service2.StartAsync(CancellationToken.None);
-
         // The real rotation on the first replica.
         var rotated = await host.SendAsync($"/test/issue?user={User}", oldCookie);
         Assert.Single(rotated.Sessions(host.CookieName));
-        Assert.Contains(oldOn1, host.Replica.Aborted);
-        Assert.DoesNotContain(oldOn2, second.Aborted);
+        Assert.True(Closed(host.Replica, oldOn1));
+        Assert.False(Closed(second, oldOn2));
 
-        // While the store of the second replica does not answer for that key, the connection stays:
-        // wait for the probe of exactly that key to have run, not for a pause.
-        var probed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        secondFaults.Before = (name, args) =>
-        {
-            if (name == nameof(IDatabase.SetContainsAsync) && args[1] is RedisValue member && (string?)member == oldKey)
-            {
-                probed.TrySetResult();
-                return new InvalidOperationException("injected");
-            }
-            return null;
-        };
-        host.Time.Advance(AccessRecheckService.Interval);
-        await probed.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        await Task.Delay(50); // the failed probe is handled right after; nothing may close
-        Assert.DoesNotContain(oldOn2, second.Aborted);
+        // While the store of the second replica does not answer for that key, the connection stays.
+        await sweeper.RoundAsync(oldKey, failing: true);
+        Assert.False(await sweeper.FenceAsync(oldOn2, oldKey));
 
         // The store answers again: the next round closes it.
-        secondFaults.Before = null;
-        host.Time.Advance(AccessRecheckService.Interval);
-        Assert.True(await UntilAsync(() => second.Aborted.Contains(oldOn2)), "the other replica did not close the old key");
+        await sweeper.RoundAsync(oldKey);
+        Assert.True(await UntilAsync(() => Closed(second, oldOn2)), "the other replica did not close the old key");
 
-        Assert.DoesNotContain(controlOn1, host.Replica.Aborted);
-        Assert.DoesNotContain(controlOn2, second.Aborted);
+        Assert.False(Closed(host.Replica, controlOn1));
+        Assert.False(Closed(second, controlOn2));
         Assert.True(await host.Db.KeyExistsAsync(controlKey));
     }
 
     // SC-006, US-4, E-4: the row of a session expires in Redis — (a) at the end of the session: its window
-    // ends about 300 ms after the read of a request, which sets the row's lifetime to the time left; (b) idle:
-    // the test sets the lifetime to 300 ms. A round while the row lives closes nothing and does not move the
+    // ends about 2 s after the read of a request, which sets the row's lifetime to the time left; (b) idle:
+    // the test sets the lifetime to 2 s. A round while the row lives closes nothing and does not move the
     // lifetime; after the row is gone a probe that fails technically closes nothing; the next successful
     // round closes the connection; the control session of the same user lives.
     [RedisTheory]
@@ -182,92 +205,102 @@ public sealed class SessionRevocationAcrossReplicasIntegrationTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         host.Replica.World.AccessApi.SetUser(User);
-        await using var second = await SecondReplica.StartAsync(host);
+        using var second = new HubTestReplica(host.Replica.World, host.Time);
+        await using var sweeper = await Sweeper.StartAsync(host, second);
         var (cookie, key, _) = await host.SignInAsync(User);
         var (_, controlKey, _) = await host.SignInAsync(User);
-        var connection = await second.Replica.ConnectAsync(User, sessionKey: key);
-        var control = await second.Replica.ConnectAsync(User, sessionKey: controlKey);
+        var connection = await second.ConnectAsync(User, sessionKey: key);
+        var control = await second.ConnectAsync(User, sessionKey: controlKey);
 
         if (ending == "absolute")
         {
-            // A window ending at a whole second (the precision of a stored ticket), read about 300 ms before
-            // that end on a replica clock set to real time.
-            var end = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 2);
+            // A window ending at a whole second (the precision of a stored ticket) 2–3 s ahead, read on a
+            // replica clock set to real time: the read sets the lifetime of the row to the time left.
+            var end = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 3);
             var ticket = TicketSerializer.Default.Deserialize((byte[])(await host.Db.StringGetAsync(key))!)!;
             ticket.Properties.IssuedUtc = end.AddHours(-1);
             ticket.Properties.ExpiresUtc = end;
             await host.Db.StringSetAsync(key, TicketSerializer.Default.Serialize(ticket), TimeSpan.FromMinutes(1));
-            await Task.Delay(end.AddMilliseconds(-300) - DateTimeOffset.UtcNow);
             host.Time.SetUtcNow(DateTimeOffset.UtcNow);
+            var left = end - host.Time.GetUtcNow();
             Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/me", cookie)).Status);
-            var left = await host.Db.KeyTimeToLiveAsync(key);
-            Assert.True(left is { } l && l <= TimeSpan.FromMilliseconds(350),
-                $"precondition: the read did not set the lifetime to the time left ({left})");
+            var lifetime = await host.Db.KeyTimeToLiveAsync(key);
+            Assert.True(lifetime is { } l && l > TimeSpan.Zero && l <= left,
+                $"the read did not set the lifetime to the time left ({lifetime}, {left} left)");
         }
         else
         {
-            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromMilliseconds(300)));
+            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(2)));
         }
         var lifetimeBefore = await host.Db.KeyTimeToLiveAsync(key);
 
-        await second.RoundAsync(host, key);
+        await sweeper.RoundAsync(key);
+        var closedWhileAlive = await sweeper.FenceAsync(connection, key);
 
         var lifetimeAfter = await host.Db.KeyTimeToLiveAsync(key);
-        Assert.True(lifetimeAfter is not null, "precondition: the row expired before the round");
-        Assert.DoesNotContain(connection, second.Replica.Aborted); // the row lives: nothing closes
+        Assert.True(lifetimeAfter is not null, "precondition: the row expired before the round was handled");
+        Assert.False(closedWhileAlive); // the row lives: nothing closes
         Assert.True(lifetimeAfter <= lifetimeBefore, "the probe moved the lifetime of the row");
 
         Assert.True(await UntilAsync(() => !host.Db.KeyExists(key)), "precondition: the row did not expire in Redis");
 
-        await second.FailedRoundAsync(host, key);
-        Assert.DoesNotContain(connection, second.Replica.Aborted); // a failed probe is not an expiry
+        await sweeper.RoundAsync(key, failing: true);
+        Assert.False(await sweeper.FenceAsync(connection, key)); // a failed probe is not an expiry
 
-        host.Time.Advance(AccessRecheckService.Interval);
-        Assert.True(await UntilAsync(() => second.Replica.Aborted.Contains(connection)),
+        await sweeper.RoundAsync(key);
+        Assert.True(await UntilAsync(() => Closed(second, connection)),
             "the first successful round after the row is gone did not close the connection");
 
-        Assert.DoesNotContain(control, second.Replica.Aborted);
+        Assert.False(Closed(second, control));
         Assert.True(await host.Db.KeyExistsAsync(controlKey));
     }
 
-    // US-4, R-1, INV-5: the index member of a live row removed by the test → the next round closes the
-    // connection before the row expires. A reconnect while the index is spoiled (another type) is admitted but
-    // does not restore the member, so the next round closes the new connection again; once the index is
-    // repaired a reconnect restores the member (and, reading the ticket, moves the row's lifetime) and the
-    // next round closes nothing; once the row is gone a reconnect is refused and creates nothing.
+    // US-4, R-1, INV-5, on the connections the hub handshake opens: the index member of a live row removed by
+    // the test → the next round closes the connection before the row expires. A reconnect while the index is
+    // spoiled (another type) is admitted and does not restore the member; the probe through the spoiled index
+    // fails technically, so the round closes nothing; with the spoiled key deleted the round closes the
+    // connection without a member. Once the index is repaired a reconnect restores the member (and, reading
+    // the ticket, moves the row's lifetime) and the next round closes nothing; once the row is gone a
+    // reconnect is refused and creates nothing.
     [RedisFact]
     public async Task ALostIndexMember_ClosesEarly_AReconnectRestoresIt_AndWithoutTheRowNothingIsRestored()
     {
         await using var host = await SessionPipelineHost.StartAsync();
         host.Replica.World.AccessApi.SetUser(User);
-        await using var second = await SecondReplica.StartAsync(host);
+        await using var sweeper = await Sweeper.StartAsync(host, host.Replica);
         var (cookie, key, _) = await host.SignInAsync(User);
-        var first = await second.Replica.ConnectAsync(User, sessionKey: key);
+        var first = Connection(await host.SendAsync("/test/hub", cookie));
 
         // The member of a live row is lost: the round closes the connection early.
         Assert.True(await host.Db.SetRemoveAsync(IndexKey, key));
-        await second.RoundAsync(host, key);
-        Assert.True(await UntilAsync(() => second.Replica.Aborted.Contains(first)), "a connection without its member stayed");
+        await sweeper.RoundAsync(key);
+        Assert.True(await UntilAsync(() => Closed(host.Replica, first)), "a connection without its member stayed");
         Assert.True(await host.Db.KeyExistsAsync(key)); // earlier than the expiry of the row
 
         // A reconnect while the index is of another type: admitted, the member is not restored.
         await host.Db.KeyDeleteAsync(IndexKey);
         await host.Db.StringSetAsync(IndexKey, "not-a-set");
-        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/hub", cookie)).Status);
+        var spoiled = await host.SendAsync("/test/hub", cookie);
+        Assert.Equal(HttpStatusCode.OK, spoiled.Status);
+        var second = Connection(spoiled);
         Assert.Equal(RedisType.String, await host.Db.KeyTypeAsync(IndexKey));
-        var spoiled = await second.Replica.ConnectAsync(User, sessionKey: key);
-        await host.Db.KeyDeleteAsync(IndexKey); // readable again, without the member
-        await second.RoundAsync(host, key);
-        Assert.True(await UntilAsync(() => second.Replica.Aborted.Contains(spoiled)), "the round did not close the new connection");
+
+        // The probe through the spoiled index fails technically: the round closes nothing.
+        await sweeper.RoundAsync(key);
+        Assert.False(await sweeper.FenceAsync(second, key));
+
+        // The spoiled key deleted: the index is readable and has no member, the round closes the connection.
+        await host.Db.KeyDeleteAsync(IndexKey);
+        await sweeper.RoundAsync(key);
+        Assert.True(await UntilAsync(() => Closed(host.Replica, second)), "the round did not close the connection without a member");
 
         // The index repaired: a reconnect reads the ticket, restores the member and moves the row's lifetime.
         Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(60)));
-        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/hub", cookie)).Status);
+        var restored = Connection(await host.SendAsync("/test/hub", cookie));
         Assert.True(await host.Db.SetContainsAsync(IndexKey, key));
         Assert.True(await host.Db.KeyTimeToLiveAsync(key) > TimeSpan.FromHours(1));
-        var restored = await second.Replica.ConnectAsync(User, sessionKey: key);
-        await second.RoundAsync(host, key);
-        Assert.DoesNotContain(restored, second.Replica.Aborted);
+        await sweeper.RoundAsync(key);
+        Assert.False(await sweeper.FenceAsync(restored, key));
 
         // The row gone: the reconnect is refused, registers no connection and creates no row.
         Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromMilliseconds(100)));
