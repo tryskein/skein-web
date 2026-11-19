@@ -161,11 +161,12 @@ public sealed class AuthController : ControllerBase
     /// Side effects:
     /// - Writes the session cookie (<c>__Host-skein.sid</c>; <c>skein.sid</c> in the Development insecure-http mode): HttpOnly, Secure (not in that mode), Path=/, SameSite=Lax.
     /// - Writes a session blob to Redis under <c>skein:session:&lt;sid&gt;</c>
-    ///   with sliding 24h TTL.
+    ///   whose lifetime follows the session limits (idle and absolute).
     /// - Increments <c>skein:login:fail:&lt;email&gt;</c> on failure or DELs on success.
     ///
     /// Logging never includes email or password — sanitiser-friendly.
     /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
+    /// <para>Session lifetime: the new session cookie is persistent and expires at sign-in plus <c>SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS</c> as in effect at sign-in (default 720 h); no request renews it (there is no sliding renewal). The session also ends after <c>SKEIN_SESSION_IDLE_TIMEOUT_HOURS</c> without a request (default 120 h), and earlier if the absolute limit is lowered later; a cookie that outlives its session no longer authenticates.</para>
     /// </remarks>
     /// <param name="req">Login credentials.</param>
     /// <param name="ct">Cancellation token tied to the request.</param>
@@ -198,7 +199,7 @@ public sealed class AuthController : ControllerBase
             "Gone for a non-break-glass account (clients navigate to /oauth2/start) but still lets " +
             "the break-glass admin sign in; a 403 with error=sso_required steers an account to SSO " +
             "without a loop." +
-            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails (type upstream-unavailable, no error member) before the operation, no Set-Cookie.",
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. The new session cookie is persistent and expires at sign-in plus SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS as in effect at sign-in (default 720 h), with no sliding renewal; the session also ends after SKEIN_SESSION_IDLE_TIMEOUT_HOURS without a request (default 120 h). Technical failure of the session store while reading the session → 502 ProblemDetails (type upstream-unavailable, no error member) before the operation, no Set-Cookie.",
         OperationId = "Login")]
     public async Task<ActionResult<UserDto>> Login(
         [FromBody, SwaggerRequestBody("Login credentials", Required = true)] LoginRequest req,

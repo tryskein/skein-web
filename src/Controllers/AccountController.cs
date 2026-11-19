@@ -97,6 +97,7 @@ public sealed class AccountController : ControllerBase
     /// <c>password_weak</c>, <c>password_pwned</c>, <c>email_taken</c>,
     /// <c>username_taken</c> (+ <c>suggestions</c>), <c>invalid_request</c>.
     /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
+    /// <para>Session lifetime: the new session cookie is persistent and expires at sign-in plus <c>SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS</c> as in effect at sign-in (default 720 h); no request renews it (there is no sliding renewal). The session also ends after <c>SKEIN_SESSION_IDLE_TIMEOUT_HOURS</c> without a request (default 120 h), and earlier if the absolute limit is lowered later; a cookie that outlives its session no longer authenticates.</para>
     /// </remarks>
     /// <param name="req">Registration form.</param>
     /// <param name="ct">Request abort.</param>
@@ -121,7 +122,7 @@ public sealed class AccountController : ControllerBase
             "and per client IP (IP only behind a trusted proxy): exceeded → 429 rate_limited " +
             "without calling skein-api. Refusals are ProblemDetails with the skein-api code in " +
             "'error'; username_taken adds 'suggestions'." +
-            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. The new session cookie is persistent and expires at sign-in plus SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS as in effect at sign-in (default 720 h), with no sliding renewal; the session also ends after SKEIN_SESSION_IDLE_TIMEOUT_HOURS without a request (default 120 h). Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "Signup")]
     public async Task<ActionResult<UserDto>> Signup(
         [FromBody, SwaggerRequestBody("Registration form", Required = true)] SignupRequest req,
@@ -277,6 +278,7 @@ public sealed class AccountController : ControllerBase
     /// <c>rate_limited</c>, <c>token_invalid</c>, <c>password_weak</c>,
     /// <c>password_pwned</c>, <c>invalid_request</c>.
     /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
+    /// <para>Session lifetime: the new session cookie is persistent and expires at sign-in plus <c>SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS</c> as in effect at sign-in (default 720 h); no request renews it (there is no sliding renewal). The session also ends after <c>SKEIN_SESSION_IDLE_TIMEOUT_HOURS</c> without a request (default 120 h), and earlier if the absolute limit is lowered later; a cookie that outlives its session no longer authenticates.</para>
     /// </remarks>
     /// <param name="token">Token from the reset link.</param>
     /// <param name="req">The new password.</param>
@@ -305,7 +307,7 @@ public sealed class AccountController : ControllerBase
             "answer is 502 of type password-changed-session-not-issued without a cookie; the password " +
             "and the spent token stay. No answer from skein-api: 502 of type upstream-unavailable. " +
             "Rate limit per client IP only." +
-            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. The new session cookie is persistent and expires at sign-in plus SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS as in effect at sign-in (default 720 h), with no sliding renewal; the session also ends after SKEIN_SESSION_IDLE_TIMEOUT_HOURS without a request (default 120 h). Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "CompletePasswordReset")]
     public async Task<ActionResult> PasswordResetComplete(
         [FromRoute, StringLength(512, MinimumLength = 1), SwaggerParameter("Token from the reset link", Required = true)] string token,
@@ -469,6 +471,7 @@ public sealed class AccountController : ControllerBase
     /// <c>password_pwned</c>, <c>email_taken</c>, <c>username_taken</c>
     /// (+ <c>suggestions</c>), <c>invalid_request</c>.
     /// <para>Session cookie: the session is read from <c>__Host-skein.sid</c> (<c>skein.sid</c> when the Development-only setting <c>SKEIN_ALLOW_INSECURE_HTTP</c> is on) — <c>Secure</c> (not in that mode), <c>HttpOnly</c>, <c>Path=/</c>, no <c>Domain</c>, <c>SameSite=Lax</c>, whatever <c>X-Forwarded-Proto</c> says. A cookie under the other name, or issued before the update, does not authenticate.</para>
+    /// <para>Session lifetime: the new session cookie is persistent and expires at sign-in plus <c>SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS</c> as in effect at sign-in (default 720 h); no request renews it (there is no sliding renewal). The session also ends after <c>SKEIN_SESSION_IDLE_TIMEOUT_HOURS</c> without a request (default 120 h), and earlier if the absolute limit is lowered later; a cookie that outlives its session no longer authenticates.</para>
     /// </remarks>
     /// <param name="token">Token from the invitation link.</param>
     /// <param name="req">Registration form.</param>
@@ -491,7 +494,7 @@ public sealed class AccountController : ControllerBase
             "Forwards to skein-api POST /ui/v1/auth/invitations/{token}/signup. On success the " +
             "user is logged in (a new session key; the key the request carried is revoked first) and the joined space is returned for the " +
             "redirect. Rate limit per client IP only." +
-            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
+            " Session cookie: __Host-skein.sid (skein.sid with the Development-only SKEIN_ALLOW_INSECURE_HTTP), Secure (not in that mode), HttpOnly, Path=/, no Domain, SameSite=Lax, whatever X-Forwarded-Proto says. The new session cookie is persistent and expires at sign-in plus SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS as in effect at sign-in (default 720 h), with no sliding renewal; the session also ends after SKEIN_SESSION_IDLE_TIMEOUT_HOURS without a request (default 120 h). Technical failure of the session store while reading the session → 502 ProblemDetails error=upstream_unavailable before the operation, no Set-Cookie.",
         OperationId = "InvitationSignup")]
     public async Task<ActionResult<InvitationSignupResponse>> InvitationSignup(
         [FromRoute, StringLength(512, MinimumLength = 1), SwaggerParameter("Token from the invitation link", Required = true)] string token,

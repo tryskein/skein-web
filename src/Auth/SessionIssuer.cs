@@ -19,6 +19,13 @@ public sealed record IssuedSession(string Key, bool HadPreviousKey);
 /// </summary>
 /// <remarks>
 /// <para>
+/// Every issue starts a new window (<see cref="SessionWindow.ForSignIn"/>): the issue time is now and
+/// the expiry is now plus the absolute limit, whatever issue or expiry time the caller's properties
+/// or the identity provider's carried; the window of a revoked key is never passed on.
+/// <see cref="AuthenticationProperties.IsPersistent"/> is kept as the caller set it, so a persistent
+/// cookie expires at the end of the new window and an OIDC session keeps a browser-session cookie.
+/// </para>
+/// <para>
 /// Any failure is a <see cref="SessionIssueException"/> without the text of its source and writes no
 /// Set-Cookie of a new session. A failed revocation leaves the previous key alive for its previous
 /// owner (an accepted state): it is never reused and never handed to the new identity.
@@ -39,6 +46,7 @@ public sealed class SessionIssuer(
     SessionCookiePolicy policy,
     TicketDataFormat ticketFormat,
     TimeProvider timeProvider,
+    SessionTimeouts timeouts,
     ILogger<SessionIssuer> logger)
 {
     // The claim the stock cookie handler puts into a cookie when a server-side store is used. It
@@ -58,7 +66,8 @@ public sealed class SessionIssuer(
     /// </summary>
     /// <param name="context">The request.</param>
     /// <param name="principal">The identity to sign in.</param>
-    /// <param name="properties">Properties of the ticket (the remembered SSO pair among them).</param>
+    /// <param name="properties">Properties of the ticket (the remembered SSO pair among them). They
+    /// are copied; their issue and expiry times are replaced by the new window.</param>
     /// <param name="surface">Short stable label of the sign-in path for the log (a surface name, or
     /// the label of the SSO or OIDC path).</param>
     /// <exception cref="SessionIssueException">A second issue on this request, a failed
@@ -89,7 +98,7 @@ public sealed class SessionIssuer(
     }
 
     /// <summary>
-    /// Forbid the late sliding write of Main on this request. Called before the first revocation of
+    /// Forbid any later ticket write of Main on this request. Called before the first revocation of
     /// any sequence that revokes or issues a session, including a sequence whose first step fails.
     /// </summary>
     public void MarkSessionWriteSuppressed(HttpContext context) =>
@@ -174,9 +183,14 @@ public sealed class SessionIssuer(
         bool hadPreviousKey)
     {
         context.Items[IssuedItemsKey] = true;
+        // A copy, so the caller's object is not changed; the window is always the new one.
+        var issued = properties.Clone();
+        var window = SessionWindow.ForSignIn(timeouts, timeProvider.GetUtcNow());
+        issued.IssuedUtc = window.IssuedUtc;
+        issued.ExpiresUtc = window.ExpiresUtc;
         try
         {
-            await context.SignInAsync(SessionSchemes.Issue, principal, properties);
+            await context.SignInAsync(SessionSchemes.Issue, principal, issued);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -190,7 +204,7 @@ public sealed class SessionIssuer(
         // The principal of the rest of this request is the new session's, so a later
         // revocation of "the current session" reaches the new key, not the old one.
         context.User = SessionPrincipal.WithSessionKey(
-            new AuthenticationTicket(principal, properties, SessionSchemes.Issue), key).Principal;
+            new AuthenticationTicket(principal, issued, SessionSchemes.Issue), key).Principal;
 
         logger.LogInformation(
             // The placeholder name avoids words the console formatter masks (key, token, secret…).

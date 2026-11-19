@@ -90,6 +90,7 @@ internal static class TestRedis
         new SessionCookiePolicy(AllowInsecureHttp: true),
         new TicketDataFormat(new Microsoft.AspNetCore.DataProtection.EphemeralDataProtectionProvider().CreateProtector("test")),
         TimeProvider.System,
+        new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours),
         NullLogger<SessionIssuer>.Instance);
 
     public static RedisTicketStore Store(IConnectionMultiplexer mux) =>
