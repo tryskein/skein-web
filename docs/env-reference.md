@@ -331,6 +331,50 @@ default. Changing the mode means restarting both services. The former
 `Authentication__Mode` and `Authentication__Hybrid` settings are gone — if a
 deployment still sets them, they are ignored.
 
+#### `SKEIN_SESSION_IDLE_TIMEOUT_HOURS`
+
+- **Purpose:** the idle limit of a browser session. A session ends when no
+  request has read its ticket for this long. Every request from the browser to
+  skein-web with the session counts, background requests of an open tab
+  included; static files, `/version.json`, `/mcp`, `/agent/v1` and frames of an
+  already open hub connection do not.
+- **Required:** no · **Default:** `120` (5 days) · **Format:** whole number of
+  hours, `1`–`8760`.
+- **If unset:** 120 hours.
+- **If set but empty, not a whole number or out of range:** startup throws
+  `InvalidOperationException` naming the variable.
+- **Larger than `SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS`:** accepted; the process
+  starts and a session ends at the absolute limit.
+- **Changing it:** takes effect when the process restarts with the new
+  environment (in Compose: when the container is recreated). For sessions already
+  issued, the new limit counts from their first request after the restart: that
+  request is let in if the session is still alive under the limit set by its
+  previous request, and the new limit starts from it. A session that has already
+  ended under the old limit does not come back when the limit is raised.
+- **Careful:** every replica must run with the same value; the guarantees above
+  hold only then.
+
+#### `SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS`
+
+- **Purpose:** the absolute limit of a browser session, counted from its sign-in
+  whatever its activity. After it the user signs in again (in an SSO mode,
+  possibly without a password, through the identity provider's own session).
+  A persistent session cookie expires at the end of the session as known when the
+  cookie is issued; there is no sliding renewal.
+- **Required:** no · **Default:** `720` (30 days) · **Format:** whole number of
+  hours, `1`–`8760`.
+- **If unset:** 720 hours.
+- **If set but empty, not a whole number or out of range:** startup throws
+  `InvalidOperationException` naming the variable.
+- **Changing it:** takes effect when the process restarts with the new
+  environment (in Compose: when the container is recreated). Lowering it applies
+  to sessions already issued, from their first request after the restart: a
+  session older than the new limit is no longer signed in. Raising it does not
+  extend a session already issued past sign-in plus the limit in effect at its
+  sign-in. The change itself rewrites nothing.
+- **Careful:** every replica must run with the same value; the guarantees above
+  hold only then.
+
 #### `SKEIN_ALLOW_INSECURE_HTTP`
 
 - **Purpose:** switches the session cookie to the insecure-http shape for local

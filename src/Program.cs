@@ -112,6 +112,14 @@ builder.Services.AddSingleton<SessionStoreMigration>();
 builder.Services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
 builder.Services.AddSingleton<ISessionTicketProbe>(sp => sp.GetRequiredService<RedisTicketStore>());
 
+// Session limits: idle and absolute, in whole hours. Optional (durations, not
+// addresses or secrets), so each has a default; a set-but-invalid value throws
+// here, before the instance-config bootstrap and before the port is bound. The cookie
+// handler, the session store and the per-user index all read this one object.
+// See docs/env-reference.md, section «Authentication».
+var sessionTimeouts = SessionTimeouts.Parse(builder.Configuration);
+builder.Services.AddSingleton(sessionTimeouts);
+
 // ---- Installation settings from skein-api (plan K-12, D-7, E-13) ------------
 // The authentication MODE is skein-api's (SKEIN_AUTH_MODE), not ours: read it
 // here, before builder.Build(), because AddAuthentication must see every scheme
@@ -393,6 +401,11 @@ builder.Services.AddSwaggerGen(c =>
 });
 
 var app = builder.Build();
+
+app.Logger.LogInformation(
+    "Session timeouts in effect: idle {SessionIdleTimeoutHours} h, absolute {SessionAbsoluteTimeoutHours} h",
+    sessionTimeouts.IdleHours,
+    sessionTimeouts.AbsoluteHours);
 
 // Strict migration of the session format: before the first request is served,
 // the session rows of the former format are deleted once per deployment under a
