@@ -299,6 +299,25 @@ internal sealed class Injection
     public bool Fired { get; set; }
 
     /// <summary>
+    /// Fails the script <paramref name="failing"/> of <paramref name="failingKey"/>, with no earlier step to
+    /// wait for: for a request that reads no ticket before that step.
+    /// </summary>
+    public static Injection Fail(DbProxy faults, string failing, string failingKey)
+    {
+        var injection = new Injection { Preceded = true };
+        faults.Before = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, failing, failingKey))
+            {
+                injection.Fired = true;
+                return new InvalidOperationException("injected");
+            }
+            return null;
+        };
+        return injection;
+    }
+
+    /// <summary>
     /// Fails the script <paramref name="failing"/> (of <paramref name="failingKey"/>, when given), and only
     /// once the script <paramref name="preceding"/> (of <paramref name="precedingKey"/>, when given) has
     /// completed in the same stand: the failure belongs to the named step, after the one before it.

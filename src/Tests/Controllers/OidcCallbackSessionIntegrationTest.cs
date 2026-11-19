@@ -200,10 +200,11 @@ public sealed class OidcCallbackSessionIntegrationTest
         var (host, idp) = await StartAsync();
         await using var _ = host;
         var (cookie, old) = await SignInByTicketAsync(host, "own-live");
-        // delete: the revocation of the old key fails after the read of its ticket; write: the issue
-        // script fails after the revocation of the old key was confirmed.
+        // delete: the revocation script of the old key fails (the callback is handled by the remote
+        // scheme before any read of the old ticket, so no read precedes it); write: the issue script
+        // fails after the revocation of the old key was confirmed.
         var injection = failing == "delete"
-            ? Injection.FailAfter(host.Faults, StoreScripts.Revoke, StoreScripts.Read, failingKey: old, precedingKey: old)
+            ? Injection.Fail(host.Faults, StoreScripts.Revoke, old)
             : Injection.FailAfter(host.Faults, StoreScripts.Issue, StoreScripts.Revoke, precedingKey: old);
 
         var (reply, _) = await CallbackAsync(host, idp, "/after", cookie);
