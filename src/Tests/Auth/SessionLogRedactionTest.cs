@@ -100,6 +100,40 @@ public sealed class SessionLogRedactionTest
         }
     }
 
+    // Two reads of one row without a valid window: only the read whose DEL removed the row logs it.
+    [RedisFact]
+    public async Task TwoReadsOfOneRowWithoutAValidWindow_LogOneWarning()
+    {
+        using var mux = TestRedis.Connect();
+        var real = mux.GetDatabase();
+        var formatted = new FormatterLogs();
+        using var factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Trace).AddProvider(formatted));
+        var proxied = DbProxy.Create(real, out var proxy);
+        var store = new RedisTicketStore(TestRedis.Over(mux, proxied), TestRedis.DefaultTimeouts, TimeProvider.System, factory.CreateLogger<RedisTicketStore>());
+        var key = "skein:session:SECRET-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            var withoutExpiry = TestRedis.Ticket(Alice);
+            withoutExpiry.Properties.ExpiresUtc = null;
+            await real.StringSetAsync(key, Microsoft.AspNetCore.Authentication.TicketSerializer.Default.Serialize(withoutExpiry), TimeSpan.FromMinutes(5));
+            // The DEL of the first read is held until the second read has read and deleted the row.
+            var firstDelete = proxy.Hold((name, args) => name == nameof(IDatabase.KeyDeleteAsync));
+
+            var first = store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None);
+            await firstDelete.Reached.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Null(await store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None));
+            Assert.False(await real.KeyExistsAsync(key)); // the second read removed it
+            firstDelete.Release();
+            Assert.Null(await first.WaitAsync(TimeSpan.FromSeconds(10)));
+
+            Assert.Equal(1, WarningsAndAbove(formatted.Output));
+        }
+        finally
+        {
+            await real.KeyDeleteAsync(key);
+        }
+    }
+
     [RedisFact]
     public async Task ARotation_IsLoggedOnceAtInformation_WithTheFlagAndWithoutPersonalData()
     {
