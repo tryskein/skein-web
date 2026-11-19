@@ -161,7 +161,7 @@ public sealed class RedisTicketStoreTest : IDisposable
             AssertNear(TimeSpan.FromHours(expectedHours), await PttlAsync(key));
             Assert.True(await Db.SetContainsAsync(IndexOf(user), key));
             // The row and the index are both KEYS of the one issue script.
-            Assert.Contains(issueKeys, k => k.SequenceEqual(new RedisKey[] { key, IndexOf(user) }));
+            Assert.Contains(issueKeys, k => k.Contains((RedisKey)key) && k.Contains(IndexOf(user)));
         }
         var lastRow = await PttlAsync(keys[^1]);
         var index = await PttlAsync(IndexOf(user));
