@@ -56,8 +56,9 @@ public sealed class SessionRequestState
     public RenewOutcome? RenewOutcome { get; set; }
 
     /// <summary>
-    /// The renewal is an explicit step of the request (the SSO renewal): a technical store failure
-    /// is thrown to the caller instead of being absorbed as <see cref="RenewOutcome.TechnicalFailure"/>.
+    /// The renewal under way is the explicit step of the request (the SSO renewal). The store does
+    /// not depend on it: every renewal is that step, and a technical store failure of a renewal is
+    /// thrown to the caller.
     /// </summary>
     public bool ExplicitRenewal { get; set; }
 

@@ -17,8 +17,16 @@ namespace SkeinWeb.Auth;
 /// <para>
 /// Rows are written straight to Redis, not through <c>IDistributedCache</c>, because the
 /// session rules need atomic decisions: an issue is <c>SET NX</c> (a key is never overwritten),
-/// a renewal is a compare-and-set against the bytes it read (it never creates an absent key and
-/// never changes the owner of a live one), a revocation reads and deletes in one step.
+/// a renewal is a compare-and-set against the bytes it read (it never creates an absent key, never
+/// changes the owner of a live one and never changes the window written at sign-in), a revocation
+/// reads and deletes in one step. The only renewal is the explicit one of the SSO confirmation;
+/// the cookie handler does not renew on its own.
+/// </para>
+/// <para>
+/// WRITE: an issue and a renewal give the row min(idle limit, time left until the end of the
+/// session) in the same script that writes it, together with the reverse index. A renewal whose
+/// session has ended by the time the script runs — by the clock of Redis — deletes the row and
+/// writes nothing.
 /// </para>
 /// <para>
 /// READ: every read checks the window of the ticket (<see cref="SessionWindow.TryRead"/>) and the
@@ -81,11 +89,6 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     /// <summary>Pause before the second attempt of a removal step; doubled before the third.</summary>
     private static readonly TimeSpan RemovalRetryDelay = TimeSpan.FromMilliseconds(100);
 
-    // Replace the row only if it still holds the bytes the renewal read.
-    private const string CompareAndSetScript =
-        "if redis.call('GET', KEYS[1]) == ARGV[1] then " +
-        "redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]) return 1 end return 0";
-
     // Delete the row and hand back what it held: nil = there was no row, integer 1 = a row of
     // a kind this store cannot read (a hash of the former format) was deleted, otherwise the bytes.
     private const string GetAndDeleteScript =
@@ -95,7 +98,8 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
     /// <summary>
     /// Maintenance of the reverse index inside a script that has just written the lifetime of the
-    /// row <c>KEYS[1]</c> (the row exists at this point): adds the member <c>ARGV[2]</c> to the
+    /// row <c>KEYS[1]</c> (the row exists at this point): adds the member — the last argument,
+    /// <c>ARGV[#ARGV]</c>, the session key — to the
     /// index <c>KEYS[2]</c> and gives the index the actual <c>PTTL</c> of the row when the index
     /// has no lifetime or a shorter one. Runs under <c>redis.pcall</c>: a failure returns
     /// <see cref="RowWriteIndexFailed"/> and leaves the written row as it is. Without
@@ -103,7 +107,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     /// </summary>
     private const string IndexMaintain =
         "if #KEYS < 2 then return 1 end " +
-        "local added = redis.pcall('SADD', KEYS[2], ARGV[2]) " +
+        "local added = redis.pcall('SADD', KEYS[2], ARGV[#ARGV]) " +
         "if type(added) == 'table' and added.err then return 2 end " +
         "local row = redis.call('PTTL', KEYS[1]) " +
         "local index = redis.pcall('PTTL', KEYS[2]) " +
@@ -117,6 +121,30 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     // A row that is gone is not recreated and gets no index member.
     private const string ReadLifetimeScript =
         "if redis.call('PEXPIRE', KEYS[1], ARGV[1]) == 0 then return 0 end " + IndexMaintain;
+
+    // The issue: SET NX PX (ARGV[1] the ticket, ARGV[2] milliseconds), then the index. An existing
+    // row (a collision) is left as it is and gets no index member.
+    private const string IssueScript =
+        "if not redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 0 end " + IndexMaintain;
+
+    // The renewal: replace the row only if it still holds the bytes the renewal read (ARGV[1]).
+    // The moment of the write is the clock of Redis: when the end of the session (ARGV[3], Unix
+    // milliseconds) leaves less than 1 ms — the time left rounded down, as in SessionWindow —
+    // the row is deleted and nothing is written; otherwise it gets the new bytes (ARGV[2]) for
+    // min(idle limit ARGV[4] in milliseconds, time left), then the index.
+    private const string CompareAndSetScript =
+        "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 3 end " +
+        "local t = redis.call('TIME') " +
+        "local now = tonumber(t[1]) * 1000 + math.floor((tonumber(t[2]) + 999) / 1000) " +
+        "local left = tonumber(ARGV[3]) - now " +
+        "if left < 1 then redis.call('DEL', KEYS[1]) return 4 end " +
+        "redis.call('SET', KEYS[1], ARGV[2], 'PX', math.min(tonumber(ARGV[4]), left)) " + IndexMaintain;
+
+    /// <summary>Outcome of the renewal script: the row no longer holds the bytes the renewal read; nothing was written.</summary>
+    private const long RenewLost = 3;
+
+    /// <summary>Outcome of the renewal script: the session had ended at the moment of the write; the row was deleted.</summary>
+    private const long RenewEnded = 4;
 
     /// <summary>Outcome of a lifetime-writing script: the row is not there; nothing was written.</summary>
     private const long RowWriteAbsent = 0;
@@ -153,7 +181,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
     /// <inheritdoc />
     public Task RenewAsync(string key, AuthenticationTicket ticket) =>
-        RenewCoreAsync(key, ticket, new SessionRequestState { ExplicitRenewal = true }, CancellationToken.None);
+        RenewCoreAsync(key, ticket, new SessionRequestState(), CancellationToken.None);
 
     /// <inheritdoc />
     public Task<AuthenticationTicket?> RetrieveAsync(string key) =>
@@ -167,10 +195,15 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
     /// <summary>
     /// Persist a freshly issued ticket under a new random key and return the key (the cookie
-    /// value). <c>SET NX</c> with the session lifetime: an existing row is never overwritten. The
-    /// key is recorded in <see cref="SessionRequestState.IssuedKey"/>;
-    /// <see cref="SessionRequestState.RenewOutcome"/> is not set.
+    /// value). <c>SET NX</c> with the row lifetime of <see cref="SessionWindow.TryGetRowLifetime"/>:
+    /// an existing row is never overwritten. The key is recorded in
+    /// <see cref="SessionRequestState.IssuedKey"/>; <see cref="SessionRequestState.RenewOutcome"/>
+    /// is not set.
     /// </summary>
+    /// <exception cref="InvalidOperationException">The ticket has no valid window (<see cref="SessionWindow.TryRead"/>):
+    /// a defect of the caller; nothing is written.</exception>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically, or the session of
+    /// the ticket has already ended; nothing is written.</exception>
     public Task<string> StoreAsync(AuthenticationTicket ticket, HttpContext httpContext, CancellationToken cancellationToken)
     {
         var state = SessionRequestState.Of(httpContext);
@@ -178,12 +211,14 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     }
 
     /// <summary>
-    /// Renew the row of <paramref name="key"/> as the request decided. Never creates an absent
-    /// key and never changes the owner of a live one; the result is in
-    /// <see cref="SessionRequestState.RenewOutcome"/>. A technical failure is absorbed as
-    /// <see cref="RenewOutcome.TechnicalFailure"/> unless <see cref="SessionRequestState.ExplicitRenewal"/>
-    /// is set, in which case it is thrown.
+    /// Renew the row of <paramref name="key"/> (the explicit SSO renewal). Never creates an absent
+    /// key, never changes the owner of a live one and keeps the window of the stored row whatever
+    /// the incoming ticket carries; the result is in <see cref="SessionRequestState.RenewOutcome"/>.
+    /// A session that has ended — before the attempt by the clock of this process, or at the
+    /// moment of the write by the clock of Redis — has its row deleted and is
+    /// <see cref="RenewOutcome.KeyAbsent"/>.
     /// </summary>
+    /// <exception cref="SessionStoreUnavailableException">The store failed technically.</exception>
     public Task RenewAsync(string key, AuthenticationTicket ticket, HttpContext httpContext, CancellationToken cancellationToken)
     {
         var state = SessionRequestState.Of(httpContext);
@@ -236,6 +271,17 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     {
         ct.ThrowIfCancellationRequested();
         var stored = StripPairMarker(ticket);
+        if (!SessionWindow.TryRead(stored.Properties, out var window))
+        {
+            throw new InvalidOperationException("A session ticket is issued without a valid window.");
+        }
+        if (!window.TryGetRowLifetime(_timeouts, _time.GetUtcNow(), out var lifetime))
+        {
+            // Unreachable with an absolute limit of at least 1 h; refused like a failed issue.
+            _logger.LogWarning("session issue refused: the session of the ticket has already ended");
+            throw new SessionStoreUnavailableException();
+        }
+
         try
         {
             var db = _redis.GetDatabase();
@@ -243,12 +289,20 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             {
                 var key = KeyPrefix + NewSessionId();
                 var bytes = TicketSerializer.Default.Serialize(SessionPrincipal.WithSessionKey(stored, key));
-                if (await db.StringSetAsync(key, bytes, SessionLifetime, When.NotExists).WaitAsync(ct))
+                var outcome = (long)await db.ScriptEvaluateAsync(
+                    IssueScript,
+                    LifetimeKeys(key, stored),
+                    [(RedisValue)bytes, (RedisValue)(long)lifetime.TotalMilliseconds, (RedisValue)key]).WaitAsync(ct);
+                if (outcome == RowWriteAbsent)
                 {
-                    state.IssuedKey = key;
-                    await TryIndexAsync(ticket, key);
-                    return key;
+                    continue; // the key is taken
                 }
+                state.IssuedKey = key;
+                if (outcome == RowWriteIndexFailed)
+                {
+                    LogIndexFailure("store");
+                }
+                return key;
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -272,7 +326,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
         try
         {
-            state.RenewOutcome = await TryRenewAsync(key, ticket, state.ExplicitRenewal, ct);
+            state.RenewOutcome = await TryRenewAsync(key, ticket, ct);
         }
         catch (RedisServerException ex) when (IsWrongType(ex))
         {
@@ -282,15 +336,11 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             LogFailure("renew", ex);
-            if (state.ExplicitRenewal)
-            {
-                throw new SessionStoreUnavailableException();
-            }
-            state.RenewOutcome = RenewOutcome.TechnicalFailure;
+            throw new SessionStoreUnavailableException();
         }
     }
 
-    private async Task<RenewOutcome> TryRenewAsync(string key, AuthenticationTicket ticket, bool explicitRenewal, CancellationToken ct)
+    private async Task<RenewOutcome> TryRenewAsync(string key, AuthenticationTicket ticket, CancellationToken ct)
     {
         var db = _redis.GetDatabase();
         var newOwner = TryReadUserId(ticket.Principal);
@@ -313,21 +363,36 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
                 return RenewOutcome.OwnerMismatch;
             }
 
-            // An explicit renewal (the SSO confirmation) writes the claims it confirmed. An automatic one
-            // (the sliding renewal of the cookie handler) only moves the expiry: its ticket is a clone
-            // of a read made earlier in the request and must not roll back claims a parallel
-            // confirmation wrote since.
-            var merged = SessionPrincipal.WithSessionKey(
-                explicitRenewal ? MergePair(ticket, stored) : ExtendOnly(ticket, stored), key);
-            var bytes = TicketSerializer.Default.Serialize(merged);
-            var result = await db.ScriptEvaluateAsync(
-                CompareAndSetScript,
-                [(RedisKey)key],
-                [(RedisValue)current, (RedisValue)bytes, (RedisValue)(long)SessionLifetime.TotalSeconds]).WaitAsync(ct);
-            if ((long)result == 1)
+            // The window is the one written at sign-in; a session without a valid one, or one that has
+            // ended by the clock of this process, is gone. The script decides again at the moment of the write.
+            if (!SessionWindow.TryRead(stored.Properties, out var window)
+                || !window.TryGetRowLifetime(_timeouts, _time.GetUtcNow(), out _))
             {
-                await TryIndexAsync(ticket, key);
-                return RenewOutcome.Written;
+                await db.KeyDeleteAsync(key).WaitAsync(ct);
+                return RenewOutcome.KeyAbsent;
+            }
+
+            var merged = SessionPrincipal.WithSessionKey(MergePair(ticket, stored, window), key);
+            var bytes = TicketSerializer.Default.Serialize(merged);
+            var outcome = (long)await db.ScriptEvaluateAsync(
+                CompareAndSetScript,
+                LifetimeKeys(key, stored),
+                [
+                    (RedisValue)current,
+                    (RedisValue)bytes,
+                    (RedisValue)window.SessionEnd(_timeouts).ToUnixTimeMilliseconds(),
+                    (RedisValue)(_timeouts.Idle.Ticks / TimeSpan.TicksPerMillisecond),
+                    (RedisValue)key,
+                ]).WaitAsync(ct);
+            switch (outcome)
+            {
+                case RowWriteIndexed:
+                    return RenewOutcome.Written;
+                case RowWriteIndexFailed:
+                    LogIndexFailure("renew");
+                    return RenewOutcome.Written;
+                case RenewEnded:
+                    return RenewOutcome.KeyAbsent;
             }
         }
 
@@ -335,14 +400,17 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     }
 
     /// <summary>
-    /// The ticket to write on a renewal. With <see cref="SsoPairWriteMarker"/> the pair of
-    /// <paramref name="incoming"/> is an explicit confirmation and replaces the stored one;
-    /// without it the pair is the one already stored (the incoming properties are a clone of an
-    /// older read and must not overwrite a newer confirmation). The marker is never kept.
+    /// The ticket to write on a renewal: the incoming principal and properties, with the window of
+    /// the stored row (<paramref name="window"/>, never the incoming one). With
+    /// <see cref="SsoPairWriteMarker"/> the pair of <paramref name="incoming"/> is an explicit
+    /// confirmation and replaces the stored one; without it the pair is the one already stored. The
+    /// marker is never kept.
     /// </summary>
-    private static AuthenticationTicket MergePair(AuthenticationTicket incoming, AuthenticationTicket stored)
+    private static AuthenticationTicket MergePair(AuthenticationTicket incoming, AuthenticationTicket stored, SessionWindow window)
     {
         var properties = incoming.Properties.Clone();
+        properties.IssuedUtc = window.IssuedUtc;
+        properties.ExpiresUtc = window.ExpiresUtc;
         var confirmed = properties.Items.Remove(SsoPairWriteMarker);
         if (!confirmed)
         {
@@ -357,24 +425,6 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             }
         }
         return new AuthenticationTicket(incoming.Principal, properties, incoming.AuthenticationScheme);
-    }
-
-    /// <summary>
-    /// The row as it is stored now, with its window (IssuedUtc and ExpiresUtc, always together: the cookie
-    /// handler measures the window as their difference) replaced by the incoming one only when the incoming
-    /// window ends later. Never earlier than what a parallel writer set, and never a window of another length.
-    /// </summary>
-    private static AuthenticationTicket ExtendOnly(AuthenticationTicket incoming, AuthenticationTicket stored)
-    {
-        var properties = stored.Properties.Clone();
-        properties.Items.Remove(SsoPairWriteMarker);
-        if (incoming.Properties.ExpiresUtc is { } incomingExpiry
-            && (properties.ExpiresUtc is not { } storedExpiry || incomingExpiry > storedExpiry))
-        {
-            properties.ExpiresUtc = incomingExpiry;
-            properties.IssuedUtc = incoming.Properties.IssuedUtc;
-        }
-        return new AuthenticationTicket(stored.Principal, properties, stored.AuthenticationScheme);
     }
 
     private static AuthenticationTicket StripPairMarker(AuthenticationTicket ticket)
