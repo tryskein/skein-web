@@ -38,11 +38,16 @@ public interface IProjectDeliveryGate
 /// lock, so a slow skein-api does not delay it — closes the connections whose
 /// session ticket is gone or now belongs to another user
 /// (<see cref="ISessionTicketProbe"/>,
-/// on every replica): a session revoked by skein-api, signed out, or removed
-/// by a password reset stops receiving frames within <see cref="Interval"/>.
-/// The replica that ends the session closes its own connections at once
-/// (<see cref="SessionRevocation.EndSessionAsync"/>). The store unreachable —
-/// nothing is closed in that run.</para>
+/// on every replica). Whatever ended the session — revoked by skein-api, signed
+/// out, removed by a password reset, or its row expired in Redis by either
+/// limit — a connection on this replica is closed by the first successful probe
+/// of that connection after the row is gone. <see cref="Interval"/> is the
+/// nominal period of the sweep, not an upper bound on the close: a probe that
+/// fails technically (the store unreachable) closes nothing in that run, and the
+/// first probe that succeeds afterwards closes it. A connection whose key has
+/// lost its member of the user's index may be closed earlier. The replica that
+/// ends the session closes its own connections at once
+/// (<see cref="SessionRevocation.EndSessionAsync"/>).</para>
 /// <para><b>Fail-closed.</b> A check that fails (<see cref="SkeinServiceApiClient"/>
 /// throws <see cref="HttpRequestException"/>, <see cref="TimeoutException"/>
 /// or <see cref="OperationCanceledException"/>) changes nothing by itself; but

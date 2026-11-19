@@ -138,8 +138,9 @@ public sealed class SessionIssuer(
 
     /// <summary>
     /// Revoke the session key the request carried (<see cref="IncomingSessionKey"/>) and close this
-    /// replica's hub connections opened with it; other replicas close theirs on their next access
-    /// re-check. Called on its own only by the password-reset sequence.
+    /// replica's hub connections opened with it; other replicas close theirs at the first successful
+    /// access re-check of each connection after the key is gone (a re-check that fails closes nothing).
+    /// Called on its own only by the password-reset sequence.
     /// </summary>
     /// <returns>True when the request carried a readable key.</returns>
     /// <exception cref="SessionIssueException">The revocation failed.</exception>

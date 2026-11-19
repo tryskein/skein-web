@@ -302,7 +302,8 @@ public sealed class AccountController : ControllerBase
             "Every session of the user ends and the key of the cookie the request carried is revoked, " +
             "whoever it belongs to; then a new session with a NEW key is issued (204 with Set-Cookie, " +
             "whatever cookie came in). This replica's hub connections of the user are closed at once " +
-            "(other replicas close theirs on the next access re-check, within 30 s). If the password " +
+            "(other replicas close each of theirs at the first successful re-check of that connection after the session is gone; " +
+            "the re-check period is nominal, not an upper bound, and a re-check that fails closes nothing). If the password " +
             "is changed but the sessions cannot all be removed or the new one cannot be issued, the " +
             "answer is 502 of type password-changed-session-not-issued without a cookie; the password " +
             "and the spent token stay. No answer from skein-api: 502 of type upstream-unavailable. " +

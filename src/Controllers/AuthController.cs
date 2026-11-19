@@ -473,9 +473,9 @@ public sealed class AuthController : ControllerBase
         // from "always forward the CancellationToken".
         // Signs out of the cookie scheme (cookie deleted, Redis ticket removed)
         // and closes this replica's hub connections opened with the session, so
-        // an open tab stops receiving hub frames at logout rather than at the
-        // next access re-check. Other replicas close theirs when that re-check
-        // finds the ticket gone.
+        // an open tab stops receiving hub frames at logout rather than at a
+        // later access re-check. Other replicas close theirs at the first
+        // successful re-check of each connection that finds the ticket gone.
         await SessionRevocation.EndSessionAsync(HttpContext);
         _logger.LogInformation("logout for {UserId}", userId);
 
