@@ -126,13 +126,16 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     private const string IssueScript =
         "if not redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 0 end " + IndexMaintain;
 
-    // The renewal: replace the row only if it still holds the bytes the renewal read (ARGV[1]).
+    // The renewal: replace the row only if it still holds the bytes the renewal read (ARGV[1]); a row
+    // that is gone is reported as such, apart from a row that holds other bytes.
     // The moment of the write is the clock of Redis: when the end of the session (ARGV[3], Unix
     // milliseconds) leaves less than 1 ms — the time left rounded down, as in SessionWindow —
     // the row is deleted and nothing is written; otherwise it gets the new bytes (ARGV[2]) for
     // min(idle limit ARGV[4] in milliseconds, time left), then the index.
     private const string CompareAndSetScript =
-        "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 3 end " +
+        "local current = redis.call('GET', KEYS[1]) " +
+        "if not current then return 5 end " +
+        "if current ~= ARGV[1] then return 3 end " +
         "local t = redis.call('TIME') " +
         "local now = tonumber(t[1]) * 1000 + math.floor((tonumber(t[2]) + 999) / 1000) " +
         "local left = tonumber(ARGV[3]) - now " +
@@ -154,6 +157,9 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
     /// <summary>Outcome of the renewal script: the session had ended at the moment of the write; the row was deleted.</summary>
     private const long RenewEnded = 4;
+
+    /// <summary>Outcome of the renewal script: the row is gone; nothing was written.</summary>
+    private const long RenewAbsent = 5;
 
     /// <summary>Outcome of a lifetime-writing script: the row is not there; nothing was written.</summary>
     private const long RowWriteAbsent = 0;
@@ -402,6 +408,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
                     LogIndexFailure("renew");
                     return RenewOutcome.Written;
                 case RenewEnded:
+                case RenewAbsent:
                     return RenewOutcome.KeyAbsent;
             }
         }
