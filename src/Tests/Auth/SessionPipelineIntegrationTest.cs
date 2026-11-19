@@ -164,13 +164,6 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         services.AddSkeinAuthentication(WebAuthMode.FromApi(apiAuthMode, oidcAuthority: null), new SsoOptions());
         services.AddSingleton(proxies);
         services.AddTransient<SessionStoreFailureMiddleware>();
-        // The cookie handler's expiry check reads the same clock the test moves.
-        foreach (var scheme in new[] { SessionSchemes.Main, SessionSchemes.Issue })
-        {
-            services.PostConfigure<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>(
-                scheme, o => o.TimeProvider = time);
-        }
-
         var app = builder.Build();
         var world = replica.World;
 
@@ -354,6 +347,15 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
     public sealed record Reply(HttpStatusCode Status, string Body, IReadOnlyList<SetCookie> Cookies)
     {
         public IReadOnlyList<SetCookie> Sessions(string name) => Cookies.Where(c => c.Name == name && !c.IsDeletion).ToList();
+
+        /// <summary>
+        /// Every Set-Cookie of a session cookie, deletions included, under the name of either mode
+        /// and any chunk of it.
+        /// </summary>
+        public IReadOnlyList<SetCookie> SessionWrites() => Cookies
+            .Where(c => c.Name.StartsWith(SessionCookiePolicy.SecureCookieName, StringComparison.Ordinal)
+                || c.Name.StartsWith(SessionCookiePolicy.InsecureCookieName, StringComparison.Ordinal))
+            .ToList();
     }
 
     public async Task<Reply> SendAsync(string path, string? cookie = null, HttpMethod? method = null,
@@ -410,7 +412,7 @@ public sealed class SessionPipelineIntegrationTest
         var raw = set.Raw.ToLowerInvariant();
         Assert.Equal(host.CookieName, set.Name);
         Assert.Contains("httponly", raw);
-        Assert.Contains("path=/", raw);
+        Assert.Equal("/", AttributeOf(set, "path"));
         Assert.Contains("samesite=lax", raw);
         Assert.DoesNotContain("domain=", raw);
         if (host.Policy.AllowInsecureHttp)
@@ -475,7 +477,7 @@ public sealed class SessionPipelineIntegrationTest
             var reply = await host.SendAsync("/test/me", cookie);
 
             Assert.Equal(HttpStatusCode.OK, reply.Status);
-            Assert.Empty(reply.Sessions(host.CookieName));
+            Assert.Empty(reply.SessionWrites());
             Assert.Equal(written, (byte[]?)await host.Db.StringGetAsync(key));
         }
     }
@@ -529,19 +531,31 @@ public sealed class SessionPipelineIntegrationTest
         else
         {
             Assert.Null(expires);
+            Assert.Null(AttributeOf(set, "max-age"));
         }
     }
 
     /// <summary>The <c>expires</c> attribute of a Set-Cookie, or null when it has none.</summary>
-    internal static DateTimeOffset? ExpiresOf(SessionPipelineHost.SetCookie set)
+    internal static DateTimeOffset? ExpiresOf(SessionPipelineHost.SetCookie set) =>
+        AttributeOf(set, "expires") is { } value
+            ? DateTimeOffset.Parse(value, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal)
+            : null;
+
+    /// <summary>
+    /// The value of the attribute <paramref name="name"/> of a Set-Cookie (names compared without
+    /// regard to case), an empty string for a flag attribute, or null when the cookie has none.
+    /// </summary>
+    internal static string? AttributeOf(SessionPipelineHost.SetCookie set, string name)
     {
         foreach (var part in set.Raw.Split(';').Skip(1))
         {
             var attribute = part.Trim();
-            if (attribute.StartsWith("expires=", StringComparison.OrdinalIgnoreCase))
+            var eq = attribute.IndexOf('=');
+            var attributeName = eq < 0 ? attribute : attribute[..eq].TrimEnd();
+            if (string.Equals(attributeName, name, StringComparison.OrdinalIgnoreCase))
             {
-                return DateTimeOffset.Parse(attribute["expires=".Length..], System.Globalization.CultureInfo.InvariantCulture,
-                    System.Globalization.DateTimeStyles.AssumeUniversal);
+                return eq < 0 ? "" : attribute[(eq + 1)..].Trim();
             }
         }
         return null;
