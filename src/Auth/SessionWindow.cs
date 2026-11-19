@@ -63,13 +63,22 @@ public readonly record struct SessionWindow(DateTimeOffset IssuedUtc, DateTimeOf
     public DateTimeOffset SessionEnd(SessionTimeouts timeouts)
     {
         ArgumentNullException.ThrowIfNull(timeouts);
-        var byCurrentLimit = IssuedUtc + timeouts.Absolute;
-        return byCurrentLimit < ExpiresUtc ? byCurrentLimit : ExpiresUtc;
+        // Compared through the written span rather than by adding the limit first:
+        // IssuedUtc + limit may lie past DateTimeOffset.MaxValue while the written
+        // expiry is representable, and when the limit is shorter than that span the
+        // sum is earlier than ExpiresUtc and so representable too.
+        return timeouts.Absolute < ExpiresUtc - IssuedUtc
+            ? IssuedUtc + timeouts.Absolute
+            : ExpiresUtc;
     }
 
     /// <summary>
     /// Whether the session has ended at <paramref name="now"/>: at its end and
     /// later it does not authenticate.
+    /// <para>During the last millisecond before the end (a time left greater than
+    /// 0 and shorter than 1 ms) the session has not ended yet, while
+    /// <see cref="TryGetRowLifetime"/> already reports «ended», because it counts
+    /// the time left in whole milliseconds rounded down.</para>
     /// </summary>
     /// <param name="timeouts">The limits in effect at the moment of the request.</param>
     /// <param name="now">The moment of the check.</param>
