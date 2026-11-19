@@ -63,7 +63,8 @@ public sealed class OidcCallbackSessionIntegrationTest
     }
 
     private static async Task<(SurfacesHost Host, FakeIdp Idp)> StartAsync(
-        Action<IServiceCollection>? extra = null, bool useTokenLifetime = false)
+        Action<IServiceCollection>? extra = null, bool useTokenLifetime = false,
+        Action<Microsoft.AspNetCore.Authentication.AuthenticationProperties?>? onTicket = null)
     {
         var idp = new FakeIdp();
         var sso = new SsoOptions();
@@ -78,6 +79,16 @@ public sealed class OidcCallbackSessionIntegrationTest
             {
                 // On: the handler puts the token's lifetime into the properties it hands the issuer.
                 options.UseTokenLifetime = useTokenLifetime;
+                if (onTicket is not null)
+                {
+                    // Sees the properties the handler hands on, then lets the service's own event run.
+                    var issue = options.Events.OnTicketReceived;
+                    options.Events.OnTicketReceived = ctx =>
+                    {
+                        onTicket(ctx.Properties);
+                        return issue(ctx);
+                    };
+                }
                 options.Backchannel = new HttpClient(idp);
                 options.ConfigurationManager = new StaticConfigurationManager<OpenIdConnectConfiguration>(new OpenIdConnectConfiguration
                 {
@@ -231,12 +242,13 @@ public sealed class OidcCallbackSessionIntegrationTest
     private const int AbsoluteHours = 11;
 
     private static Task<(SurfacesHost Host, FakeIdp Idp)> StartWithClockAsync(
-        Microsoft.Extensions.Time.Testing.FakeTimeProvider clock, bool useTokenLifetime) =>
+        Microsoft.Extensions.Time.Testing.FakeTimeProvider clock, bool useTokenLifetime,
+        Action<Microsoft.AspNetCore.Authentication.AuthenticationProperties?>? onTicket = null) =>
         StartAsync(services =>
         {
             services.AddSingleton<TimeProvider>(clock);
             services.AddSingleton(new SessionTimeouts(120, AbsoluteHours));
-        }, useTokenLifetime);
+        }, useTokenLifetime, onTicket);
 
     private static Microsoft.Extensions.Time.Testing.FakeTimeProvider WholeSecondClock() =>
         new(DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
@@ -253,15 +265,24 @@ public sealed class OidcCallbackSessionIntegrationTest
     public async Task Callback_SetsABrowserSessionCookie_AndAWindowFromTheSettings_WhateverTheProviderProperties(bool useTokenLifetime)
     {
         var clock = WholeSecondClock();
-        var (host, idp) = await StartWithClockAsync(clock, useTokenLifetime);
+        DateTimeOffset? handedExpiry = null;
+        var (host, idp) = await StartWithClockAsync(clock, useTokenLifetime, p => handedExpiry = p?.ExpiresUtc);
         await using var _ = host;
         var issuedAt = clock.GetUtcNow();
 
+        var before = DateTimeOffset.UtcNow;
         var (reply, _) = await CallbackAsync(host, idp, "/after", incoming: null);
+        var after = DateTimeOffset.UtcNow;
 
         Assert.Equal(HttpStatusCode.Redirect, reply.Status);
+        // Precondition of the arm: with the token lifetime on, the handler hands the issuer the
+        // token's exp (5 min after it is made, whole seconds); off, it does not.
+        var tokenExpiry = handedExpiry is { } h
+            && h >= before.AddMinutes(5).AddSeconds(-1) && h <= after.AddMinutes(5).AddSeconds(1);
+        Assert.Equal(useTokenLifetime, tokenExpiry);
         var set = Assert.Single(reply.Sessions(host.CookieName));
-        Assert.DoesNotContain("expires=", set.Raw, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(SessionPipelineIntegrationTest.ExpiresOf(set));
+        Assert.Null(SessionPipelineIntegrationTest.AttributeOf(set, "max-age"));
         var row = await RowPropertiesAsync(host, host.KeyOf(set));
         Assert.Equal(issuedAt, row.IssuedUtc);
         Assert.Equal(issuedAt.AddHours(AbsoluteHours), row.ExpiresUtc);
@@ -274,12 +295,13 @@ public sealed class OidcCallbackSessionIntegrationTest
         var clock = WholeSecondClock();
         var (host, idp) = await StartWithClockAsync(clock, useTokenLifetime: false);
         await using var _ = host;
-        var tenDaysAgo = clock.GetUtcNow().AddDays(-10);
+        // The old session's window: earlier than the new one and still live under the stand's limit.
+        var twoHoursAgo = clock.GetUtcNow().AddHours(-2);
         var principal = SessionPrincipal.Create(
             new UserDto(A.ToString(), "a@x.io", "alice", "alice", "user", null, null, false), 3);
         var old = await host.Services.GetRequiredService<RedisTicketStore>().StoreAsync(
             new Microsoft.AspNetCore.Authentication.AuthenticationTicket(principal,
-                new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IssuedUtc = tenDaysAgo, ExpiresUtc = tenDaysAgo.AddHours(720) },
+                new Microsoft.AspNetCore.Authentication.AuthenticationProperties { IssuedUtc = twoHoursAgo, ExpiresUtc = twoHoursAgo.AddHours(AbsoluteHours) },
                 SessionSchemes.Issue),
             new Microsoft.AspNetCore.Http.DefaultHttpContext(), CancellationToken.None);
         var cookie = CookieFor(host, old);
