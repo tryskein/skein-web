@@ -68,12 +68,15 @@ public sealed class SessionExpiryPipelineTest
         var (_, control, _) = await host.SignInAsync(Alice);
         await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(2));
         await host.Db.KeyExpireAsync(control, TimeSpan.FromMinutes(5));
+        var controlBefore = await PttlAsync(host, control);
 
         var reply = await host.SendAsync("/test/me", cookie);
 
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         AssertNear(host.Timeouts.Idle, await PttlAsync(host, key));
-        Assert.InRange(await PttlAsync(host, control), 1, (long)TimeSpan.FromMinutes(5).TotalMilliseconds);
+        // The other session's lifetime is the one it had, minus the time that passed: not written again.
+        var controlAfter = await PttlAsync(host, control);
+        Assert.InRange(controlAfter, controlBefore - 2000, controlBefore);
     }
 
     [RedisFact]
@@ -157,12 +160,12 @@ public sealed class SessionExpiryPipelineTest
     // ---- One source of the three lifetimes (row 44) -------------------------------------------
 
     [RedisTheory]
-    [InlineData(7, 13)]
-    [InlineData(30, 11)]
-    public async Task TheCookieExpiry_TheRowAndTheIndexLifetimes_AllComeFromTheRegisteredLimits(int idle, int absolute)
+    [InlineData(7, 13, 7)]
+    [InlineData(30, 11, 11)]
+    public async Task TheCookieExpiry_TheRowAndTheIndexLifetimes_AllComeFromTheRegisteredLimits(int idle, int absolute, int rowHours)
     {
         await using var host = await SessionPipelineHost.StartAsync(timeouts: new SessionTimeouts(idle, absolute));
-        var row = TimeSpan.FromHours(Math.Min(idle, absolute));
+        var row = TimeSpan.FromHours(rowHours);
 
         var reply = await host.SendAsync($"/test/issue?user={Alice}&persistent=true");
 
