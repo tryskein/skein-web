@@ -85,6 +85,7 @@ public class SessionCookiePolicyTest
         services.AddDataProtection();
         services.AddSingleton(new SessionCookiePolicy(insecure));
         services.AddSingleton(new RedisTicketStore(new Mock<IConnectionMultiplexer>().Object, NullLogger<RedisTicketStore>.Instance));
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(WebAuthMode.FromApi("local", null), new SsoOptions());
         using var provider = services.BuildServiceProvider();
         var options = provider.GetRequiredService<IOptionsMonitor<CookieAuthenticationOptions>>();

@@ -95,6 +95,7 @@ public class SessionIssuerFailureTest
         services.AddSingleton<RedisTicketStore>();
         services.AddSingleton(new ConnectionRegistry(time));
         services.AddSingleton<SessionIssuer>();
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(WebAuthMode.FromApi("local", null), new SsoOptions());
         var provider = services.BuildServiceProvider();
         return new World

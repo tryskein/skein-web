@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.IdentityModel.Protocols.OpenIdConnect;
 
 namespace SkeinWeb.Auth;
@@ -335,19 +336,24 @@ public static class AuthenticationRegistration
             });
         }
 
-        // The cookie name and Secure come from the policy, the store and the ticket format
-        // from DI; both are resolved on first use, after the service provider is built. The
-        // two schemes share the store and the ticket format (one purpose, so a value issued
-        // by an earlier version is rejected whatever its cookie name); they differ only in
-        // the cookie manager: Main reads the incoming cookie, Issue never does.
+        // The cookie name and Secure come from the policy, the lifetime from the session
+        // limits, the store, the ticket format and the clock from DI; all are resolved on first
+        // use, after the service provider is built. The two schemes share the store, the ticket
+        // format (one purpose, so a value issued by an earlier version is rejected whatever its
+        // cookie name) and the clock (the same one the store and the issuer use); they differ
+        // only in the cookie manager: Main reads the incoming cookie, Issue never does. The
+        // clock is the process one unless the host registered its own.
+        services.TryAddSingleton(TimeProvider.System);
         services.AddSingleton(sp => new TicketDataFormat(
             sp.GetRequiredService<IDataProtectionProvider>().CreateProtector("Skein.Session.Cookie", "v3")));
         services.AddOptions<CookieAuthenticationOptions>(SessionSchemes.Main)
-            .Configure<RedisTicketStore, SessionCookiePolicy, TicketDataFormat>((opts, store, policy, format) =>
-                ConfigureSessionCookie(opts, store, policy, format, new SessionCookieManager(new ChunkingCookieManager())));
+            .Configure<RedisTicketStore, SessionCookiePolicy, TicketDataFormat, SessionTimeouts, TimeProvider>(
+                (opts, store, policy, format, timeouts, clock) => ConfigureSessionCookie(
+                    opts, store, policy, format, timeouts, clock, new SessionCookieManager(new ChunkingCookieManager())));
         services.AddOptions<CookieAuthenticationOptions>(SessionSchemes.Issue)
-            .Configure<RedisTicketStore, SessionCookiePolicy, TicketDataFormat>((opts, store, policy, format) =>
-                ConfigureSessionCookie(opts, store, policy, format, new IssueCookieManager(new ChunkingCookieManager())));
+            .Configure<RedisTicketStore, SessionCookiePolicy, TicketDataFormat, SessionTimeouts, TimeProvider>(
+                (opts, store, policy, format, timeouts, clock) => ConfigureSessionCookie(
+                    opts, store, policy, format, timeouts, clock, new IssueCookieManager(new ChunkingCookieManager())));
 
         return authBuilder;
     }
@@ -360,8 +366,6 @@ public static class AuthenticationRegistration
         options.Cookie.HttpOnly = true;
         options.Cookie.SameSite = SameSiteMode.Lax;
         options.Cookie.Path = "/";
-        options.ExpireTimeSpan = TimeSpan.FromHours(24);
-        options.SlidingExpiration = true;
 
         options.Events.OnRedirectToLogin = ctx =>
         {
@@ -377,14 +381,21 @@ public static class AuthenticationRegistration
 
     // The name and Secure come from the policy, never from the request scheme or from
     // X-Forwarded-Proto. No Domain: with Path=/ and Secure that is what the __Host- prefix
-    // requires.
+    // requires. No sliding renewal: the window of a ticket (issued = sign-in, expires =
+    // sign-in + the absolute limit) is set at sign-in and never moved by a request; a ticket
+    // is written only at sign-in and on an explicit SSO renewal of the same key.
     private static void ConfigureSessionCookie(
         CookieAuthenticationOptions options,
         RedisTicketStore store,
         SessionCookiePolicy policy,
         TicketDataFormat format,
+        SessionTimeouts timeouts,
+        TimeProvider clock,
         ICookieManager manager)
     {
+        options.SlidingExpiration = false;
+        options.ExpireTimeSpan = timeouts.Absolute;
+        options.TimeProvider = clock;
         options.Cookie.Name = policy.CookieName;
         options.Cookie.SecurePolicy = policy.Secure ? CookieSecurePolicy.Always : CookieSecurePolicy.None;
         options.SessionStore = store;

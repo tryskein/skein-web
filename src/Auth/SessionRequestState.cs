@@ -1,6 +1,6 @@
 namespace SkeinWeb.Auth;
 
-/// <summary>How the late renewal of a session row ended; set only when a renewal was attempted.</summary>
+/// <summary>How the explicit SSO renewal of a session row ended; set only when a renewal was attempted.</summary>
 public enum RenewOutcome
 {
     /// <summary>The row was written (extended, claims and the remembered SSO pair merged).</summary>
@@ -43,8 +43,9 @@ public sealed class SessionRequestState
     }
 
     /// <summary>
-    /// The request revoked or issued a session, so the late sliding write of Main must neither
-    /// touch the store nor add a Set-Cookie. Set before the first store call of such a sequence.
+    /// The request revoked or issued a session, so a later ticket write of Main (an explicit SSO
+    /// renewal) must neither touch the store nor add a Set-Cookie. Set before the first store call
+    /// of such a sequence.
     /// </summary>
     public bool SuppressMainWrite { get; set; }
 

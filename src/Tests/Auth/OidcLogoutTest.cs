@@ -34,6 +34,7 @@ public sealed class OidcLogoutTest
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<ConnectionRegistry>();
         services.AddSingleton<RedisTicketStore>();
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(WebAuthMode.FromApi(authMode, realm), sso);
         services.PostConfigure<OpenIdConnectOptions>(OpenIdConnectDefaults.AuthenticationScheme, options =>
             options.ConfigurationManager = new StaticConfigurationManager<OpenIdConnectConfiguration>(new()

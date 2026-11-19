@@ -124,6 +124,7 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
         services.AddDataProtection();
         var proxies = TrustedProxyConfig.FromEntries(trustLoopback ? ["127.0.0.1", "::1"] : []);
         services.AddSkeinEdge(proxies, AllowedHostsConfig.Parse(""));
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(WebAuthMode.FromApi(apiAuthMode, oidcAuthority: null), new SsoOptions());
         services.AddSingleton(proxies);
         services.AddTransient<SessionStoreFailureMiddleware>();

@@ -185,6 +185,7 @@ public sealed class EdgePipelineTest
 
             var proxies = TrustedProxyConfig.FromEntries(trustedProxies);
             services.AddSkeinEdge(proxies, AllowedHostsConfig.Parse(allowedHosts));
+            services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
             services.AddSkeinAuthentication(WebAuthMode.FromApi(apiAuthMode, oidcAuthority: null), new SsoOptions());
             services.AddHttpContextAccessor();
             services.Configure<SkeinApiOptions>(o =>

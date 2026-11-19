@@ -197,6 +197,7 @@ internal sealed class SurfacesHost : IAsyncDisposable
         var replica = new HubTestReplica(new HubTestWorld(), new FakeTimeProvider(DateTimeOffset.UtcNow));
         services.AddSingleton(replica.Registry);
         services.AddSingleton<TimeProvider>(TimeProvider.System);
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(mode ?? WebAuthMode.FromApi("local", null), sso ?? new SsoOptions());
         configure?.Invoke(services);
         services.AddAuthorization();

@@ -129,6 +129,7 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         services.AddSingleton(TimeProvider.System);
         services.AddSingleton<ConnectionRegistry>();
 
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(WebAuthMode.FromApi("local", null), new SsoOptions());
         services.AddAuthorization();
         services.AddHttpContextAccessor();

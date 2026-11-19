@@ -5,9 +5,10 @@ namespace SkeinWeb.Auth;
 
 /// <summary>
 /// Cookie manager of <see cref="SessionSchemes.Main"/>. Reads the cookie the scheme's options name
-/// (the name of the current mode, nothing else), and decides on every write whether the late
-/// sliding renewal may add a Set-Cookie: it may not when the request suppressed Main's write or
-/// when the renewal ended in anything but <see cref="RenewOutcome.Written"/>. A write with no
+/// (the name of the current mode, nothing else), and decides on every write whether Main may add a
+/// Set-Cookie. Main writes a ticket only on an explicit SSO renewal of the same key (there is no
+/// sliding renewal): the write may not add a Set-Cookie when the request suppressed Main's write
+/// or when the renewal ended in anything but <see cref="RenewOutcome.Written"/>. A write with no
 /// renewal outcome (an issue through Main, which does not set one) goes through as usual, and a
 /// deletion always does.
 /// </summary>

@@ -45,7 +45,7 @@ public static class SessionRevocation
     /// Ends the session of the current request. The row of the key of the EFFECTIVE principal
     /// (the new key after an issue on this request, otherwise the key of the cookie) is deleted
     /// first, this replica's hub connections opened with that session are closed (INV-26: a revoked
-    /// session receives no more hub frames), the late sliding write of Main is suppressed, and only
+    /// session receives no more hub frames), any later ticket write of Main is suppressed, and only
     /// then the cookie scheme is signed out, which deletes the cookie. The sign-out's own removal of
     /// the incoming key is a no-op when that key was just deleted
     /// (<see cref="SessionRequestState.RemovedKeys"/>). Connections on other replicas are closed by
