@@ -123,13 +123,41 @@ public sealed class SessionStoreFailureMiddlewareTest
     public async Task ATechnicalFailureToRemoveAnExpiredTicket_IsARefusal()
     {
         await using var host = await SessionPipelineHost.StartAsync();
-        var (cookie, _, _) = await host.SignInAsync(Alice);
-        host.Time.Advance(TimeSpan.FromHours(25));
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected-secret-source-text") : null;
+        var (cookie, key, _) = await host.SignInAsync(Alice);
+        host.Time.Advance(host.Timeouts.Absolute + TimeSpan.FromSeconds(1)); // the session has ended by the stand's clock
+        host.Faults.Before = (name, args) => name == nameof(IDatabase.KeyDeleteAsync)
+            ? new InvalidOperationException("injected-secret-source-text")
+            : null;
 
         var reply = await host.SendAsync("/test/me", cookie);
 
         AssertRefusal(reply);
+        Assert.True(await host.Db.KeyExistsAsync(key)); // the refusal came from the failed DEL of that row
+    }
+
+    [RedisFact]
+    public async Task ATechnicalFailureOfTheLifetimeWriteOfALiveTicket_IsARefusal()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var (cookie, _, _) = await host.SignInAsync(Alice);
+        host.Faults.Before = (name, args) => DbProxy.IsScript(name, args, StoreScripts.Read)
+            ? new InvalidOperationException("injected-secret-source-text")
+            : null;
+
+        var reply = await host.SendAsync("/test/me", cookie);
+
+        AssertRefusal(reply);
+    }
+
+    [RedisFact]
+    public async Task Control_WithoutACookie_IsUnauthorizedNotARefusal()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+
+        var reply = await host.SendAsync("/test/me");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, reply.Status);
+        Assert.Empty(reply.SessionWrites());
     }
 
     [RedisFact]

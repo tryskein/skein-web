@@ -110,13 +110,13 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         else
         {
             var db = new Mock<IDatabase>();
-            db.Setup(d => d.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>()))
-                .ReturnsAsync(true);
             db.Setup(d => d.SetMembersAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
                 .ReturnsAsync(Array.Empty<RedisValue>()); // an empty index: nothing to revoke
-            // The browser carries the cookie of an earlier sign-up: its key is revoked by a later route.
+            // A model of the database by the script it is asked to run: the issue writes the row, a
+            // read finds no row, a revocation deletes one (the browser carries the cookie of an earlier
+            // sign-up: its key is revoked by a later route), the prune at sign-in finds nothing dead.
             db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
-                .ReturnsAsync(RedisResult.Create((RedisValue)1, ResultType.Integer));
+                .Returns((string script, RedisKey[] _, RedisValue[] _, CommandFlags _) => Task.FromResult(ModelAnswer(script)));
             var mux = new Mock<IConnectionMultiplexer>();
             mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
             services.AddSingleton(mux.Object);
@@ -158,6 +158,28 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
         await _app.StartAsync();
         var address = _app.Services.GetRequiredService<Microsoft.AspNetCore.Hosting.Server.IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
         _base = new Uri(address);
+    }
+
+    private static RedisResult ModelAnswer(string script)
+    {
+        static RedisResult Integer(long value) => RedisResult.Create((RedisValue)value, ResultType.Integer);
+        if (script.Contains("'NX', 'PX'", StringComparison.Ordinal))
+        {
+            return Integer(1); // issue: the row is written and indexed
+        }
+        if (script.Contains("PEXPIRE', KEYS[1], ARGV[1]", StringComparison.Ordinal))
+        {
+            return Integer(0); // read: the row is not there
+        }
+        if (script.Contains("redis.pcall('GET', KEYS[1])", StringComparison.Ordinal))
+        {
+            return Integer(1); // revocation: a row was deleted
+        }
+        if (script.Contains("SMEMBERS", StringComparison.Ordinal))
+        {
+            return Integer(0); // prune: no dead member
+        }
+        throw new InvalidOperationException("The model of the database does not know this script.");
     }
 
     public async ValueTask DisposeAsync()

@@ -52,6 +52,54 @@ public sealed class SessionLogRedactionTest
         Assert.DoesNotContain("SECRET-", ex.ToString());
     }
 
+    private static int WarningsAndAbove(string output) =>
+        output.Split('\n').Count(line =>
+            line.Contains("level=warn") || line.Contains("\"level\":\"error\"") || line.Contains("\"level\":\"fatal\""));
+
+    // Observability: deleting a row whose window is not valid is one Warning per session, with neither the
+    // session key nor a claim value in the printed line; the regular end of a session logs nothing at
+    // Warning or above.
+    [RedisFact]
+    public async Task ARowWithoutAValidWindow_IsOneWarningWithoutKeyOrClaims_AndARegularEndLogsNoWarning()
+    {
+        using var mux = TestRedis.Connect();
+        var db = mux.GetDatabase();
+        var formatted = new FormatterLogs();
+        using var factory = LoggerFactory.Create(b => b.SetMinimumLevel(LogLevel.Trace).AddProvider(formatted));
+        var store = new RedisTicketStore(mux, TestRedis.DefaultTimeouts, TimeProvider.System, factory.CreateLogger<RedisTicketStore>());
+        var invalid = "skein:session:SECRET-" + Guid.NewGuid().ToString("N");
+        var ended = "skein:session:SECRET-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            var withoutExpiry = TestRedis.Ticket(Alice, "alice@example.com", "alice-sso",
+                new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Email, "alice.claim@example.com"));
+            withoutExpiry.Properties.ExpiresUtc = null;
+            await db.StringSetAsync(invalid, Microsoft.AspNetCore.Authentication.TicketSerializer.Default.Serialize(withoutExpiry), TimeSpan.FromMinutes(5));
+
+            Assert.Null(await store.RetrieveAsync(invalid, new DefaultHttpContext(), CancellationToken.None));
+
+            Assert.Equal(1, WarningsAndAbove(formatted.Output));
+            Assert.Contains("session row without a valid window deleted", formatted.Output);
+            Assert.DoesNotContain("SECRET-", formatted.Output);
+            Assert.DoesNotContain("alice", formatted.Output);
+            Assert.DoesNotContain(Alice.ToString(), formatted.Output);
+
+            var before = formatted.Output.Length;
+            var over = TestRedis.Ticket(Alice);
+            TestRedis.WithWindow(over.Properties, DateTimeOffset.UtcNow.AddHours(-(TestRedis.DefaultTimeouts.AbsoluteHours + 1)));
+            await db.StringSetAsync(ended, Microsoft.AspNetCore.Authentication.TicketSerializer.Default.Serialize(over), TimeSpan.FromMinutes(5));
+
+            Assert.Null(await store.RetrieveAsync(ended, new DefaultHttpContext(), CancellationToken.None));
+
+            Assert.False(await db.KeyExistsAsync(ended)); // control: the read did reject it by its end
+            Assert.Equal(0, WarningsAndAbove(formatted.Output[before..]));
+        }
+        finally
+        {
+            await db.KeyDeleteAsync([invalid, ended]);
+        }
+    }
+
     [RedisFact]
     public async Task ARotation_IsLoggedOnceAtInformation_WithTheFlagAndWithoutPersonalData()
     {

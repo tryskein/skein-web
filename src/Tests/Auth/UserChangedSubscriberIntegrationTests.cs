@@ -137,12 +137,13 @@ public sealed class UserChangedSubscriberIntegrationTests
 
     private static AuthenticationTicket Ticket(Guid user) => new(
         new ClaimsPrincipal(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, user.ToString())], "Cookies")),
-        new AuthenticationProperties(new Dictionary<string, string?>
+        // The window of a sign-in now: a ticket without one is not issued.
+        TestRedis.WithWindow(new AuthenticationProperties(new Dictionary<string, string?>
         {
             // A remembered SSO pair rides in the ticket; the revocation must reach it too.
             [RedisTicketStore.SsoEmailItem] = $"{user:N}@example.com",
             [RedisTicketStore.SsoUserItem] = user.ToString("N"),
-        }),
+        })),
         CookieAuthenticationDefaults.AuthenticationScheme);
 
     private static string Required(string name) => Environment.GetEnvironmentVariable(name)

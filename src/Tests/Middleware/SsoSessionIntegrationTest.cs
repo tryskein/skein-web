@@ -421,11 +421,13 @@ public sealed class SsoSessionIntegrationTest
         await using var host = await StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
         host.Api.EpochA = 4;
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected") : null;
+        var injection = Injection.FailAfter(host.Faults, StoreScripts.Revoke, StoreScripts.Read, failingKey: key, precedingKey: key);
 
         var reply = await GetAsync(host, cookie, HeadersA);
 
         host.Faults.Before = null;
+        host.Faults.After = null;
+        Assert.True(injection.Fired, "the revocation was never reached after the read: the test proves nothing");
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Equal("sso_unavailable", ErrorOf(reply));
         Assert.Empty(reply.Cookies);
@@ -439,13 +441,13 @@ public sealed class SsoSessionIntegrationTest
         var (cookie, key) = await host.SignInAsync("a@x.io");
         host.Api.EpochA = 4;
         var revoked = false;
-        host.Faults.After = (name, _) =>
+        host.Faults.After = (name, args) =>
         {
-            revoked |= name == nameof(IDatabase.ScriptEvaluateAsync);
+            revoked |= DbProxy.IsScript(name, args, StoreScripts.Revoke, key);
             return Task.CompletedTask;
         };
-        host.Faults.Before = (name, _) =>
-            revoked && name != nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected") : null;
+        host.Faults.Before = (name, args) =>
+            revoked && !DbProxy.IsScript(name, args, StoreScripts.Revoke) ? new InvalidOperationException("injected") : null;
 
         var reply = await GetAsync(host, cookie, HeadersA);
 
@@ -714,7 +716,7 @@ public sealed class SsoSessionIntegrationTest
     public async Task IssueFailure_OnTheBootstrap_Is502ProvisioningFailed_WithNoCookie()
     {
         await using var host = await StartAsync();
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.StringSetAsync) ? new InvalidOperationException("injected") : null;
+        host.Faults.Before = (name, args) => DbProxy.IsScript(name, args, StoreScripts.Issue) ? new InvalidOperationException("injected") : null;
 
         var reply = await GetAsync(host, null, HeadersA);
 
@@ -729,11 +731,13 @@ public sealed class SsoSessionIntegrationTest
     {
         await using var host = await StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected") : null;
+        var injection = Injection.FailAfter(host.Faults, StoreScripts.Revoke, StoreScripts.Read, failingKey: key, precedingKey: key);
 
         var reply = await GetAsync(host, cookie, HeadersB);
 
         host.Faults.Before = null;
+        host.Faults.After = null;
+        Assert.True(injection.Fired, "the revocation was never reached after the read: the test proves nothing");
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Equal("sso_unavailable", ErrorOf(reply));
         Assert.Empty(reply.Cookies);
@@ -751,8 +755,8 @@ public sealed class SsoSessionIntegrationTest
             host.Db.KeyDelete(key);
             armed = true;
         });
-        host.Faults.Before = (name, _) =>
-            armed && name == nameof(IDatabase.StringSetAsync) ? new InvalidOperationException("injected") : null;
+        host.Faults.Before = (name, args) =>
+            armed && DbProxy.IsScript(name, args, StoreScripts.Issue) ? new InvalidOperationException("injected") : null;
 
         var reply = await GetAsync(host, cookie, HeadersA);
 

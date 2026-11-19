@@ -23,6 +23,41 @@ public sealed class SessionIssuerTest
     private static IEnumerable<string> RowsOf(SessionPipelineHost host, Guid user) =>
         host.Db.SetMembers("skein:user-tickets:" + user).Select(m => (string)m!);
 
+    // Distinctive fragments of the store's scripts: the lifetime write of a read, the revocation
+    // (read and delete), the issue and the compare-and-set of the explicit renewal.
+    private const string ReadScript = "PEXPIRE', KEYS[1], ARGV[1]";
+    private const string RevokeScript = "redis.pcall('GET', KEYS[1])";
+    private const string IssueScript = "'NX', 'PX'";
+    private const string RenewScript = "redis.call('TIME')";
+
+    /// <summary>
+    /// Fails the revocation script of <paramref name="key"/>, and only once a read of a ticket has
+    /// completed in the request (the failure is the revocation's, not the read's).
+    /// </summary>
+    private static Func<bool> FailRevocationAfterARead(SessionPipelineHost host, string key)
+    {
+        var read = false;
+        var injected = false;
+        host.Faults.After = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, ReadScript))
+            {
+                read = true;
+            }
+            return Task.CompletedTask;
+        };
+        host.Faults.Before = (name, args) =>
+        {
+            if (read && DbProxy.IsScript(name, args, RevokeScript, key))
+            {
+                injected = true;
+                return new InvalidOperationException("injected");
+            }
+            return null;
+        };
+        return () => injected;
+    }
+
     // ---- R25 ----------------------------------------------------------------------------------
 
     [RedisTheory]
@@ -94,15 +129,17 @@ public sealed class SessionIssuerTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (bobCookie, bobKey, _) = await host.SignInAsync(Bob);
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected") : null;
+        var injected = FailRevocationAfterARead(host, bobKey);
 
         var reply = await host.SendAsync($"/test/issue?user={Alice}", bobCookie);
 
+        Assert.True(injected(), "the revocation was never reached after a read: the test proves nothing");
         Assert.False((int)reply.Status < 300);
         Assert.Empty(reply.Sessions(host.CookieName));
         Assert.True(await host.Db.KeyExistsAsync(bobKey));
         Assert.Empty(RowsOf(host, Alice));
         host.Faults.Before = null;
+        host.Faults.After = null;
         var still = await host.SendAsync("/test/me", bobCookie);
         Assert.Contains(Bob.ToString(), still.Body); // the old key is still Bob's, not Alice's
     }
@@ -112,10 +149,29 @@ public sealed class SessionIssuerTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (bobCookie, bobKey, _) = await host.SignInAsync(Bob);
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.StringSetAsync) ? new InvalidOperationException("injected") : null;
+        var revoked = false;
+        var injected = false;
+        host.Faults.After = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, RevokeScript, bobKey))
+            {
+                revoked = true;
+            }
+            return Task.CompletedTask;
+        };
+        host.Faults.Before = (name, args) =>
+        {
+            if (revoked && DbProxy.IsScript(name, args, IssueScript))
+            {
+                injected = true;
+                return new InvalidOperationException("injected");
+            }
+            return null;
+        };
 
         var reply = await host.SendAsync($"/test/issue?user={Alice}", bobCookie);
 
+        Assert.True(injected, "the issue was never reached after the confirmed revocation: the test proves nothing");
         Assert.False((int)reply.Status < 300);
         Assert.Empty(reply.Sessions(host.CookieName));
         Assert.False(await host.Db.KeyExistsAsync(bobKey));
@@ -145,10 +201,11 @@ public sealed class SessionIssuerTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (cookie, key, _) = await host.SignInAsync(Alice);
-        host.Faults.Before = (name, _) => name == nameof(IDatabase.ScriptEvaluateAsync) ? new InvalidOperationException("injected") : null;
+        var injected = FailRevocationAfterARead(host, key);
 
         var reply = await host.SendAsync("/test/end-current", cookie);
 
+        Assert.True(injected(), "the revocation was never reached after a read: the test proves nothing");
         Assert.False((int)reply.Status < 300);
         Assert.Empty(reply.Cookies);
         Assert.True(await host.Db.KeyExistsAsync(key));
@@ -187,7 +244,6 @@ public sealed class SessionIssuerTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (bobCookie, bobKey, _) = await host.SignInAsync(Bob);
-        host.Time.Advance(TimeSpan.FromHours(13));
 
         var reply = await host.SendAsync($"/test/issue-then-end-session?user={Alice}", bobCookie);
 
@@ -202,11 +258,10 @@ public sealed class SessionIssuerTest
     }
 
     [RedisFact]
-    public async Task EndSession_AfterALateRenewalWasDue_CreatesNoRowAndNoCookieOfTheOldKey()
+    public async Task EndSession_CreatesNoRowAndNoCookieOfTheOldKey()
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (cookie, key, _) = await host.SignInAsync(Alice);
-        host.Time.Advance(TimeSpan.FromHours(13));
 
         var reply = await host.SendAsync("/test/end-session", cookie);
 
@@ -230,32 +285,63 @@ public sealed class SessionIssuerTest
 
     // ---- R70 ----------------------------------------------------------------------------------
 
+    // The only renewal left is the explicit one; it is held at its compare-and-set command, the one
+    // command that could write the row again.
     [RedisFact]
     public async Task ADecidedRenewal_DoesNotResurrectTheRow_AfterAParallelRevocation()
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (cookie, key, _) = await host.SignInAsync(Alice);
-        host.Time.Advance(TimeSpan.FromHours(13));
-        var written = new TaskCompletionSource();
-        var release = new TaskCompletionSource();
-        host.Faults.After = async (name, _) =>
+        var cas = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, RenewScript, key));
+
+        var renewal = host.SendAsync("/test/renew", cookie);
+        await cas.Reached.WaitAsync(TimeSpan.FromSeconds(10)); // decided, not yet sent to Redis
+        await host.Store.RevokeAsync(key, new Microsoft.AspNetCore.Http.DefaultHttpContext(), CancellationToken.None);
+        cas.Release();
+        var reply = await renewal;
+
+        Assert.False(await host.Db.KeyExistsAsync(key));
+        Assert.NotEqual("Written", JsonDocument.Parse(reply.Body).RootElement.GetProperty("outcome").GetString());
+        Assert.DoesNotContain(reply.Cookies, c => c.Name == host.CookieName && !c.IsDeletion);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.SendAsync("/test/me", cookie)).Status);
+    }
+
+    [RedisFact]
+    public async Task AnAppliedRenewal_FollowedByARevocation_LeavesNoRow()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var (cookie, key, _) = await host.SignInAsync(Alice);
+        var written = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Faults.After = async (name, args) =>
         {
-            if (name == nameof(IDatabase.ScriptEvaluateAsync))
+            if (DbProxy.IsScript(name, args, RenewScript, key))
             {
-                host.Faults.After = null; // only the renewal of the first request pauses
-                written.SetResult();
+                written.TrySetResult();
                 await release.Task;
             }
         };
 
-        var first = host.SendAsync("/test/me", cookie);
-        await written.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var renewal = host.SendAsync("/test/renew", cookie);
+        await written.Task.WaitAsync(TimeSpan.FromSeconds(10)); // the compare-and-set has run
+        host.Faults.After = null;
         await host.Store.RevokeAsync(key, new Microsoft.AspNetCore.Http.DefaultHttpContext(), CancellationToken.None);
         release.SetResult();
-        await first; // its headers may carry the key: that is allowed
+        await renewal; // its headers may carry the key: that is allowed
 
         Assert.False(await host.Db.KeyExistsAsync(key));
-        var after = await host.SendAsync("/test/me", cookie);
-        Assert.Equal(HttpStatusCode.Unauthorized, after.Status);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.SendAsync("/test/me", cookie)).Status);
+    }
+
+    [RedisFact]
+    public async Task Control_AnOrdinaryRequest_DoesNotRewriteTheTicket()
+    {
+        await using var host = await SessionPipelineHost.StartAsync();
+        var (cookie, key, _) = await host.SignInAsync(Alice);
+        var before = (byte[])(await host.Db.StringGetAsync(key))!;
+
+        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/me", cookie)).Status);
+
+        Assert.Equal(before, (byte[])(await host.Db.StringGetAsync(key))!);
     }
 }

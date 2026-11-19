@@ -200,22 +200,17 @@ public sealed class OidcCallbackSessionIntegrationTest
         var (host, idp) = await StartAsync();
         await using var _ = host;
         var (cookie, old) = await SignInByTicketAsync(host, "own-live");
-        var method = failing == "delete" ? nameof(IDatabase.ScriptEvaluateAsync) : nameof(IDatabase.StringSetAsync);
-        var injected = false;
-        host.Faults.Before = (name, _) =>
-        {
-            if (name == method)
-            {
-                injected = true;
-                return new InvalidOperationException("injected");
-            }
-            return null;
-        };
+        // delete: the revocation of the old key fails after the read of its ticket; write: the issue
+        // script fails after the revocation of the old key was confirmed.
+        var injection = failing == "delete"
+            ? Injection.FailAfter(host.Faults, StoreScripts.Revoke, StoreScripts.Read, failingKey: old, precedingKey: old)
+            : Injection.FailAfter(host.Faults, StoreScripts.Issue, StoreScripts.Revoke, precedingKey: old);
 
         var (reply, _) = await CallbackAsync(host, idp, "/after", cookie);
 
         host.Faults.Before = null;
-        Assert.True(injected);
+        host.Faults.After = null;
+        Assert.True(injection.Fired, "the failing step was never reached after the one before it: the test proves nothing");
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Equal("OIDC sign-in failed. Contact your administrator.", reply.Body);
         Assert.Empty(reply.Sessions(host.CookieName));
@@ -327,7 +322,7 @@ public sealed class OidcCallbackSessionIntegrationTest
         var principal = SessionPrincipal.Create(
             new UserDto(user.ToString(), "a@x.io", "alice", "alice", "user", null, null, false), epoch);
         return await host.Services.GetRequiredService<RedisTicketStore>().StoreAsync(
-            new Microsoft.AspNetCore.Authentication.AuthenticationTicket(principal, new Microsoft.AspNetCore.Authentication.AuthenticationProperties(), SessionSchemes.Issue),
+            new Microsoft.AspNetCore.Authentication.AuthenticationTicket(principal, TestRedis.WithWindow(new Microsoft.AspNetCore.Authentication.AuthenticationProperties()), SessionSchemes.Issue),
             new Microsoft.AspNetCore.Http.DefaultHttpContext(), CancellationToken.None);
     }
 

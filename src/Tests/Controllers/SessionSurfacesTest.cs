@@ -118,22 +118,15 @@ public sealed class SessionSurfacesTest
     {
         await using var host = await SurfacesHost.StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
-        var injected = false;
-        host.Faults.Before = (name, _) =>
-        {
-            if (name == nameof(IDatabase.ScriptEvaluateAsync))
-            {
-                injected = true;
-                return new InvalidOperationException("injected");
-            }
-            return null;
-        };
+        // The revocation of the old key fails, after the read of its ticket succeeded.
+        var injection = Injection.FailAfter(host.Faults, StoreScripts.Revoke, StoreScripts.Read, failingKey: key, precedingKey: key);
 
         var reply = await host.LoginAsync("a@x.io", cookie: cookie);
 
-        Assert.True(injected);
+        Assert.True(injection.Fired, "the revocation was never reached after the read: the test proves nothing");
         AssertLoginRefusalShape(reply);
         host.Faults.Before = null;
+        host.Faults.After = null;
         Assert.True(await host.Db.KeyExistsAsync(key));
     }
 
@@ -142,22 +135,15 @@ public sealed class SessionSurfacesTest
     {
         await using var host = await SurfacesHost.StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
-        var injected = false;
-        host.Faults.Before = (name, _) =>
-        {
-            if (name == nameof(IDatabase.StringSetAsync))
-            {
-                injected = true;
-                return new InvalidOperationException("injected");
-            }
-            return null;
-        };
+        // The issue script fails, after the revocation of the old key was confirmed.
+        var injection = Injection.FailAfter(host.Faults, StoreScripts.Issue, StoreScripts.Revoke, precedingKey: key);
 
         var reply = await host.LoginAsync("a@x.io", cookie: cookie);
 
-        Assert.True(injected);
+        Assert.True(injection.Fired, "the issue was never reached after the confirmed revocation: the test proves nothing");
         AssertLoginRefusalShape(reply);
         host.Faults.Before = null;
+        host.Faults.After = null;
         Assert.False(await host.Db.KeyExistsAsync(key));
     }
 
@@ -283,12 +269,14 @@ public sealed class SessionSurfacesTest
     public async Task Registration_WhenTheIssueFails_IsAccountCreatedNotSignedIn(int which, string failing)
     {
         await using var host = await SurfacesHost.StartAsync();
-        var (cookie, _) = await host.SignInAsync("a@x.io");
-        var method = failing == "delete" ? nameof(IDatabase.ScriptEvaluateAsync) : nameof(IDatabase.StringSetAsync);
-        host.Faults.Before = (name, _) => name == method ? new InvalidOperationException("injected") : null;
+        var (cookie, key) = await host.SignInAsync("a@x.io");
+        var injection = failing == "delete"
+            ? Injection.FailAfter(host.Faults, StoreScripts.Revoke, StoreScripts.Read, failingKey: key, precedingKey: key)
+            : Injection.FailAfter(host.Faults, StoreScripts.Issue, StoreScripts.Revoke, precedingKey: key);
 
         var reply = await host.SendAsync(HttpMethod.Post, Registrations[which].Path, Registrations[which].Body, cookie);
 
+        Assert.True(injection.Fired, "the failing step was never reached after the one before it: the test proves nothing");
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Empty(reply.Cookies);
         Assert.EndsWith("/account-created-session-not-issued", Json(reply).GetProperty("type").GetString());
@@ -321,9 +309,9 @@ public sealed class SessionSurfacesTest
         var (cookie, key) = await host.SignInAsync("a@x.io");
         var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        host.Faults.After = async (name, _) =>
+        host.Faults.After = async (name, args) =>
         {
-            if (name == nameof(IDatabase.ScriptEvaluateAsync))
+            if (DbProxy.IsScript(name, args, StoreScripts.Revoke, key))
             {
                 host.Faults.After = null; // only the first revocation waits, right after its deletion
                 reached.SetResult();

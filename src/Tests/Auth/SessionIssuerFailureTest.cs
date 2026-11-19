@@ -79,8 +79,9 @@ public class SessionIssuerFailureTest
     private static World Build(bool insecureHttp = false)
     {
         var db = new Mock<IDatabase>();
-        db.Setup(d => d.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>()))
-            .ReturnsAsync(true);
+        // The issue is one script; it answers «the row is written and indexed».
+        db.Setup(d => d.ScriptEvaluateAsync(It.Is<string>(s => IsIssueScript(s)), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync(RedisResult.Create((RedisValue)1, ResultType.Integer));
         var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
 
@@ -108,6 +109,9 @@ public class SessionIssuerFailureTest
             Db = db,
         };
     }
+
+    // The issue script of the store: SET NX PX of a new row.
+    private static bool IsIssueScript(string script) => script.Contains("'NX', 'PX'", StringComparison.Ordinal);
 
     private static ClaimsPrincipal Principal() =>
         new(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, User.ToString()), new Claim(ClaimTypes.Email, "a@example.com")], "spike"));
@@ -184,7 +188,7 @@ public class SessionIssuerFailureTest
     public async Task StoreFailureDuringTheIssue_CarriesNoSourceText_AndWritesNoCookie()
     {
         var w = Build();
-        w.Db.Setup(d => d.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>()))
+        w.Db.Setup(d => d.ScriptEvaluateAsync(It.Is<string>(s => IsIssueScript(s)), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
             .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.SocketFailure, $"no connection for {SecretKey}"));
         var ctx = w.Request();
 

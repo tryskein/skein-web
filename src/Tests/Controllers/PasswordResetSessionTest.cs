@@ -42,9 +42,15 @@ public sealed class PasswordResetSessionTest
         var principal = SessionPrincipal.Create(
             new UserDto(user.ToString(), email, email.Split('@')[0], email.Split('@')[0], "user", null, null, false), epoch);
         return await host.Services.GetRequiredService<RedisTicketStore>().StoreAsync(
-            new AuthenticationTicket(principal, new AuthenticationProperties(), SessionSchemes.Issue),
+            new AuthenticationTicket(principal, SkeinWeb.Tests.Auth.TestRedis.WithWindow(new AuthenticationProperties()), SessionSchemes.Issue),
             new DefaultHttpContext(), CancellationToken.None);
     }
+
+    // Distinctive fragments of the store's scripts: the lifetime write of a read, the revocation
+    // (read and delete) and the issue.
+    private const string ReadScript = "PEXPIRE', KEYS[1], ARGV[1]";
+    private const string RevokeScript = "redis.pcall('GET', KEYS[1])";
+    private const string IssueScript = "'NX', 'PX'";
 
     private static Task<SessionPipelineHost.Reply> ProxyAsync(SurfacesHost host, string cookie) =>
         host.SendAsync(HttpMethod.Get, "/api/v1/projects", cookie: cookie);
@@ -138,14 +144,11 @@ public sealed class PasswordResetSessionTest
         await using var host = await SurfacesHost.StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
         var onAlice = ConnectionOf(await host.SendAsync(HttpMethod.Get, "/test/hub", cookie: cookie));
-        await MakeSlidingDueAsync(host, key);
         byte[] before = (await host.Db.StringGetAsync(key))!;
         // The key cannot be deleted by either of the two ways the sequence has: the revocation of the incoming
         // key and the removal by the user's index.
         host.Faults.Before = (name, args) =>
-            // Only the revoking script (the one that DELs) fails; the compare-and-set of the sliding renewal
-            // keeps working, so a lost suppression of the late write would rewrite the row and show here.
-            (name == nameof(IDatabase.ScriptEvaluateAsync) && args[0] is string script && script.Contains("DEL", StringComparison.Ordinal))
+            DbProxy.IsScript(name, args, RevokeScript)
             || (name == nameof(IDatabase.KeyDeleteAsync) && ((RedisKey)args[0]!).ToString() == key)
                 ? new InvalidOperationException("injected") : null;
 
@@ -186,13 +189,32 @@ public sealed class PasswordResetSessionTest
     {
         await using var host = await SurfacesHost.StartAsync();
         var (bobCookie, bobKey) = await host.SignInAsync("b@x.io");
+        // Only the revocation of Bob's key fails, and only once the request has read his ticket.
+        var read = false;
+        var injected = false;
+        host.Faults.After = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, ReadScript, bobKey))
+            {
+                read = true;
+            }
+            return Task.CompletedTask;
+        };
         host.Faults.Before = (name, args) =>
-            name == nameof(IDatabase.ScriptEvaluateAsync) && args[1] is RedisKey[] keys && keys.Any(k => k.ToString() == bobKey)
-                ? new InvalidOperationException("injected") : null;
+        {
+            if (read && DbProxy.IsScript(name, args, RevokeScript, bobKey))
+            {
+                injected = true;
+                return new InvalidOperationException("injected");
+            }
+            return null;
+        };
 
         var reply = await ResetAsync(host, bobCookie);
 
         host.Faults.Before = null;
+        host.Faults.After = null;
+        Assert.True(injected, "the revocation was never reached after the read: the test proves nothing");
         AssertPartial(host, reply);
         Assert.True(await host.Db.KeyExistsAsync(bobKey));
         Assert.Empty(host.IndexOf(A)); // never rewritten as the reset user's
@@ -249,7 +271,7 @@ public sealed class PasswordResetSessionTest
         });
         if (kind == "issue-fails")
         {
-            host.Faults.Before = (name, _) => name == nameof(IDatabase.StringSetAsync) ? new InvalidOperationException("injected") : null;
+            host.Faults.Before = (name, args) => DbProxy.IsScript(name, args, IssueScript) ? new InvalidOperationException("injected") : null;
         }
 
         var reply = await ResetAsync(host, null);

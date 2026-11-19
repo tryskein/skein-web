@@ -57,6 +57,51 @@ public class RedisTicketStoreFailureTest
         Assert.Null(await store.RetrieveAsync(Key, new DefaultHttpContext(), CancellationToken.None));
     }
 
+    private static byte[] Bytes(AuthenticationTicket ticket) => TicketSerializer.Default.Serialize(ticket);
+
+    private static AuthenticationTicket SignedInAt(DateTimeOffset signIn)
+    {
+        var ticket = Ticket();
+        TestRedis.WithWindow(ticket.Properties, signIn);
+        return ticket;
+    }
+
+    private static void AssertSourceFree(SessionStoreUnavailableException ex)
+    {
+        Assert.Null(ex.InnerException);
+        Assert.DoesNotContain("SECRET-KEY-VALUE", ex.ToString());
+    }
+
+    [Fact]
+    public async Task Retrieve_WhenTheLifetimeScriptFails_IsAnExceptionWithoutTheSourceText()
+    {
+        var (store, db) = Build();
+        db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
+            .ReturnsAsync((RedisValue)Bytes(SignedInAt(DateTimeOffset.UtcNow)));
+        db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(Down());
+
+        AssertSourceFree(await Assert.ThrowsAsync<SessionStoreUnavailableException>(
+            () => store.RetrieveAsync(Key, new DefaultHttpContext(), CancellationToken.None)));
+    }
+
+    [Theory]
+    [InlineData("ended")] // the session of the row has ended
+    [InlineData("unreadable")] // bytes that are no ticket: no valid window
+    public async Task Retrieve_WhenTheDeleteOfARejectedRowFails_IsAnExceptionWithoutTheSourceText(string row)
+    {
+        var (store, db) = Build();
+        var bytes = row == "ended"
+            ? Bytes(SignedInAt(DateTimeOffset.UtcNow.AddHours(-(TestRedis.DefaultTimeouts.AbsoluteHours + 1))))
+            : [0xFF, 0x00, 0x13, 0x37];
+        db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ReturnsAsync((RedisValue)bytes);
+        db.Setup(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
+
+        AssertSourceFree(await Assert.ThrowsAsync<SessionStoreUnavailableException>(
+            () => store.RetrieveAsync(Key, new DefaultHttpContext(), CancellationToken.None)));
+        db.Verify(d => d.KeyDeleteAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()), Times.Once); // the failure came from the DEL
+    }
+
     [Fact]
     public async Task Remove_TechnicalFailure_IsAnExceptionWithoutTheSourceText()
     {
