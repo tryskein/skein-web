@@ -14,8 +14,10 @@ namespace SkeinWeb.Tests.Hubs;
 /// INV-26 on the hub (sk-674.18 T049): a session that has ended stops receiving hub frames. The replica
 /// that ends it — skein-api's <c>session_revoked</c> answered to a request of
 /// that session (<see cref="SessionRevocation.EndSessionAsync"/>) — closes its
-/// connections of that session at once; any other replica closes its own on
-/// the access re-check once the session ticket is gone from the shared store.
+/// connections of that session at once; any other replica closes each of its
+/// own at the first successful probe of that connection after the session ticket
+/// is gone from the shared store (the period of the re-check is nominal, not an
+/// upper bound, and a probe that fails technically closes nothing).
 /// Connections of another session of the same user keep receiving.
 /// </summary>
 /// <remarks>

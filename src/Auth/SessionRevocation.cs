@@ -48,8 +48,10 @@ public static class SessionRevocation
     /// session receives no more hub frames), any later ticket write of Main is suppressed, and only
     /// then the cookie scheme is signed out, which deletes the cookie. The sign-out's own removal of
     /// the incoming key is a no-op when that key was just deleted
-    /// (<see cref="SessionRequestState.RemovedKeys"/>). Connections on other replicas are closed by
-    /// their access re-check once the ticket is gone (<see cref="AccessRecheckService"/>). Never
+    /// (<see cref="SessionRequestState.RemovedKeys"/>). A connection on another replica is closed by
+    /// the first successful probe of that connection after the ticket is gone
+    /// (<see cref="AccessRecheckService"/>): the period of the re-check is nominal, not an upper
+    /// bound, and a probe that fails technically closes nothing. Never
     /// retried, and not cancellable — tearing a session down is past the point of no return (same
     /// reasoning as logout).
     /// </summary>
