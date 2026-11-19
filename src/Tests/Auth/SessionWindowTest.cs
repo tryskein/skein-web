@@ -35,7 +35,8 @@ public class SessionWindowTest
     public static TheoryData<string, AuthenticationProperties, bool> Windows() => new()
     {
         { "both times, issued before expiry", Props(SignIn, SignIn.AddHours(720)), true },
-        { "both times, one tick apart", Props(SignIn, SignIn.AddTicks(1)), true },
+        // The properties keep times to the second, so a second is the smallest gap a ticket can carry.
+        { "both times, one second apart", Props(SignIn, SignIn.AddSeconds(1)), true },
         { "no issue time", Props(null, SignIn.AddHours(720)), false },
         { "no expiry time", Props(SignIn, null), false },
         { "neither time", Props(null, null), false },
