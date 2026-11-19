@@ -1,4 +1,6 @@
-using System.Diagnostics;
+using System.Globalization;
+using System.Net.Sockets;
+using System.Text;
 using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -15,10 +17,11 @@ namespace SkeinWeb.Tests.Auth;
 /// sign-in), an ordinary authenticated read costs at most two commands to Redis whatever the size of
 /// the user's index (the non-functional limit of D-4), and dead index members stay until the user's
 /// next sign-in. The commands are counted in the log of the RESP proxy between a mark and the
-/// answer; a control window of the same length without a request measures the background. Work
-/// inside a script is not visible from outside; the dead member that survives the read holds it.
-/// The stand is built from the parts of <c>StandardStartupStand.cs</c> (Redis proxy, process) and a
-/// skein-api stand-in of its own that answers for one user with a stable id.
+/// answer, on the client connection that carried the read; commands of other connections are the
+/// background. Work inside a script is not visible from outside; the dead member that survives the
+/// read holds it. The stand runs the process of <c>StandardStartupStand.cs</c> behind a proxy of its
+/// own that logs the connection of each command, with a skein-api stand-in of its own that answers
+/// for one user with a stable id.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("startup-stand")]
@@ -81,9 +84,165 @@ public sealed class SessionStoreStartupIntegrationTest
         }
     }
 
+    /// <summary>One command a client sent, with the number of the client connection that carried it.</summary>
+    private sealed record Sent(int Connection, string Name, string[] Args)
+    {
+        public bool Mentions(string key) => Args.Any(a => a == key);
+    }
+
+    /// <summary>
+    /// A TCP proxy in front of the real Redis that logs every command with the number of the client
+    /// connection that sent it, and selects <see cref="RedisProxy.Database"/> on every upstream
+    /// connection. The stand's own proxy logs commands without their connection; the count of an
+    /// ordinary read is per connection, so this test carries its own.
+    /// </summary>
+    private sealed class ConnectionLog : IDisposable
+    {
+        private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
+        private readonly List<TcpClient> _sockets = [];
+        private readonly List<Sent> _log = [];
+        private int _connections;
+        private volatile bool _closed;
+
+        public ConnectionLog(string host, int port)
+        {
+            _listener.Start();
+            _ = Task.Run(async () =>
+            {
+                while (!_closed)
+                {
+                    try
+                    {
+                        var client = await _listener.AcceptTcpClientAsync();
+                        var upstream = new TcpClient();
+                        await upstream.ConnectAsync(host, port);
+                        var db = RedisProxy.Database.ToString(CultureInfo.InvariantCulture);
+                        await upstream.GetStream().WriteAsync(Encoding.ASCII.GetBytes($"*2\r\n$6\r\nSELECT\r\n${db.Length}\r\n{db}\r\n"));
+                        var ok = new byte[5];
+                        await upstream.GetStream().ReadExactlyAsync(ok); // +OK\r\n
+                        var id = Interlocked.Increment(ref _connections);
+                        lock (_sockets)
+                        {
+                            _sockets.Add(client);
+                            _sockets.Add(upstream);
+                        }
+                        _ = PumpAsync(id, client, upstream);
+                        _ = upstream.GetStream().CopyToAsync(client.GetStream()).ContinueWith(_ => { });
+                    }
+                    catch (Exception)
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+
+        public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+        public IReadOnlyList<Sent> Commands()
+        {
+            lock (_log)
+            {
+                return _log.ToArray();
+            }
+        }
+
+        private async Task PumpAsync(int id, TcpClient client, TcpClient upstream)
+        {
+            var input = client.GetStream();
+            var output = upstream.GetStream();
+            var buffer = new List<byte>();
+            var chunk = new byte[16 * 1024];
+            try
+            {
+                while (true)
+                {
+                    var read = await input.ReadAsync(chunk);
+                    if (read == 0)
+                    {
+                        return;
+                    }
+                    buffer.AddRange(chunk.AsSpan(0, read).ToArray());
+                    while (TryParse(buffer, out var parts, out var length))
+                    {
+                        lock (_log)
+                        {
+                            _log.Add(new Sent(id, parts[0].ToUpperInvariant(), parts[1..]));
+                        }
+                        buffer.RemoveRange(0, length);
+                    }
+                    await output.WriteAsync(chunk.AsMemory(0, read));
+                }
+            }
+            catch (Exception)
+            {
+                // a closed peer ends the pipe
+            }
+        }
+
+        // One RESP array of bulk strings: *N, then N times $len and the bytes.
+        private static bool TryParse(List<byte> buffer, out string[] parts, out int length)
+        {
+            parts = [];
+            length = 0;
+            var pos = 0;
+            if (buffer.Count == 0 || buffer[0] != (byte)'*' || !ReadLine(buffer, ref pos, out var header))
+            {
+                return false;
+            }
+            var count = int.Parse(header[1..], CultureInfo.InvariantCulture);
+            var read = new string[count];
+            for (var i = 0; i < count; i++)
+            {
+                if (!ReadLine(buffer, ref pos, out var size) || size[0] != '$')
+                {
+                    return false;
+                }
+                var n = int.Parse(size[1..], CultureInfo.InvariantCulture);
+                if (buffer.Count < pos + n + 2)
+                {
+                    return false;
+                }
+                read[i] = Encoding.UTF8.GetString(buffer.GetRange(pos, n).ToArray());
+                pos += n + 2;
+            }
+            parts = read;
+            length = pos;
+            return true;
+        }
+
+        private static bool ReadLine(List<byte> buffer, ref int pos, out string line)
+        {
+            for (var i = pos; i + 1 < buffer.Count; i++)
+            {
+                if (buffer[i] == '\r' && buffer[i + 1] == '\n')
+                {
+                    line = Encoding.ASCII.GetString(buffer.GetRange(pos, i - pos).ToArray());
+                    pos = i + 2;
+                    return true;
+                }
+            }
+            line = "";
+            return false;
+        }
+
+        public void Dispose()
+        {
+            _closed = true;
+            _listener.Stop();
+            lock (_sockets)
+            {
+                foreach (var socket in _sockets)
+                {
+                    socket.Close();
+                }
+            }
+        }
+    }
+
     private sealed class Stand : IAsyncDisposable
     {
-        private Stand(RedisProxy proxy, OneUserApi api, AppProcess app, ConnectionMultiplexer mux)
+        private Stand(ConnectionLog proxy, OneUserApi api, AppProcess app, ConnectionMultiplexer mux)
         {
             Proxy = proxy;
             Api = api;
@@ -95,7 +254,7 @@ public sealed class SessionStoreStartupIntegrationTest
             };
         }
 
-        public RedisProxy Proxy { get; }
+        public ConnectionLog Proxy { get; }
         public OneUserApi Api { get; }
         public AppProcess App { get; }
         public ConnectionMultiplexer Mux { get; }
@@ -112,7 +271,7 @@ public sealed class SessionStoreStartupIntegrationTest
             var (host, port) = endpoint is DnsEndPoint dns
                 ? (dns.Host, dns.Port)
                 : (((IPEndPoint)endpoint).Address.ToString(), ((IPEndPoint)endpoint).Port);
-            var proxy = new RedisProxy(host, port);
+            var proxy = new ConnectionLog(host, port);
             var api = await OneUserApi.StartAsync();
             var app = AppProcess.Start(new Dictionary<string, string?>
             {
@@ -187,42 +346,37 @@ public sealed class SessionStoreStartupIntegrationTest
         AssertNear(TimeSpan.FromHours(9), await PttlAsync(stand, key));
         AssertNear(TimeSpan.FromHours(9), await PttlAsync(stand, Index));
 
-        // A first read, to learn how long one takes; then a control window of that length without a request.
-        var watch = Stopwatch.StartNew();
-        Assert.Equal(HttpStatusCode.OK, await stand.ReadAsync(cookie));
-        var window = TimeSpan.FromTicks(Math.Max(watch.Elapsed.Ticks, TimeSpan.FromMilliseconds(200).Ticks));
-        var mark = stand.Proxy.Commands().Count;
-        await Task.Delay(window);
-        var background = stand.Proxy.Commands().Count - mark;
+        Assert.Equal(HttpStatusCode.OK, await stand.ReadAsync(cookie)); // the scripts are loaded before counting
 
         var dead = new List<string>();
         var counts = new Dictionary<int, int>();
         foreach (var size in new[] { 1, 50, 500 })
         {
-            // The user's index of the given size: dead members, and the session's own membership lost.
+            // The user's index at the declared size: only dead members, the session's own membership lost.
             await stand.Db.KeyDeleteAsync(Index);
-            for (var i = dead.Count; i < size - 1; i++)
+            while (dead.Count < size)
             {
                 dead.Add("skein:session:dead-" + Guid.NewGuid().ToString("N"));
             }
-            if (size > 1)
-            {
-                await stand.Db.SetAddAsync(Index, dead.Take(size - 1).Select(d => (RedisValue)d).ToArray());
-            }
+            await stand.Db.SetAddAsync(Index, dead.Take(size).Select(d => (RedisValue)d).ToArray());
+            Assert.Equal(size, await stand.Db.SetLengthAsync(Index));
 
-            mark = stand.Proxy.Commands().Count;
+            var mark = stand.Proxy.Commands().Count;
             Assert.Equal(HttpStatusCode.OK, await stand.ReadAsync(cookie));
-            var commands = stand.Proxy.Commands().Skip(mark).ToList();
+            var window = stand.Proxy.Commands().Skip(mark).ToList();
 
-            Assert.Contains(commands, c => c.Mentions(key)); // control: the read went through the proxy
-            Assert.True(commands.Count - background <= 2,
-                $"index of {size}: {commands.Count} commands, background {background}: {string.Join(", ", commands.Select(c => c.Name))}");
-            counts[size] = commands.Count(c => c.Mentions(key) || c.Mentions(Index));
+            // The foreground: every command, whatever its keys, on the connection that carried the read of
+            // this session; commands of other connections in the same window are the background.
+            var foreground = window.Where(c => c.Mentions(key)).Select(c => c.Connection).ToHashSet();
+            Assert.NotEmpty(foreground); // control: the read went through the proxy
+            var commands = window.Where(c => foreground.Contains(c.Connection)).ToList();
+            Assert.True(commands.Count <= 2,
+                $"index of {size}: {commands.Count} commands: {string.Join(", ", commands.Select(c => c.Name))}");
+            counts[size] = commands.Count;
+
             Assert.True(await stand.Db.SetContainsAsync(Index, key)); // the read restored the membership
-            if (size > 1)
-            {
-                Assert.True(await stand.Db.SetContainsAsync(Index, dead[0])); // and left the dead member alone
-            }
+            Assert.True(await stand.Db.SetContainsAsync(Index, dead[0])); // and left the dead members alone
+            Assert.Equal(size + 1, await stand.Db.SetLengthAsync(Index));
         }
         Assert.Single(counts.Values.Distinct()); // the same number of commands for 1, 50 and 500 members
 
