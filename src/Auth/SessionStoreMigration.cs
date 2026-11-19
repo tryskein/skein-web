@@ -3,35 +3,47 @@ using StackExchange.Redis;
 namespace SkeinWeb.Auth;
 
 /// <summary>
-/// One-time cleanup at startup of the session rows of the former format: the sessions of this
-/// version are Redis strings, the former ones were hashes under the same <c>skein:session:*</c>
-/// keys. No value of the former format is read or converted; the hashes are deleted so no session
-/// issued before the update is accepted (a user signs in once), and nothing else is touched.
+/// Startup cleanup of the session store: before the first request is served, every session row
+/// under <c>skein:session:*</c> that existed when the cleanup began ends, when the store shows that
+/// the former version ran on it. A plain restart ends no session.
 /// </summary>
 /// <remarks>
 /// <para>
-/// The work is done once per deployment under a lock whose owner is a random token, and
-/// recorded by the marker <c>skein:session-format</c> = <c>3</c>. When the marker is already
-/// <c>3</c>, before or after the lock is taken, no key is deleted. A replica that does not get the
-/// lock waits for the marker and fails with a startup timeout if it does not appear.
+/// WHEN: the sessions of this version are Redis strings, the former ones (version 1.0.1) were
+/// hashes under the same keys. Every start scans for such hashes (<c>SCAN … TYPE hash</c>). The
+/// cleanup runs when a hash is found — the former version ran after a rollback, and the rows this
+/// version left behind are ended with its own — or when the marker <c>skein:session-format</c> =
+/// <c>3</c> is missing (deleted by the rollback procedure, or never written). With the marker in
+/// place and no hash, nothing is deleted. Deleting the marker stays a required step of a rollback
+/// that leaves no session of the former version behind: without it such a rollback is not seen.
 /// </para>
 /// <para>
-/// The lock lives <see cref="LockLifetime"/> and is extended on every batch of the scan; every
-/// delete runs in a script that first checks the lock still belongs to this process, and deletes
-/// only keys of type hash, so a paused owner that lost its lock deletes nothing and a string row of
-/// the new model is never removed. The marker is written by a script under the same check, and only
-/// then is the lock released.
+/// PASS: the state is four keys — the marker, the lock <c>skein:session-format:lock</c> (the
+/// random token of its owner, with a finite lifetime from the moment it is taken), the count of
+/// finished passes <c>skein:session-format:generation</c> (no key = 0) and the set of marks
+/// <c>skein:session-format:issued-during</c>. A replica observes the state (marker, lock, count),
+/// scans for hashes and observes again. It serves only when both observations show the marker
+/// <c>3</c>, no lock and the same count, and the scan found nothing. Otherwise it enters a pass only
+/// through <see cref="BeginPassScript"/> with the count of its first observation: when the lock is
+/// taken it waits until the lock is gone and the count has grown; when the count differs a pass
+/// finished after the observation and it observes again; else the script takes the lock and
+/// deletes the marker and the marks of an earlier pass in one step.
 /// </para>
 /// <para>
-/// Operator contract: after a rollback to the former version, delete <c>skein:session-format</c>
-/// before rolling forward again. Without that the cleanup is skipped and hashes of the former
-/// format are rejected anyway (<c>WRONGTYPE</c> is read as no session, and the cookie purpose
-/// differs). Rows of this version that survived a rollback stay valid.
+/// The owner scans <c>skein:session:*</c> page by page. Every page first extends the lock and the
+/// set of marks by its token, then deletes the hashes and strings of the page except the rows
+/// marked "own token:key": a session issued during the pass by a replica that is serving is marked
+/// by the issue script before its row is written, and survives. The end
+/// (<see cref="FinishPassScript"/>) writes the marker, counts the pass, drops the marks and the
+/// lock in one step. Every step checks the token: an owner that lost its lock deletes nothing,
+/// writes no marker and touches no mark of another pass; its lock expires and the next start
+/// runs a full pass. A replica waiting for another pass fails its start on the startup timeout
+/// when the pass does not finish; the marker alone does not end the wait.
 /// </para>
 /// <para>
 /// Keys of the data-protection key ring, the login throttle, the SignalR backplane and the
-/// <c>skein:user-tickets:*</c> index are not touched. Redis exceptions are logged by type and
-/// code, never with a key.
+/// <c>skein:user-tickets:*</c> index are not touched. Every key of a script is passed in
+/// <c>KEYS</c>. Redis exceptions are logged by type, never with a key.
 /// </para>
 /// </remarks>
 public sealed class SessionStoreMigration(
@@ -39,76 +51,143 @@ public sealed class SessionStoreMigration(
     TimeProvider timeProvider,
     ILogger<SessionStoreMigration> logger)
 {
-    /// <summary>The key that records that the cleanup was done.</summary>
+    /// <summary>The key that records the session format of the store; written at the end of a pass.</summary>
     public const string MarkerKey = "skein:session-format";
 
     /// <summary>The value of <see cref="MarkerKey"/> of the session format of this version.</summary>
     public const string MarkerValue = "3";
 
-    /// <summary>The key of the lock that serialises the cleanup.</summary>
+    /// <summary>The key of the lock of a pass; its value is the token of the owner.</summary>
     public const string LockKey = "skein:session-format:lock";
 
+    /// <summary>The key of the count of finished passes; no key means none.</summary>
+    public const string GenerationKey = "skein:session-format:generation";
+
+    /// <summary>The set of the marks of a pass; a member is "token of the pass:key of the row".</summary>
+    public const string IssuedDuringKey = "skein:session-format:issued-during";
+
+    /// <summary>The lifetime the lock and the set of marks get when the pass begins and on every page of its scan.</summary>
+    public static readonly TimeSpan LockLifetime = TimeSpan.FromSeconds(30);
+
     private const string SessionKeyPattern = "skein:session:*";
-    private const int BatchSize = 500;
-    private static readonly TimeSpan LockLifetime = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan LockPollInterval = TimeSpan.FromMilliseconds(250);
+    private const int PageSize = 500;
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
 
-    // Extend the lock if it is still ours.
-    private const string ExtendLockScript =
-        "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end return 0";
+    // The state in one call (KEYS: marker, lock, count): the marker or false, 1 when the lock
+    // exists, the count of finished passes.
+    private const string PassStatusScript =
+        "return {redis.call('GET', KEYS[1]), redis.call('EXISTS', KEYS[2]), " +
+        "tonumber(redis.call('GET', KEYS[3]) or '0')}";
 
-    // Delete the hash keys of a batch if the lock is still ours; -1 = the lock is not ours.
-    private const string DeleteBatchScript =
+    // Enter a pass (KEYS: lock, count, marker, marks; ARGV: expected count, token, lifetime ms):
+    // 1 = the lock is taken, 2 = the count is not the expected one (a pass finished after the
+    // observation), 3 = begun: the lock is taken with its lifetime, the marker and the marks of an
+    // earlier pass are deleted.
+    private const string BeginPassScript =
+        "if redis.call('EXISTS', KEYS[1]) == 1 then return 1 end " +
+        "if tonumber(redis.call('GET', KEYS[2]) or '0') ~= tonumber(ARGV[1]) then return 2 end " +
+        "redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3]) " +
+        "redis.call('DEL', KEYS[3], KEYS[4]) " +
+        "return 3";
+
+    // A page of the scan (KEYS: lock, marks; ARGV: token, lifetime ms): extend both if the lock is
+    // still ours; 0 = it is not.
+    private const string ExtendPassScript =
+        "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end " +
+        "redis.call('PEXPIRE', KEYS[1], ARGV[2]) " +
+        "redis.call('PEXPIRE', KEYS[2], ARGV[2]) " +
+        "return 1";
+
+    // Delete the rows of a page (KEYS: lock, marks, rows...; ARGV: token): hashes and strings,
+    // except a row marked "token:key" with the token of this pass. -1 = the lock is not ours.
+    private const string DeletePageScript =
         "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end " +
         "local n = 0 " +
-        "for i = 2, #KEYS do " +
-        "if redis.call('TYPE', KEYS[i]).ok == 'hash' then redis.call('DEL', KEYS[i]) n = n + 1 end " +
+        "for i = 3, #KEYS do " +
+        "local t = redis.call('TYPE', KEYS[i]).ok " +
+        "if (t == 'hash' or t == 'string') and " +
+        "redis.call('SISMEMBER', KEYS[2], ARGV[1] .. ':' .. KEYS[i]) == 0 then " +
+        "redis.call('DEL', KEYS[i]) n = n + 1 end " +
         "end return n";
 
-    // Write the marker if the lock is still ours.
-    private const string WriteMarkerScript =
-        "if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('SET', KEYS[2], ARGV[2]) return 1 end return 0";
+    // End a pass (KEYS: lock, marker, count, marks; ARGV: token, marker value): if the lock is ours,
+    // write the marker, count the pass, drop the marks and the lock. 0 = it is not ours.
+    private const string FinishPassScript =
+        "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end " +
+        "redis.call('SET', KEYS[2], ARGV[2]) " +
+        "redis.call('INCR', KEYS[3]) " +
+        "redis.call('DEL', KEYS[4], KEYS[1]) " +
+        "return 1";
 
-    // Release the lock if it is still ours.
+    // Release the lock of a pass that failed, if it is still ours; the marks expire or are
+    // deleted by the next pass.
     private const string ReleaseLockScript =
         "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0";
 
+    private const long Busy = 1;
+    private const long FinishedAfterObservation = 2;
+    private const long Begun = 3;
+
+    private readonly record struct PassStatus(bool Marked, bool Locked, long Generation);
+
     /// <summary>
-    /// Make sure the cleanup is done: do it under the lock, or wait for the replica that holds the
-    /// lock to record the marker.
+    /// Make sure the store holds no session that predates a rollback: observe the state, run the
+    /// pass when it is needed, or wait for the pass of another replica to finish.
     /// </summary>
-    /// <param name="timeout">How long to wait for the marker when another replica does the cleanup.</param>
+    /// <param name="timeout">How long to wait for the pass of another replica to finish.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
-    /// <exception cref="InvalidOperationException">The cleanup failed, lost its lock, or did not
-    /// finish within <paramref name="timeout"/>. The message names no key.</exception>
+    /// <exception cref="InvalidOperationException">The pass failed, lost its lock, a Redis primary
+    /// was not reachable, or the pass of another replica did not finish within
+    /// <paramref name="timeout"/>. The message names no key.</exception>
     public async Task RunAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
         var deadline = timeProvider.GetUtcNow() + timeout;
         var db = redis.GetDatabase();
-        var token = Guid.NewGuid().ToString("N");
 
         try
         {
             while (true)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (await IsMarkedAsync(db))
+                var first = await ReadStatusAsync(db);
+                var formerFound = await AnyFormerRowAsync(db, cancellationToken);
+                var second = await ReadStatusAsync(db);
+
+                if (first.Locked || second.Locked)
+                {
+                    await WaitForPassAsync(db, first.Generation, deadline, cancellationToken);
+                    continue;
+                }
+                if (first.Generation != second.Generation)
+                {
+                    continue; // a pass finished between the observations
+                }
+                if (first.Marked && second.Marked && !formerFound)
                 {
                     return;
                 }
 
-                if (await db.StringSetAsync(LockKey, token, LockLifetime, When.NotExists))
+                var token = Guid.NewGuid().ToString("N");
+                var begun = (long)await db.ScriptEvaluateAsync(
+                    BeginPassScript,
+                    [(RedisKey)LockKey, (RedisKey)GenerationKey, (RedisKey)MarkerKey, (RedisKey)IssuedDuringKey],
+                    [(RedisValue)first.Generation, (RedisValue)token, (RedisValue)(long)LockLifetime.TotalMilliseconds]);
+                if (begun == Busy)
                 {
-                    await CleanUnderLockAsync(db, token, cancellationToken);
-                    return;
+                    await WaitForPassAsync(db, first.Generation, deadline, cancellationToken);
+                    continue;
+                }
+                if (begun == FinishedAfterObservation)
+                {
+                    continue;
+                }
+                if (begun != Begun)
+                {
+                    throw new InvalidOperationException("The session store cleanup got an unknown answer when it began.");
                 }
 
-                if (timeProvider.GetUtcNow() >= deadline)
-                {
-                    throw new InvalidOperationException(
-                        "The session store cleanup of another replica did not finish within the startup timeout.");
-                }
-                await Task.Delay(LockPollInterval, timeProvider, cancellationToken);
+                await RunPassAsync(db, token, cancellationToken);
+                return;
             }
         }
         catch (Exception ex) when (ex is RedisException or RedisTimeoutException)
@@ -119,48 +198,72 @@ public sealed class SessionStoreMigration(
         }
     }
 
-    private async Task CleanUnderLockAsync(IDatabase db, string token, CancellationToken ct)
+    private async Task WaitForPassAsync(IDatabase db, long observed, DateTimeOffset deadline, CancellationToken ct)
     {
-        try
+        while (true)
         {
-            // The marker may have been written between the check and the lock.
-            if (await IsMarkedAsync(db))
+            var status = await ReadStatusAsync(db);
+            if (!status.Locked && status.Generation > observed)
             {
                 return;
             }
-
-            var removed = 0;
-            var batch = new List<RedisKey>(BatchSize);
-            // Every primary that is known must be scanned: a marker written after a partial scan would
-            // hide the rows of the one that was not reached. No primary, or one not connected, stops the start.
-            var primaries = redis.GetServers().Where(s => !s.IsReplica).ToList();
-            if (primaries.Count == 0 || primaries.Any(s => !s.IsConnected))
+            if (timeProvider.GetUtcNow() >= deadline)
             {
-                throw new InvalidOperationException("The session store cleanup could not reach every Redis primary.");
+                throw new InvalidOperationException(
+                    "The session store cleanup of another replica did not finish within the startup timeout.");
             }
-            foreach (var server in primaries)
+            await Task.Delay(PollInterval, timeProvider, ct);
+        }
+    }
+
+    private async Task RunPassAsync(IDatabase db, string token, CancellationToken ct)
+    {
+        try
+        {
+            var removed = 0L;
+            foreach (var server in Primaries())
             {
-                await foreach (var key in server.KeysAsync(db.Database, SessionKeyPattern, BatchSize).WithCancellation(ct))
+                await ScanAsync(server, db.Database, type: null, async page =>
                 {
-                    batch.Add(key);
-                    if (batch.Count >= BatchSize)
+                    var extended = (long)await db.ScriptEvaluateAsync(
+                        ExtendPassScript,
+                        [(RedisKey)LockKey, (RedisKey)IssuedDuringKey],
+                        [(RedisValue)token, (RedisValue)(long)LockLifetime.TotalMilliseconds]);
+                    if (extended != 1)
                     {
-                        removed += await DeleteBatchAsync(db, token, batch);
+                        throw new InvalidOperationException("The session store cleanup lost its lock.");
                     }
-                }
-            }
-            removed += await DeleteBatchAsync(db, token, batch);
+                    if (page.Length == 0)
+                    {
+                        return true;
+                    }
 
-            var written = (long)await db.ScriptEvaluateAsync(
-                WriteMarkerScript, [(RedisKey)LockKey, (RedisKey)MarkerKey], [(RedisValue)token, (RedisValue)MarkerValue]);
-            if (written != 1)
+                    var keys = new RedisKey[page.Length + 2];
+                    keys[0] = LockKey;
+                    keys[1] = IssuedDuringKey;
+                    page.CopyTo(keys, 2);
+                    var deleted = (long)await db.ScriptEvaluateAsync(DeletePageScript, keys, [(RedisValue)token]);
+                    if (deleted < 0)
+                    {
+                        throw new InvalidOperationException("The session store cleanup lost its lock.");
+                    }
+                    removed += deleted;
+                    return true;
+                }, ct);
+            }
+
+            var finished = (long)await db.ScriptEvaluateAsync(
+                FinishPassScript,
+                [(RedisKey)LockKey, (RedisKey)MarkerKey, (RedisKey)GenerationKey, (RedisKey)IssuedDuringKey],
+                [(RedisValue)token, (RedisValue)MarkerValue]);
+            if (finished != 1)
             {
                 throw new InvalidOperationException("The session store cleanup lost its lock before it was recorded.");
             }
 
-            logger.LogInformation("session store migration done: removed {Removed} sessions of the former format", removed);
+            logger.LogInformation("session store cleanup done: removed {Removed} sessions", removed);
         }
-        finally
+        catch
         {
             try
             {
@@ -168,39 +271,80 @@ public sealed class SessionStoreMigration(
             }
             catch (Exception ex) when (ex is RedisException or RedisTimeoutException)
             {
-                // The lock expires by itself; nothing waits on it once the marker is written.
-                logger.LogWarning("session store migration: lock not released exceptionType={ExceptionType}", ex.GetType().Name);
+                // The lock expires by itself.
+                logger.LogWarning("session store cleanup: lock not released exceptionType={ExceptionType}", ex.GetType().Name);
+            }
+            throw;
+        }
+    }
+
+    private async Task<bool> AnyFormerRowAsync(IDatabase db, CancellationToken ct)
+    {
+        var found = false;
+        foreach (var server in Primaries())
+        {
+            await ScanAsync(server, db.Database, type: "hash", page =>
+            {
+                found = page.Length > 0;
+                return Task.FromResult(!found);
+            }, ct);
+            if (found)
+            {
+                return true;
             }
         }
+        return false;
     }
 
-    private async Task<int> DeleteBatchAsync(IDatabase db, string token, List<RedisKey> batch)
+    /// <summary>
+    /// Every primary that is known must be scanned: a scan that missed one would hide its rows. No
+    /// primary, or one not connected, stops the start.
+    /// </summary>
+    private List<IServer> Primaries()
     {
-        if (batch.Count == 0)
+        var primaries = redis.GetServers().Where(s => !s.IsReplica).ToList();
+        if (primaries.Count == 0 || primaries.Any(s => !s.IsConnected))
         {
-            return 0;
+            throw new InvalidOperationException("The session store cleanup could not reach every Redis primary.");
         }
-
-        var extended = (long)await db.ScriptEvaluateAsync(
-            ExtendLockScript, [(RedisKey)LockKey], [(RedisValue)token, (RedisValue)(long)LockLifetime.TotalMilliseconds]);
-        if (extended != 1)
-        {
-            throw new InvalidOperationException("The session store cleanup lost its lock.");
-        }
-
-        var keys = new RedisKey[batch.Count + 1];
-        keys[0] = LockKey;
-        batch.CopyTo(keys, 1);
-        batch.Clear();
-
-        var removed = (long)await db.ScriptEvaluateAsync(DeleteBatchScript, keys, [(RedisValue)token]);
-        if (removed < 0)
-        {
-            throw new InvalidOperationException("The session store cleanup lost its lock.");
-        }
-        return (int)removed;
+        return primaries;
     }
 
-    private static async Task<bool> IsMarkedAsync(IDatabase db) =>
-        (string?)await db.StringGetAsync(MarkerKey) == MarkerValue;
+    /// <summary>
+    /// Walk <c>skein:session:*</c> of the database of this process with <c>SCAN</c>, one call of
+    /// <paramref name="onPage"/> per page (an empty page included); it returns false to stop.
+    /// </summary>
+    private static async Task ScanAsync(
+        IServer server, int database, string? type, Func<RedisKey[], Task<bool>> onPage, CancellationToken ct)
+    {
+        var cursor = "0";
+        do
+        {
+            ct.ThrowIfCancellationRequested();
+            List<object> args = [cursor, "MATCH", SessionKeyPattern, "COUNT", PageSize];
+            if (type is not null)
+            {
+                args.Add("TYPE");
+                args.Add(type);
+            }
+            var reply = (RedisResult[])(await server.ExecuteAsync(database, "SCAN", args))!;
+            cursor = (string)reply[0]!;
+            var page = ((RedisResult[])reply[1]!).Select(k => (RedisKey)(string)k!).ToArray();
+            if (!await onPage(page))
+            {
+                return;
+            }
+        }
+        while (cursor != "0");
+    }
+
+    private static async Task<PassStatus> ReadStatusAsync(IDatabase db)
+    {
+        var reply = (RedisResult[])(await db.ScriptEvaluateAsync(
+            PassStatusScript, [(RedisKey)MarkerKey, (RedisKey)LockKey, (RedisKey)GenerationKey]))!;
+        return new PassStatus(
+            Marked: !reply[0].IsNull && (string?)reply[0] == MarkerValue,
+            Locked: (long)reply[1] == 1,
+            Generation: (long)reply[2]);
+    }
 }

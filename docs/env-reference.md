@@ -85,8 +85,9 @@ spellings are shown below; the environment form is the one used in deployments.
   until the window ends.
 - **Required:** no · **Default:** `60` · **Format:** whole number of seconds,
   `1`–`3600`.
-- **Also used by:** the wait of a replica for the session-format cleanup of
-  another replica (see `REDIS_URL`); no marker within the window stops the start.
+- **Also used by:** the wait of a replica for the startup session cleanup of
+  another replica (see `REDIS_URL`); a pass that does not finish within the
+  window stops the start.
 - **If skein-api gives no valid answer within the window:** the process logs a
   critical error naming the last failure and exits with code 1 — the pod never
   becomes ready. There is no default mode to fall back on (E-13). A 401 (wrong
@@ -117,16 +118,30 @@ spellings are shown below; the environment form is the one used in deployments.
   persistence logs everyone out when it restarts.
 - **Topology:** one Redis (a single primary) is supported; Redis Cluster is not (the
   session-format cleanup and the session scripts address several keys at once).
-- **Session format marker:** at startup, before the first request, skein-web
-  deletes once per deployment the session rows of the former format (Redis
-  hashes under `skein:session:*`), so every session issued before the update
-  ends and users sign in once. It records that in the key `skein:session-format`
-  (value `3`), takes the lock `skein:session-format:lock` while it works, and
-  touches no other key. The other replicas wait for the marker and stop the start
-  on the `SKEIN_API_STARTUP_TIMEOUT_SECONDS` window. After a rollback to the
-  former version, delete `skein:session-format` before rolling forward again;
-  without that the cleanup is skipped, and rows of the former format are still
-  rejected (a hash is read as no session, and the cookie format differs).
+- **Startup session cleanup:** at every start, before the first request,
+  skein-web looks for session rows of the former version (Redis hashes under
+  `skein:session:*`) and reads the marker `skein:session-format`.
+  - A plain restart — marker `3` in place, no such hash — ends no session.
+  - When the marker is missing or such a hash is found (the former version ran
+    after a rollback), every `skein:session:*` row that existed when the cleanup
+    began ends: the sessions issued by the former version and the sessions of
+    this version that survived the rollback. Users sign in again. A session
+    issued during the cleanup by a replica that is serving is kept.
+  - The cleanup records itself in `skein:session-format` (value `3`) and uses
+    `skein:session-format:lock`, `skein:session-format:generation` and
+    `skein:session-format:issued-during`. It touches no other key: the reverse
+    index `skein:user-tickets:*`, the DataProtection key ring, the login
+    throttle and the SignalR backplane stay.
+  - A replica that finds the cleanup of another replica running waits until
+    that pass finishes and stops the start on the
+    `SKEIN_API_STARTUP_TIMEOUT_SECONDS` window. A start interrupted during the
+    cleanup leaves the lock to expire; the next start runs the cleanup again.
+  - Rollback procedure: delete `skein:session-format` as part of every rollback
+    to the former version. A rollback that leaves no session of the former
+    version behind is not seen otherwise. Deleting the marker outside a rollback
+    ends every session at the next start.
+  - Every primary must be reachable at startup: the scan for rows of the former
+    version runs on every start, and an unreachable primary stops it.
 
 #### `NATS_URL`
 

@@ -26,7 +26,9 @@ namespace SkeinWeb.Auth;
 /// WRITE: an issue and a renewal give the row min(idle limit, time left until the end of the
 /// session) in the same script that writes it, together with the reverse index. A renewal whose
 /// session has ended by the time the script runs — by the clock of Redis — deletes the row and
-/// writes nothing.
+/// writes nothing. While a startup cleanup pass holds its lock, the issue script marks the new row
+/// in the set of that pass before it writes the row, so the pass keeps it; when the mark fails, no
+/// row is written and the issue fails (<see cref="SessionStoreMigration"/>).
 /// </para>
 /// <para>
 /// READ: every read checks the window of the ticket (<see cref="SessionWindow.TryRead"/>) and the
@@ -98,32 +100,54 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     /// <summary>
     /// Maintenance of the reverse index inside a script that has just written the lifetime of the
     /// row <c>KEYS[1]</c> (the row exists at this point): adds the member — the last argument,
-    /// <c>ARGV[#ARGV]</c>, the session key — to the
-    /// index <c>KEYS[2]</c> and gives the index the actual <c>PTTL</c> of the row when the index
-    /// has no lifetime or a shorter one. Runs under <c>redis.pcall</c>: a failure returns
-    /// <see cref="RowWriteIndexFailed"/> and leaves the written row as it is. Without
-    /// <c>KEYS[2]</c> (a ticket without a user) there is no index to maintain.
+    /// <c>ARGV[#ARGV]</c>, the session key — to the index, the key the script put into the local
+    /// <c>ik</c> (<see cref="IndexKeyAt2"/>, <see cref="IndexKeyAt4"/>), and gives the index the
+    /// actual <c>PTTL</c> of the row when the index has no lifetime or a shorter one. Runs under
+    /// <c>redis.pcall</c>: a failure returns <see cref="RowWriteIndexFailed"/> and leaves the
+    /// written row as it is. Without an index key (a ticket without a user) there is no index to
+    /// maintain.
     /// </summary>
     private const string IndexMaintain =
-        "if #KEYS < 2 then return 1 end " +
-        "local added = redis.pcall('SADD', KEYS[2], ARGV[#ARGV]) " +
+        "if not ik then return 1 end " +
+        "local added = redis.pcall('SADD', ik, ARGV[#ARGV]) " +
         "if type(added) == 'table' and added.err then return 2 end " +
         "local row = redis.call('PTTL', KEYS[1]) " +
-        "local index = redis.pcall('PTTL', KEYS[2]) " +
+        "local index = redis.pcall('PTTL', ik) " +
         "if type(index) == 'table' and index.err then return 2 end " +
         "if row > 0 and (index == -1 or row > index) then " +
-        "local set = redis.pcall('PEXPIRE', KEYS[2], row) " +
+        "local set = redis.pcall('PEXPIRE', ik, row) " +
         "if type(set) == 'table' and set.err then return 2 end end " +
         "return 1";
+
+    /// <summary>The index of a script whose <c>KEYS</c> are the row and, when there is one, the index.</summary>
+    private const string IndexKeyAt2 = "local ik = KEYS[2] ";
+
+    /// <summary>The index of the issue script, whose <c>KEYS</c> are the row, the lock and the marks of a cleanup pass and, when there is one, the index.</summary>
+    private const string IndexKeyAt4 = "local ik = KEYS[4] ";
 
     // The lifetime write of a read: PEXPIRE of the row (ARGV[1] milliseconds), then the index.
     // A row that is gone is not recreated and gets no index member.
     private const string ReadLifetimeScript =
+        IndexKeyAt2 +
         "if redis.call('PEXPIRE', KEYS[1], ARGV[1]) == 0 then return 0 end " + IndexMaintain;
 
-    // The issue: SET NX PX (ARGV[1] the ticket, ARGV[2] milliseconds), then the index. An existing
-    // row (a collision) is left as it is and gets no index member.
+    // The issue (KEYS: the row, the lock and the set of marks of the startup cleanup, the index;
+    // ARGV: the ticket, milliseconds, the session key). An existing row (a collision) is left as it
+    // is and nothing is written. While a cleanup pass holds the lock, the row is first marked in its
+    // set as "value of the lock:key" and the set gets at least the lifetime left to the lock — with
+    // redis.call, before the row is written: a failed mark aborts the script and no row is written,
+    // so no session survives a pass unmarked. Then SET NX PX and the index part.
     private const string IssueScript =
+        IndexKeyAt4 +
+        "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end " +
+        "local lock = redis.call('GET', KEYS[2]) " +
+        "if lock then " +
+        "redis.call('SADD', KEYS[3], lock .. ':' .. KEYS[1]) " +
+        "local held = redis.call('PTTL', KEYS[2]) " +
+        "local marks = redis.call('PTTL', KEYS[3]) " +
+        "if held == -1 then redis.call('PERSIST', KEYS[3]) " +
+        "elseif held > 0 and marks < held then redis.call('PEXPIRE', KEYS[3], held) end " +
+        "end " +
         "if not redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 0 end " + IndexMaintain;
 
     // The renewal: replace the row only if it still holds the bytes the renewal read (ARGV[1]); a row
@@ -133,6 +157,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     // the row is deleted and nothing is written; otherwise it gets the new bytes (ARGV[2]) for
     // min(idle limit ARGV[4] in milliseconds, time left), then the index.
     private const string CompareAndSetScript =
+        IndexKeyAt2 +
         "local current = redis.call('GET', KEYS[1]) " +
         "if not current then return 5 end " +
         "if current ~= ARGV[1] then return 3 end " +
@@ -307,7 +332,7 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
                 var bytes = TicketSerializer.Default.Serialize(SessionPrincipal.WithSessionKey(stored, key));
                 var outcome = (long)await db.ScriptEvaluateAsync(
                     IssueScript,
-                    LifetimeKeys(key, stored),
+                    IssueKeys(key, stored),
                     [(RedisValue)bytes, (RedisValue)(long)lifetime.TotalMilliseconds, (RedisValue)key]).WaitAsync(ct);
                 if (outcome == RowWriteAbsent)
                 {
@@ -528,6 +553,17 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         }
         return ticket;
     }
+
+    /// <summary>
+    /// <c>KEYS</c> of the issue script: the row, the lock and the set of marks of the startup
+    /// cleanup (<see cref="SessionStoreMigration"/>) and, when the ticket names its user, the user's
+    /// reverse index (<see cref="IndexMaintain"/>).
+    /// </summary>
+    private static RedisKey[] IssueKeys(string key, AuthenticationTicket ticket) =>
+        TryReadUserId(ticket.Principal) is { } userId
+            ? [(RedisKey)key, (RedisKey)SessionStoreMigration.LockKey, (RedisKey)SessionStoreMigration.IssuedDuringKey,
+                (RedisKey)(UserIndexPrefix + userId)]
+            : [(RedisKey)key, (RedisKey)SessionStoreMigration.LockKey, (RedisKey)SessionStoreMigration.IssuedDuringKey];
 
     /// <summary>
     /// <c>KEYS</c> of a lifetime-writing script: the row and, when the ticket names its user, the

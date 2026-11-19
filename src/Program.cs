@@ -408,10 +408,13 @@ app.Logger.LogInformation(
     sessionTimeouts.IdleHours,
     sessionTimeouts.AbsoluteHours);
 
-// Strict migration of the session format: before the first request is served,
-// the session rows of the former format are deleted once per deployment under a
-// lock, and the marker skein:session-format = 3 is written. Other replicas wait
-// for the marker and fail the start on SKEIN_API_STARTUP_TIMEOUT_SECONDS.
+// Startup cleanup of the session store: before the first request is served. A
+// plain restart (marker skein:session-format = 3, no hash of the former format
+// under skein:session:*) ends no session. When the marker is missing or such a
+// hash is found (the former version ran after a rollback), every session row that
+// existed when the cleanup began ends; rows issued during it stay, non-session
+// keys are not touched. A replica that finds another replica's pass waits for it
+// to finish and fails the start on SKEIN_API_STARTUP_TIMEOUT_SECONDS.
 await app.Services.GetRequiredService<SessionStoreMigration>()
     .RunAsync(apiStartupTimeout, CancellationToken.None);
 
