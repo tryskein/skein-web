@@ -40,7 +40,9 @@ namespace SkeinWeb.Auth;
 /// the user's session keys, walked by <see cref="RemoveUserSessionsAsync"/>. It drives
 /// event-driven invalidation and the hub's ownership probe. The script that writes a row's
 /// lifetime also adds the key to the index and lifts the index lifetime to the row's actual one
-/// (<see cref="IndexMaintain"/>), so the index never expires before a live row of its user.
+/// (<see cref="IndexMaintain"/>), so the index never expires before a live row of its user; a
+/// failed index part is repaired by the next lifetime write of that session. Members whose rows
+/// are gone are removed when the user signs in next (<see cref="IndexPruneScript"/>).
 /// </para>
 /// <para>
 /// The request-level decisions (suppressed write, renewal outcome, issued key, removed
@@ -73,9 +75,6 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
 
     /// <summary>Reverse-index key prefix; combined with the user UUID to form a Set of session keys.</summary>
     private const string UserIndexPrefix = "skein:user-tickets:";
-
-    /// <summary>Sliding session lifetime. 24h matches the cookie ExpireTimeSpan.</summary>
-    private static readonly TimeSpan SessionLifetime = TimeSpan.FromHours(24);
 
     /// <summary>Compare-and-set attempts of a renewal on a live key before it reports <see cref="RenewOutcome.CasExhausted"/>.</summary>
     private const int CasAttempts = 3;
@@ -139,6 +138,16 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
         "local left = tonumber(ARGV[3]) - now " +
         "if left < 1 then redis.call('DEL', KEYS[1]) return 4 end " +
         "redis.call('SET', KEYS[1], ARGV[2], 'PX', math.min(tonumber(ARGV[4]), left)) " + IndexMaintain;
+
+    // Dead members of a reverse index (KEYS[1]): every member whose row no longer exists is
+    // removed; members with a live row stay. Returns the number removed.
+    private const string IndexPruneScript =
+        "local dead = {} " +
+        "for _, member in ipairs(redis.call('SMEMBERS', KEYS[1])) do " +
+        "if redis.call('EXISTS', member) == 0 then dead[#dead + 1] = member end end " +
+        "for i = 1, #dead, 1000 do " +
+        "redis.call('SREM', KEYS[1], unpack(dead, i, math.min(i + 999, #dead))) end " +
+        "return #dead";
 
     /// <summary>Outcome of the renewal script: the row no longer holds the bytes the renewal read; nothing was written.</summary>
     private const long RenewLost = 3;
@@ -282,9 +291,10 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             throw new SessionStoreUnavailableException();
         }
 
+        var db = _redis.GetDatabase();
+        await TryPruneIndexAsync(db, stored, ct);
         try
         {
-            var db = _redis.GetDatabase();
             for (var attempt = 1; attempt <= IssueAttempts; attempt++)
             {
                 var key = KeyPrefix + NewSessionId();
@@ -741,27 +751,24 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
     // ---- Index ----------------------------------------------------------------------------------
 
     /// <summary>
-    /// SADD the key into the user's reverse-index Set and set its TTL to the session lifetime.
-    /// Best-effort: a failure only weakens event-driven invalidation (the SSO refresh fallback
-    /// still catches stale claims), so it is logged and swallowed.
+    /// Remove from the reverse index of the ticket's user the members whose rows are gone, before an
+    /// issue (<see cref="IndexPruneScript"/>), so dead members do not outlive the user's next
+    /// sign-in. Live members stay. Best-effort: a failure leaves the index as it was and does not
+    /// affect the issue.
     /// </summary>
-    private async Task TryIndexAsync(AuthenticationTicket ticket, string key)
+    private async Task TryPruneIndexAsync(IDatabase db, AuthenticationTicket ticket, CancellationToken ct)
     {
         if (TryReadUserId(ticket.Principal) is not { } userId)
         {
             return;
         }
-
         try
         {
-            var db = _redis.GetDatabase();
-            var indexKey = UserIndexPrefix + userId;
-            await db.SetAddAsync(indexKey, key);
-            await db.KeyExpireAsync(indexKey, SessionLifetime);
+            await db.ScriptEvaluateAsync(IndexPruneScript, [(RedisKey)(UserIndexPrefix + userId)]).WaitAsync(ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            LogFailure("index-add", ex);
+            LogFailure("index-prune-dead", ex);
         }
     }
 
