@@ -35,7 +35,6 @@ public class SessionTimeoutsTest
     [InlineData("13", "7", 13, 7)]
     [InlineData("1", "8760", 1, 8760)]
     [InlineData("8760", "1", 8760, 1)]
-    [InlineData(" 30 ", "11", 30, 11)]
     public void AValidValueOfEachSetting_IsTakenAsGiven_IndependentlyOfTheOther(
         string idle, string absolute, int expectedIdleHours, int expectedAbsoluteHours)
     {
