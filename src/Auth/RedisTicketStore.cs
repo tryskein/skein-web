@@ -476,18 +476,22 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             LogFailure("retrieve", ex);
             throw new SessionStoreUnavailableException();
         }
-        if (bytes is null || bytes.Length == 0)
+        if (bytes is null)
         {
             return null;
         }
 
-        var ticket = TryDeserializeQuietly(bytes);
+        // An empty value is a row that holds no ticket: like unreadable bytes, no valid window.
+        var ticket = bytes.Length == 0 ? null : TryDeserializeQuietly(bytes);
         if (ticket is null || !SessionWindow.TryRead(ticket.Properties, out var window))
         {
-            await DeleteRowAsync(db, key, "retrieve-invalid", ct);
-            _logger.LogWarning(
-                "session row without a valid window deleted; treated as no session reason={Reason}",
-                ticket is null ? "unreadable" : "window");
+            // One Warning per session: only the request whose DEL removed the row logs it.
+            if (await DeleteRowAsync(db, key, "retrieve-invalid", ct))
+            {
+                _logger.LogWarning(
+                    "session row without a valid window deleted; treated as no session reason={Reason}",
+                    ticket is null ? "unreadable" : "window");
+            }
             return null;
         }
 
@@ -534,12 +538,15 @@ public sealed class RedisTicketStore : ITicketStore, IUserSessionRevoker, ISessi
             ? [(RedisKey)key, (RedisKey)(UserIndexPrefix + userId)]
             : [(RedisKey)key];
 
-    /// <summary>Delete a row the read found unusable; a technical failure is a store failure.</summary>
-    private async Task DeleteRowAsync(IDatabase db, string key, string operation, CancellationToken ct)
+    /// <summary>
+    /// Delete a row the read found unusable; true when this call removed it. A technical failure is a
+    /// store failure.
+    /// </summary>
+    private async Task<bool> DeleteRowAsync(IDatabase db, string key, string operation, CancellationToken ct)
     {
         try
         {
-            await db.KeyDeleteAsync(key).WaitAsync(ct);
+            return await db.KeyDeleteAsync(key).WaitAsync(ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
