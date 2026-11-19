@@ -90,7 +90,6 @@ public sealed class RedisTicketStoreTest : IDisposable
     private static async Task<RenewOutcome?> RenewAsync(RedisTicketStore store, string key, AuthenticationTicket ticket)
     {
         var ctx = new DefaultHttpContext();
-        SessionRequestState.Of(ctx).ExplicitRenewal = true;
         await store.RenewAsync(key, ticket, ctx, CancellationToken.None);
         return SessionRequestState.Of(ctx).RenewOutcome;
     }

@@ -121,7 +121,6 @@ public class RedisTicketStoreFailureTest
         var (store, db) = Build();
         db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
         var ctx = new DefaultHttpContext();
-        SessionRequestState.Of(ctx).ExplicitRenewal = true;
 
         await Assert.ThrowsAsync<SessionStoreUnavailableException>(
             () => store.RenewAsync(Key, Ticket(), ctx, CancellationToken.None));

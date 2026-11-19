@@ -17,9 +17,6 @@ public enum RenewOutcome
 
     /// <summary>The request decided that Main must not write anymore (<see cref="SessionRequestState.SuppressMainWrite"/>).</summary>
     Suppressed,
-
-    /// <summary>The store could not be reached. Nothing is known to be written.</summary>
-    TechnicalFailure,
 }
 
 /// <summary>
@@ -54,13 +51,6 @@ public sealed class SessionRequestState
     /// not set it). Main adds no Set-Cookie when it is set and is not <see cref="RenewOutcome.Written"/>.
     /// </summary>
     public RenewOutcome? RenewOutcome { get; set; }
-
-    /// <summary>
-    /// The renewal under way is the explicit step of the request (the SSO renewal). The store does
-    /// not depend on it: every renewal is that step, and a technical store failure of a renewal is
-    /// thrown to the caller.
-    /// </summary>
-    public bool ExplicitRenewal { get; set; }
 
     /// <summary>The request carried a session key that was revoked by the issuer (for the issue event of the log).</summary>
     public bool PreviousKeyRevoked { get; set; }

@@ -75,7 +75,6 @@ public class SessionCookieManagerTest
     [InlineData(RenewOutcome.CasExhausted)]
     [InlineData(RenewOutcome.OwnerMismatch)]
     [InlineData(RenewOutcome.Suppressed)]
-    [InlineData(RenewOutcome.TechnicalFailure)]
     public void Main_WithAnyOtherRenewOutcome_WritesNoCookie(RenewOutcome outcome)
     {
         var manager = new SessionCookieManager(new ChunkingCookieManager());

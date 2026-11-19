@@ -201,20 +201,11 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
             {
                 return Results.Unauthorized();
             }
-            var state = SessionRequestState.Of(ctx);
-            state.ExplicitRenewal = true;
-            try
-            {
-                await ctx.SignInAsync(
-                    SessionSchemes.Main,
-                    PrincipalOf(Guid.Parse(read.Principal!.FindFirstValue(ClaimTypes.NameIdentifier)!)),
-                    read.Properties!.Clone());
-            }
-            finally
-            {
-                state.ExplicitRenewal = false;
-            }
-            return Results.Json(new { outcome = state.RenewOutcome?.ToString() });
+            await ctx.SignInAsync(
+                SessionSchemes.Main,
+                PrincipalOf(Guid.Parse(read.Principal!.FindFirstValue(ClaimTypes.NameIdentifier)!)),
+                read.Properties!.Clone());
+            return Results.Json(new { outcome = SessionRequestState.Of(ctx).RenewOutcome?.ToString() });
         });
         app.MapGet("/test/issue-then-hub", async (HttpContext ctx, SessionIssuer issuer, Guid user) =>
         {

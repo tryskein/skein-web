@@ -30,12 +30,16 @@ namespace SkeinWeb.Middleware;
 ///   <item>No session: confirm the subject at skein-api and issue a new session through
 ///         <see cref="SessionIssuer"/>, remembering the header pair in the ticket.</item>
 ///   <item>A live session whose remembered pair equals the request's pair: nothing is asked of
-///         skein-api (the sliding renewal of the cookie handler applies), except the periodic
-///         refresh every <see cref="SessionRefreshTtl"/>.</item>
+///         skein-api and the ticket is not written (the read of the request only moves the lifetime
+///         of the row), except the periodic refresh every <see cref="SessionRefreshTtl"/>.</item>
 ///   <item>A different or unknown pair, or a due refresh: confirm the subject. Another user id → a
 ///         new session, the old key revoked. The same id with another epoch → the session ends and
 ///         nothing is issued. The same id and epoch → an explicit renewal of the same key with the
-///         confirmed claims and the new pair; an absent row → a new session.</item>
+///         confirmed claims and the new pair: the window of the session is kept and the persistent
+///         cookie expires at the end of the session as of the renewal (<see cref="SessionWindow.SessionEnd"/>,
+///         under the limits in effect). A row that is gone, or a session that has ended by the
+///         renewal, is a new session under a new key with its own window and cookie; no write and
+///         no Set-Cookie of the old key.</item>
 ///   <item>An unconfirmed subject is neither executed as the old user nor given a session.</item>
 /// </list></para>
 /// </remarks>
@@ -151,7 +155,7 @@ public sealed class SsoSessionMiddleware : IMiddleware
                 return;
             }
 
-            if (!await ApplyToLiveSessionAsync(context, confirmed, email, username))
+            if (!await ApplyToLiveSessionAsync(context, current?.Properties, confirmed, email, username))
             {
                 return;
             }
@@ -249,9 +253,12 @@ public sealed class SsoSessionMiddleware : IMiddleware
     /// The confirmed subject against the live session: another id → a new authentication (the old key
     /// is revoked); the same id and another epoch → the session ends and nothing is issued; the same id
     /// and epoch → an explicit renewal of the same key. False when the response is already written.
+    /// <para>The epoch is compared here, before any write: the store checks only the owner of the row,
+    /// so this comparison is what keeps a renewal from carrying a session across a revocation.
+    /// <c>current</c> holds the properties Main read for this request: the window of the session.</para>
     /// </summary>
     private async Task<bool> ApplyToLiveSessionAsync(
-        HttpContext context, Confirmed confirmed, string email, string username)
+        HttpContext context, AuthenticationProperties? current, Confirmed confirmed, string email, string username)
     {
         var ticketUserId = context.User.FindFirstValue(ClaimTypes.NameIdentifier);
         if (!string.Equals(ticketUserId, confirmed.User.Id, StringComparison.OrdinalIgnoreCase))
@@ -284,30 +291,39 @@ public sealed class SsoSessionMiddleware : IMiddleware
             return true;
         }
 
-        return await RenewSameKeyAsync(context, confirmed, email, username);
+        return await RenewSameKeyAsync(context, current, confirmed, email, username);
     }
 
+    /// <summary>
+    /// The explicit renewal of the same key, the only write of a live session's ticket. The window
+    /// comes from <paramref name="current"/>, read once by Main for this request: the properties of
+    /// the renewal carry the sign-in time and the end of the session as of now, so the handler gives
+    /// the persistent cookie that end as its expiry before it writes to the store, which keeps the
+    /// window of the stored row. A window that is not valid, or a session that has ended by now
+    /// (<see cref="SessionWindow.TryGetRowLifetime"/>: a time left under 1 ms included), is handled
+    /// like an absent key: a new session, and <c>SignInAsync</c> of Main is not called.
+    /// </summary>
     private async Task<bool> RenewSameKeyAsync(
-        HttpContext context, Confirmed confirmed, string email, string username)
+        HttpContext context, AuthenticationProperties? current, Confirmed confirmed, string email, string username)
     {
-        var key = SessionPrincipal.SessionKeyOf(context.User);
-        var principal = NewPrincipal(confirmed);
-        var state = SessionRequestState.Of(context);
-        state.ExplicitRenewal = true;
-        try
+        var timeouts = _services.GetRequiredService<SessionTimeouts>();
+        var now = _services.GetRequiredService<TimeProvider>().GetUtcNow();
+        if (current is null
+            || !SessionWindow.TryRead(current, out var window)
+            || !window.TryGetRowLifetime(timeouts, now, out _))
         {
-            await context.SignInAsync(
-                CookieAuthenticationDefaults.AuthenticationScheme,
-                principal,
-                NewProperties(email, username, pairWrite: true));
-        }
-        finally
-        {
-            // Only this step is explicit: a later sliding renewal of the handler in the same request
-            // carries a clone of the earlier read and must not write it over the confirmed claims.
-            state.ExplicitRenewal = false;
+            _logger.LogInformation("sso: the session has ended before its renewal; a new session is issued");
+            return await RotateToAsync(context, confirmed, email, username);
         }
 
+        var key = SessionPrincipal.SessionKeyOf(context.User);
+        var principal = NewPrincipal(confirmed);
+        var properties = NewProperties(email, username, pairWrite: true);
+        properties.IssuedUtc = window.IssuedUtc;
+        properties.ExpiresUtc = window.SessionEnd(timeouts);
+        await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal, properties);
+
+        var state = SessionRequestState.Of(context);
         switch (state.RenewOutcome)
         {
             case RenewOutcome.Written when key is not null:
@@ -317,7 +333,8 @@ public sealed class SsoSessionMiddleware : IMiddleware
                 return true;
 
             case RenewOutcome.KeyAbsent:
-                // The row is gone (revoked in parallel): a new authentication from the answer already in hand.
+                // The row is gone (revoked in parallel, or the session ended by the moment of the write):
+                // a new authentication from the answer already in hand.
                 return await RotateToAsync(context, confirmed, email, username);
 
             case RenewOutcome.CasExhausted:
@@ -467,8 +484,8 @@ public sealed class SsoSessionMiddleware : IMiddleware
 
     private static async Task WriteJsonStatusAsync(HttpContext context, int statusCode, object body)
     {
-        // Every answer written here is a refusal: the late sliding write of Main (a renewal it already
-        // planned) must neither touch the row nor add a Set-Cookie of the old key beside it.
+        // Every answer written here is a refusal: no later write of Main in this request may touch the
+        // row or add a Set-Cookie of the old key beside it.
         SessionRequestState.Of(context).SuppressMainWrite = true;
         context.Response.StatusCode = statusCode;
         context.Response.ContentType = "application/json";
