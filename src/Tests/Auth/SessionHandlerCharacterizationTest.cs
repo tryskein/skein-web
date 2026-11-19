@@ -21,15 +21,15 @@ namespace SkeinWeb.Tests.Auth;
 
 /// <summary>
 /// Characterization of the stock ASP.NET Core cookie handler against the session mechanism
-/// the plan builds on (spike, questions Q0–Q6). The handler is the real
+/// the plan builds on (spike, questions Q1 and Q3–Q6). The handler is the real
 /// <see cref="CookieAuthenticationHandler"/> running in Kestrel on a loopback port, so
-/// <c>OnStarting</c> and the late sliding renewal run exactly as in production; only the
+/// <c>OnStarting</c> runs exactly as in production; only the
 /// ticket store and the request-level decision (<see cref="SpikeRequestState"/>) are in-memory
 /// stand-ins for the product pieces that do not exist yet. The expectations come from the
-/// plan (new key on issue, one session cookie after rotation, no late write after a
-/// revocation, no row for an absent key), not from what the stand returned when the test
-/// was written. Each negative result is paired with a positive control on the same stand,
-/// because a negative on a stand that cannot see writes is green by construction.
+/// plan (new key on issue, deletion of the cookie without the store, sign-out removing the row),
+/// not from what the stand returned when the test was written. The product no longer relies on
+/// the handler's sliding renewal: that no ticket is written without a sign-in, and that a failed
+/// renewal sets no cookie, is checked on the product's own pipeline.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
@@ -62,25 +62,6 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         Assert.Equal(10, Environment.Version.Major);
         Assert.NotNull(cookiesVersion);
         Assert.StartsWith("10.", cookiesVersion);
-    }
-
-    // ---- Q0: positive control — the stand sees an ordinary sliding renewal ------------------
-
-    [Fact]
-    public async Task Q0_SlidingRenewalOfMain_WritesTheRowAndSetsTheCookie()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, key) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13)); // more than half of the 24 h lifetime
-        stand.Store.ResetCounters();
-
-        var reply = await stand.GetAsync("/me", cookie);
-
-        Assert.Equal("auth=True", reply.Body);
-        var set = Assert.Single(reply.SessionCookies(stand.CookieName));
-        Assert.Equal(key, stand.KeyOf(set));
-        Assert.Equal(1, stand.Store.WrittenRenewals);
-        Assert.True(stand.Store.ContextOverloadCalls > 0, "the handler is expected to call the HttpContext overloads of ITicketStore");
     }
 
     // ---- Q1: the Issue scheme gives a new key while the old one is live ---------------------
@@ -133,103 +114,6 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         Assert.Equal(1, stand.Store.StoreCalls);
     }
 
-    // ---- Q2: late sliding write of Main -----------------------------------------------------
-
-    [Fact]
-    public async Task Q2_Control_WithoutSuppressionTheLateSlidingWriteHappens()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, key) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-        stand.Store.ResetCounters();
-
-        var reply = await stand.GetAsync("/me", cookie);
-
-        Assert.Single(reply.SessionCookies(stand.CookieName));
-        Assert.Equal(1, stand.Store.WrittenRenewals);
-        Assert.Contains(key, stand.Store.RenewedKeys);
-    }
-
-    [Fact]
-    public async Task Q2_SuppressMainWrite_NoRowWriteAndNoSetCookie()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, _) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-        stand.Store.ResetCounters();
-
-        var reply = await stand.GetAsync("/me-suppressed", cookie);
-
-        Assert.Equal(HttpStatusCode.OK, reply.Status);
-        Assert.Empty(reply.SessionCookies(stand.CookieName));
-        Assert.Equal(0, stand.Store.WrittenRenewals);
-        Assert.Empty(stand.Errors);
-    }
-
-    [Theory]
-    [InlineData(RenewOutcome.KeyAbsent)]
-    [InlineData(RenewOutcome.CasExhausted)]
-    [InlineData(RenewOutcome.OwnerMismatch)]
-    public async Task Q2_RenewOutcomeOtherThanWritten_NoRowWriteAndNoSetCookie(RenewOutcome outcome)
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, _) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-        stand.Store.ResetCounters();
-        stand.Store.SimulatedRenewOutcome = outcome;
-
-        var reply = await stand.GetAsync("/me", cookie);
-
-        Assert.Equal(HttpStatusCode.OK, reply.Status);
-        Assert.Empty(reply.SessionCookies(stand.CookieName));
-        Assert.Equal(0, stand.Store.WrittenRenewals);
-        Assert.Equal(1, stand.Store.RenewCalls);
-        Assert.Empty(stand.Errors);
-    }
-
-    [Fact]
-    public async Task Q2_RedisFailureInBackgroundRenewalCaughtByTheStore_DoesNotThrowFromOnStarting()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, _) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-        stand.Store.ResetCounters();
-        stand.Store.RenewFailure = RenewFailure.CaughtInStore;
-
-        var reply = await stand.GetAsync("/me", cookie);
-
-        Assert.Equal(HttpStatusCode.OK, reply.Status);
-        Assert.Empty(reply.SessionCookies(stand.CookieName));
-        Assert.Equal(0, stand.Store.WrittenRenewals);
-        Assert.Empty(stand.Errors);
-    }
-
-    [Fact]
-    public async Task Q2_Control_RedisFailureNotCaughtByTheStore_ShowsUpAsAnApplicationError()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, _) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-        stand.Store.ResetCounters();
-        stand.Store.RenewFailure = RenewFailure.Unhandled;
-
-        await stand.TryGetAsync("/me", cookie);
-
-        Assert.Contains(stand.Errors, e => e.ChainContains("redis down (renew)"));
-    }
-
-    [Fact]
-    public async Task Q2_IssueThroughMain_WithoutRenewOutcome_WritesTheCookie()
-    {
-        await using var stand = await Stand.StartAsync();
-
-        var reply = await stand.GetAsync($"/signin/{Main}", cookie: null);
-
-        var set = Assert.Single(reply.SessionCookies(stand.CookieName));
-        Assert.True(stand.Store.Rows.ContainsKey(stand.KeyOf(set)));
-        Assert.Equal(1, stand.Store.StoreCalls);
-    }
-
     // ---- Q3: a new purpose rejects cookies of the previous one ------------------------------
 
     [Theory]
@@ -253,39 +137,7 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         Assert.Equal("auth=True", withNew.Body); // control: the same row, the current purpose
     }
 
-    // ---- Q4: one session cookie after a rotation; deletion without the store ----------------
-
-    [Fact]
-    public async Task Q4_Control_WithoutSuppressionARotationYieldsTwoSessionCookies()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, oldKey) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-
-        var reply = await stand.GetAsync("/rotate?revoke=false&suppress=false", cookie);
-        Dump(stand, reply, oldKey);
-
-        Assert.Equal(2, reply.SessionCookies(stand.CookieName).Count);
-    }
-
-    [Fact]
-    public async Task Q4_RotationWithSuppression_YieldsExactlyOneSessionCookieWithTheNewKey()
-    {
-        await using var stand = await Stand.StartAsync();
-        var (cookie, oldKey) = await stand.SeedAsync();
-        stand.Time.Advance(TimeSpan.FromHours(13));
-        stand.Store.ResetCounters();
-
-        var reply = await stand.GetAsync("/rotate?revoke=true&suppress=true", cookie);
-        Dump(stand, reply, oldKey);
-
-        var set = Assert.Single(reply.SessionCookies(stand.CookieName));
-        var newKey = stand.KeyOf(set);
-        Assert.NotEqual(oldKey, newKey);
-        Assert.True(stand.Store.Rows.ContainsKey(newKey));
-        Assert.False(stand.Store.Rows.ContainsKey(oldKey));
-        Assert.Equal(0, stand.Store.WrittenRenewals);
-    }
+    // ---- Q4: deletion of the cookie and sign-out ---------------------------------------------
 
     [Fact]
     public async Task Q4_DeletingTheCookieThroughTheMainManager_NeedsNoStoreCall()
@@ -312,19 +164,6 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
         Assert.Contains(reply.Cookies, c => c.Name == stand.CookieName && c.IsDeletion);
         Assert.False(stand.Store.Rows.ContainsKey(key));
         Assert.True(stand.Store.RemoveCalls >= 1);
-    }
-
-    private void Dump(Stand stand, Reply reply, string oldKey)
-    {
-        output.WriteLine($"status {reply.Status}, old key {oldKey}, errors {stand.Errors.Count}");
-        foreach (var c in reply.Cookies)
-        {
-            output.WriteLine($"Set-Cookie {c.Name} deletion={c.IsDeletion} key={(c.Name == stand.CookieName && !c.IsDeletion ? stand.KeyOf(c) : "-")}");
-        }
-        foreach (var e in stand.Errors)
-        {
-            output.WriteLine($"error: {e.Message}");
-        }
     }
 
     // ---- Q5: a remote (OIDC-shaped) callback ------------------------------------------------
