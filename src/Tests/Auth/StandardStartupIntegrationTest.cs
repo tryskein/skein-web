@@ -32,8 +32,12 @@ internal sealed class StartupStand : IAsyncDisposable
     public IDatabase Db => Mux.GetDatabase(RedisProxy.Database);
     public HttpClient Http { get; }
 
-    private StartupStand(RedisProxy proxy, StubSkeinApi api, AppProcess app, ConnectionMultiplexer mux)
+    private readonly IDictionary<string, string?> _environment;
+    private readonly List<AppProcess> _others = [];
+
+    private StartupStand(RedisProxy proxy, StubSkeinApi api, AppProcess app, ConnectionMultiplexer mux, IDictionary<string, string?> environment)
     {
+        _environment = environment;
         Proxy = proxy;
         Api = api;
         App = app;
@@ -63,7 +67,7 @@ internal sealed class StartupStand : IAsyncDisposable
             {
                 await beforeLaunch(proxy);
             }
-            var app = AppProcess.Start(new Dictionary<string, string?>
+            var environmentOfTheStand = new Dictionary<string, string?>
             {
                 ["ASPNETCORE_ENVIRONMENT"] = environment,
                 ["SKEIN_ALLOW_INSECURE_HTTP"] = insecure,
@@ -73,8 +77,9 @@ internal sealed class StartupStand : IAsyncDisposable
                 ["NATS_URL"] = Environment.GetEnvironmentVariable("TEST_NATS_URL"),
                 ["SKEIN_TRUSTED_PROXIES"] = trusted,
                 ["SKEIN_API_STARTUP_TIMEOUT_SECONDS"] = "60",
-            });
-        return new StartupStand(proxy, api, app, mux);
+            };
+            var app = AppProcess.Start(environmentOfTheStand);
+            return new StartupStand(proxy, api, app, mux, environmentOfTheStand);
         }
         catch
         {
@@ -86,6 +91,18 @@ internal sealed class StartupStand : IAsyncDisposable
             mux.Dispose();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Starts one more process of the application with the settings of the stand, on the same
+    /// Redis proxy, database and stub skein-api. The stand stays the only owner of the database: it
+    /// is not flushed here, and the stand stops every process it started when it is disposed.
+    /// </summary>
+    public AppProcess StartAnother()
+    {
+        var app = AppProcess.Start(_environment);
+        _others.Add(app);
+        return app;
     }
 
     public async Task<(HttpStatusCode Status, string Body, string[] SetCookies)> SendAsync(
@@ -112,6 +129,10 @@ internal sealed class StartupStand : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         Http.Dispose();
+        foreach (var other in _others)
+        {
+            other.Dispose();
+        }
         App.Dispose();
         Proxy.Dispose();
         await Api.DisposeAsync();
@@ -120,34 +141,39 @@ internal sealed class StartupStand : IAsyncDisposable
     }
 }
 
-/// <summary>The startup order of the real application (R68) and the agent bypass (R72), on the stand.</summary>
+/// <summary>
+/// The startup order of the real application around the startup session cleanup (R68), two processes
+/// on one Redis, and the agent bypass (R72), on the stand. The holds name the commands the
+/// application really sends: the scan for rows of the former format, and the scripts of the pass by
+/// their keys (an <c>EVALSHA</c> carries a SHA, not the script text).
+/// </summary>
 [Trait("Category", "Integration")]
 [Collection("startup-stand")]
 public sealed class StandardStartupIntegrationTest
 {
     private const string Legacy = "skein:session:legacy";
 
-    private static async Task SeedLegacyAsync(StartupStand stand) =>
-        await stand.Db.HashSetAsync(Legacy, [new HashEntry("absexp", -1), new HashEntry("sldexp", 86400), new HashEntry("data", new byte[] { 1 })]);
-
-    private static async Task AssertNoPortForAWhileAsync(StartupStand stand)
+    private static async Task AssertNoPortForAWhileAsync(AppProcess app)
     {
         for (var i = 0; i < 10; i++)
         {
-            Assert.False(await stand.App.AcceptsConnectionAsync(), "the port accepted a connection before the cleanup finished");
+            Assert.False(await app.AcceptsConnectionAsync(), "the port accepted a connection before the cleanup finished");
             await Task.Delay(100);
         }
     }
 
-    private static async Task<StartupStand> StartHeldAsync(Func<RedisCommand, bool> predicate)
+    private static async Task<(StartupStand Stand, RedisHold Hold)> StartHeldAsync(Func<RedisCommand, bool> predicate, bool marker = false)
     {
         RedisHold? hold = null;
-        StartupStand? stand = null;
-        stand = await StartupStand.StartAsync(beforeLaunch: async proxy =>
+        var stand = await StartupStand.StartAsync(beforeLaunch: async proxy =>
         {
-            // The legacy hash must be there before the application starts.
+            // The legacy hash (and the marker of an earlier deployment) must be there before the application starts.
             var seed = TestRedis.Connect(RedisProxy.Database);
             await seed.GetDatabase(RedisProxy.Database).HashSetAsync(Legacy, [new HashEntry("data", 1)]);
+            if (marker)
+            {
+                await seed.GetDatabase(RedisProxy.Database).StringSetAsync(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
+            }
             seed.Dispose();
             hold = proxy.Hold(predicate);
         });
@@ -161,44 +187,86 @@ public sealed class StandardStartupIntegrationTest
             await stand.DisposeAsync();
             throw;
         }
-        return stand;
+        return (stand, hold);
     }
+
+    private static async Task<long> GenerationAsync(StartupStand stand) =>
+        (long?)await stand.Db.StringGetAsync(SessionStoreMigration.GenerationKey) ?? 0;
 
     // ---- R68 (а): the early window ------------------------------------------------------------
 
     [StartupFact]
-    public async Task EarlyWindow_NoPortIsOpen_TheLegacyKeyIsStillThere_AndThereIsNoMarker()
+    public async Task EarlyWindow_OnTheScanForFormerRows_NoPortIsOpen_AndTheFormerHashIsThere()
     {
-        await using var stand = await StartHeldAsync(c => c.IsScriptWith("TYPE"));
+        var (stand, _) = await StartHeldAsync(c => c.Name == "SCAN" && c.Args.Contains(CleanupCalls.SessionPattern));
+        await using var _stand = stand;
 
-        await AssertNoPortForAWhileAsync(stand);
+        // The scan the implementation sends asks for hashes of the session keys only.
+        var scan = stand.Proxy.Commands().Last(c => c.Name == "SCAN");
+        Assert.Equal(new[] { "MATCH", CleanupCalls.SessionPattern }, scan.Args.Skip(1).Take(2));
+        Assert.Contains("TYPE", scan.Args);
+        Assert.Equal("hash", scan.Args[Array.IndexOf(scan.Args, "TYPE") + 1]);
+        await AssertNoPortForAWhileAsync(stand.App);
         Assert.True(await stand.Db.KeyExistsAsync(Legacy));
         Assert.False(await stand.Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
         Assert.False(stand.App.HasExited, stand.App.Output);
     }
 
-    // ---- R68 (б1): the marker script is held ---------------------------------------------------
+    // ---- R68 (б), (в): the finish of the pass is the boundary ----------------------------------
 
     [StartupFact]
-    public async Task FinalWindow_OnTheMarkerScript_NoPortIsOpen_AndThereIsNoMarker()
+    public async Task TheFinishOfThePass_IsTheBoundary_BeforeIt_NoPortAndNoMarker_AfterIt_TheMarkerTheCountAndService()
     {
-        await using var stand = await StartHeldAsync(c => c.IsScriptWith("KEYS[2]"));
+        var (stand, hold) = await StartHeldAsync(c => CleanupCalls.Of(c) == CleanupStep.Finish);
+        await using var _stand = stand;
 
-        await AssertNoPortForAWhileAsync(stand);
+        // Held: the owner still has the lock, there is no marker, the count has not moved, the rows are gone.
+        Assert.True(hold.Reached.IsCompletedSuccessfully);
+        await AssertNoPortForAWhileAsync(stand.App);
+        Assert.True(await stand.Db.KeyExistsAsync(SessionStoreMigration.LockKey));
         Assert.False(await stand.Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.False(await stand.Db.KeyExistsAsync(Legacy)); // the delete already ran
+        Assert.Equal(0, await GenerationAsync(stand));
+        Assert.False(await stand.Db.KeyExistsAsync(Legacy));
+
+        hold.Release();
+
+        Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
+        Assert.Equal(SessionStoreMigration.MarkerValue, await stand.Db.StringGetAsync(SessionStoreMigration.MarkerKey));
+        Assert.Equal(1, await GenerationAsync(stand));
+        Assert.False(await stand.Db.KeyExistsAsync(SessionStoreMigration.LockKey));
     }
 
-    // ---- R68 (б2): the lock release after the marker is held ----------------------------------
+    // ---- US-5: two processes on one Redis ---------------------------------------------------------
 
     [StartupFact]
-    public async Task FinalWindow_OnTheLockRelease_NoPortIsOpen_TheMarkerIsAlreadySet_AndTheLockIsStillThere()
+    public async Task TwoProcesses_OnOneRedis_RunOnePass_AndTheSecondServesOnlyAfterIt()
     {
-        await using var stand = await StartHeldAsync(c => c.IsScriptWith("return redis.call('DEL', KEYS[1])"));
+        // The marker of an earlier deployment and a hash of the former format: a re-rollout after a rollback.
+        var (stand, hold) = await StartHeldAsync(c => CleanupCalls.Of(c) == CleanupStep.Finish, marker: true);
+        await using var _stand = stand;
+        var mark = stand.Proxy.Commands().Count;
 
-        await AssertNoPortForAWhileAsync(stand);
+        var second = stand.StartAnother();
+
+        // The second process observes the pass of the first one and waits: it polls the state.
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        while (stand.Proxy.Commands().Skip(mark).Count(c => CleanupCalls.Of(c) == CleanupStep.Status) < 3)
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the second process did not reach the wait for the pass: " + second.Output);
+            Assert.False(second.HasExited, second.Output);
+            await Task.Delay(50);
+        }
+        await AssertNoPortForAWhileAsync(second);
+        await AssertNoPortForAWhileAsync(stand.App);
+        Assert.DoesNotContain(stand.Proxy.Commands().Skip(mark), c => CleanupCalls.Of(c) == CleanupStep.Begin);
+
+        hold.Release();
+
+        Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
+        Assert.True(await second.WaitForHealthAsync(TimeSpan.FromSeconds(60)), second.Output);
+        Assert.Equal(1, await GenerationAsync(stand));
+        Assert.Single(stand.Proxy.Commands(), c => CleanupCalls.Of(c) == CleanupStep.Finish);
         Assert.Equal(SessionStoreMigration.MarkerValue, await stand.Db.StringGetAsync(SessionStoreMigration.MarkerKey));
-        Assert.True(await stand.Db.KeyExistsAsync(SessionStoreMigration.LockKey));
         Assert.False(await stand.Db.KeyExistsAsync(Legacy));
     }
 
@@ -239,7 +307,7 @@ public sealed class StandardStartupIntegrationTest
         Assert.Equal(meCalls, stand.Api.MeCalls);
     }
 
-    // ---- R72: /agent/v1 bypasses Main and the SSO bootstrap -------------------------------------
+    // ---- R72: /agent/v1 and /mcp do not touch the session; an ordinary path reads it ----------------
 
     [StartupFact]
     public async Task TheAgentPath_NeverReadsOrRenewsTheTicket_WhileAnOrdinaryPathDoes()
@@ -253,15 +321,13 @@ public sealed class StandardStartupIntegrationTest
         Assert.Equal(1, stand.Api.Provisions);
         var cookie = signIn.SetCookies.Single(c => c.StartsWith("skein.sid=", StringComparison.Ordinal)).Split(';')[0];
 
-        // The row of that session, rewritten as a LIVE ticket past half of its lifetime.
+        // The row of that session, with a small lifetime left: a read writes the row's lifetime anew.
         var key = (string)stand.Mux.GetServers().First(s => !s.IsReplica).Keys(RedisProxy.Database, "skein:session:*").Single()!;
-        var ticket = TicketSerializer.Default.Deserialize((byte[])(await stand.Db.StringGetAsync(key))!)!;
-        var issued = DateTimeOffset.UtcNow.AddHours(-13);
-        ticket.Properties.IssuedUtc = issued;
-        ticket.Properties.ExpiresUtc = issued.AddHours(24);
-        var before = TicketSerializer.Default.Serialize(ticket);
-        await stand.Db.StringSetAsync(key, before, TimeSpan.FromHours(24));
+        Assert.True(await stand.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(60)));
+        var before = (byte[])(await stand.Db.StringGetAsync(key))!;
 
+        // The agent path: no command names the key, the bytes and the lifetime are not written.
+        var lifetime = await stand.Db.KeyTimeToLiveAsync(key);
         var mark = stand.Proxy.Commands().Count;
         var provisions = stand.Api.Provisions;
         var agent = await stand.SendAsync("/agent/v1/ping", cookie, null,
@@ -270,15 +336,26 @@ public sealed class StandardStartupIntegrationTest
         Assert.Empty(agent.SetCookies);
         Assert.DoesNotContain(stand.Proxy.Commands().Skip(mark), c => c.Mentions(key));
         Assert.Equal(before, (byte[])(await stand.Db.StringGetAsync(key))!);
+        Assert.True(await stand.Db.KeyTimeToLiveAsync(key) <= lifetime, "the agent path wrote a new lifetime of the row");
         Assert.Equal(provisions, stand.Api.Provisions);
         Assert.Equal(1, stand.Api.AgentCalls);
 
-        // The distinguishing control on the same ticket: an ordinary protected path does read and slide it.
+        // /mcp with the same cookie: the same — no new lifetime is written (the time left only goes down).
+        lifetime = await stand.Db.KeyTimeToLiveAsync(key);
+        mark = stand.Proxy.Commands().Count;
+        await stand.SendAsync("/mcp", cookie, HttpMethod.Post, ("X-Skein-Api-Key", "ska_test"));
+
+        Assert.DoesNotContain(stand.Proxy.Commands().Skip(mark), c => c.Mentions(key));
+        Assert.Equal(before, (byte[])(await stand.Db.StringGetAsync(key))!);
+        Assert.True(await stand.Db.KeyTimeToLiveAsync(key) <= lifetime, "/mcp wrote a new lifetime of the row");
+
+        // The distinguishing control on the same row: an ordinary protected path reads the ticket and
+        // writes the row's lifetime, the bytes of the ticket stay.
         mark = stand.Proxy.Commands().Count;
         var ordinary = await stand.SendAsync("/api/auth/me", cookie);
         Assert.Equal(HttpStatusCode.OK, ordinary.Status);
         Assert.Contains(stand.Proxy.Commands().Skip(mark), c => c.Mentions(key));
-        var after = TicketSerializer.Default.Deserialize((byte[])(await stand.Db.StringGetAsync(key))!)!;
-        Assert.True(after.Properties.ExpiresUtc > ticket.Properties.ExpiresUtc);
+        Assert.True(await stand.Db.KeyTimeToLiveAsync(key) > TimeSpan.FromHours(1), "the ordinary path did not write the row's lifetime");
+        Assert.Equal(before, (byte[])(await stand.Db.StringGetAsync(key))!);
     }
 }

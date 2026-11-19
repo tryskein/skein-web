@@ -10,10 +10,56 @@ using StackExchange.Redis;
 
 namespace SkeinWeb.Tests.Auth;
 
+/// <summary>A step of the startup session cleanup, as seen on the Redis boundary.</summary>
+internal enum CleanupStep
+{
+    None,
+    Status,
+    Begin,
+    Extend,
+    Delete,
+    Finish,
+    Release,
+}
+
 /// <summary>
-/// The startup cleanup of session rows of the former format against a real Redis, in database 7 so
-/// a flush cannot touch other tests: what is deleted and what is not, the lock and its loss, a
-/// cleanup interrupted and finished by the next start, and a re-rollout after a rollback.
+/// Tells the scripts of the startup session cleanup apart by their <c>KEYS</c>, in a call of
+/// <c>ScriptEvaluateAsync</c> (<see cref="DbProxy"/>) and in a command on the wire
+/// (<see cref="RedisProxy"/>, where an <c>EVALSHA</c> carries a SHA instead of the text).
+/// </summary>
+internal static class CleanupCalls
+{
+    public const string SessionPattern = "skein:session:*";
+
+    public static CleanupStep Of(IReadOnlyList<string> keys) => keys switch
+    {
+        [SessionStoreMigration.MarkerKey, SessionStoreMigration.LockKey, SessionStoreMigration.GenerationKey] => CleanupStep.Status,
+        [SessionStoreMigration.LockKey, SessionStoreMigration.GenerationKey, SessionStoreMigration.MarkerKey, SessionStoreMigration.IssuedDuringKey] => CleanupStep.Begin,
+        [SessionStoreMigration.LockKey, SessionStoreMigration.IssuedDuringKey] => CleanupStep.Extend,
+        [SessionStoreMigration.LockKey, SessionStoreMigration.MarkerKey, SessionStoreMigration.GenerationKey, SessionStoreMigration.IssuedDuringKey] => CleanupStep.Finish,
+        [SessionStoreMigration.LockKey, SessionStoreMigration.IssuedDuringKey, ..] => CleanupStep.Delete,
+        [SessionStoreMigration.LockKey] => CleanupStep.Release,
+        _ => CleanupStep.None,
+    };
+
+    public static CleanupStep Of(string method, object?[] args) =>
+        DbProxy.ScriptOf(method, args) is null ? CleanupStep.None : Of(DbProxy.KeysOf(method, args).Select(k => (string)k!).ToArray());
+
+    /// <summary>The <c>KEYS</c> of an <c>EVAL</c> or <c>EVALSHA</c> command; empty for any other command.</summary>
+    public static string[] KeysOf(RedisCommand command) =>
+        command.Name is "EVAL" or "EVALSHA" && command.Args.Length > 1 && int.TryParse(command.Args[1], out var n)
+            ? command.Args.Skip(2).Take(n).ToArray()
+            : [];
+
+    public static CleanupStep Of(RedisCommand command) => Of(KeysOf(command));
+}
+
+/// <summary>
+/// The startup session cleanup against a real Redis, in database 7 so a flush cannot touch other
+/// tests: when a pass runs and what it ends (US-5), the protocol of the pass (the count of finished
+/// passes, the answers of its begin, the lock with a lifetime from the moment it is taken), the marks
+/// of a pass, the loss of the lock at every step, the wait of another replica, two replicas at once,
+/// and the failures of the start.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("session-store-migration")]
@@ -61,11 +107,73 @@ public sealed class SessionStoreMigrationTest : IDisposable
     private async Task<string> IssueV3Async(Guid user) =>
         await TestRedis.Store(_mux).StoreAsync(TestRedis.Ticket(user), new DefaultHttpContext(), CancellationToken.None);
 
-    // ---- R29 ----------------------------------------------------------------------------------
+    private Task MarkAsync() => Db.StringSetAsync(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
+
+    private async Task<long> GenerationAsync() => (long?)await Db.StringGetAsync(SessionStoreMigration.GenerationKey) ?? 0;
+
+    /// <summary>
+    /// A multiplexer whose database records every step of the cleanup; <paramref name="onStep"/> sees
+    /// the step and its occurrence (1 for the first) before it reaches Redis, and may fail it.
+    /// </summary>
+    private (IConnectionMultiplexer Mux, List<CleanupStep> Steps) Watched(Func<CleanupStep, int, Exception?>? onStep = null)
+    {
+        var db = DbProxy.Create(Db, out var proxy);
+        var steps = new List<CleanupStep>();
+        proxy.Before = (name, args) =>
+        {
+            var step = CleanupCalls.Of(name, args);
+            if (step == CleanupStep.None)
+            {
+                return null;
+            }
+            int occurrence;
+            lock (steps)
+            {
+                steps.Add(step);
+                occurrence = steps.Count(s => s == step);
+            }
+            return onStep?.Invoke(step, occurrence);
+        };
+        return (TestRedis.Over(_mux, db), steps);
+    }
+
+    private static int CountOf(List<CleanupStep> steps, CleanupStep step)
+    {
+        lock (steps)
+        {
+            return steps.Count(s => s == step);
+        }
+    }
+
+    /// <summary>The state a finished pass leaves: the marker, the count, no lock, no marks.</summary>
+    private async Task AssertFinishedAsync(long generation)
+    {
+        Assert.Equal(SessionStoreMigration.MarkerValue, await Db.StringGetAsync(SessionStoreMigration.MarkerKey));
+        Assert.Equal(generation, await GenerationAsync());
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.LockKey));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.IssuedDuringKey));
+    }
+
+    private static async Task UntilAsync(Func<bool> condition, string what)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail($"precondition not met within 15 s: {what}");
+            }
+            await Task.Delay(20);
+        }
+    }
+
+    // ---- when a pass runs and what it ends (US-5) ----------------------------------------------
 
     [RedisFact]
-    public async Task Cleanup_RemovesTheFormerHashes_AndNothingElse()
+    public async Task Cleanup_RemovesTheFormerHashes_AndTheRowsOfThisVersion_AndNothingElse()
     {
+        // A re-rollout after a rollback: the marker of the earlier deployment is kept, the former version left hashes.
+        await MarkAsync();
         var legacy = new[] { Legacy(), Legacy(), Legacy() };
         foreach (var key in legacy)
         {
@@ -73,10 +181,10 @@ public sealed class SessionStoreMigrationTest : IDisposable
         }
         var user = Guid.NewGuid();
         var v3 = await IssueV3Async(user);
-        byte[] v3Bytes = (await Db.StringGetAsync(v3))!;
         await Db.StringSetAsync("skein:dataprotection:keys", "ring");
         await Db.StringSetAsync("skein:login:fail:someone", "3");
         await Db.StringSetAsync("skein:signalr:other", "x");
+        await Db.StringSetAsync("skein:session-other", "y");
 
         await Migration().RunAsync(Wait, CancellationToken.None);
 
@@ -84,62 +192,304 @@ public sealed class SessionStoreMigrationTest : IDisposable
         {
             Assert.False(await Db.KeyExistsAsync(key));
         }
-        Assert.Equal(v3Bytes, (byte[])(await Db.StringGetAsync(v3))!);
-        Assert.True(await Db.SetContainsAsync("skein:user-tickets:" + user, v3));
+        Assert.False(await Db.KeyExistsAsync(v3));
+        Assert.True(await Db.SetContainsAsync("skein:user-tickets:" + user, v3)); // the index is not the cleanup's
         Assert.Equal("ring", await Db.StringGetAsync("skein:dataprotection:keys"));
         Assert.Equal("3", await Db.StringGetAsync("skein:login:fail:someone"));
         Assert.Equal("x", await Db.StringGetAsync("skein:signalr:other"));
-        Assert.Equal(SessionStoreMigration.MarkerValue, await Db.StringGetAsync(SessionStoreMigration.MarkerKey));
-        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.LockKey));
+        Assert.Equal("y", await Db.StringGetAsync("skein:session-other"));
+        await AssertFinishedAsync(1);
     }
 
     [RedisFact]
-    public async Task Cleanup_WhenTheMarkerIsAlreadySet_DeletesNothing()
+    public async Task Cleanup_WhenTheMarkerIsSetAndNoFormerHashIsLeft_DeletesNothing_AndBeginsNoPass()
     {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
-        await Db.StringSetAsync(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
+        await MarkAsync();
+        await Db.StringSetAsync(SessionStoreMigration.GenerationKey, 4);
+        var v3 = await IssueV3Async(Guid.NewGuid());
+        var (mux, steps) = Watched();
 
-        await Migration().RunAsync(Wait, CancellationToken.None);
+        await Migration(mux).RunAsync(Wait, CancellationToken.None);
 
-        Assert.True(await Db.KeyExistsAsync(legacy));
-    }
-
-    [RedisFact]
-    public async Task Cleanup_WhenTheMarkerAppearsAfterTheLockWasTaken_DeletesNothing()
-    {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
-        var db = DbProxy.Create(Db, out var proxy);
-        proxy.After = async (name, args) =>
-        {
-            if (name == nameof(IDatabase.StringSetAsync) && (RedisKey)args[0]! == SessionStoreMigration.LockKey)
-            {
-                await Db.StringSetAsync(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
-            }
-        };
-
-        await Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None);
-
-        Assert.True(await Db.KeyExistsAsync(legacy));
+        Assert.True(await Db.KeyExistsAsync(v3));
+        Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
+        await AssertFinishedAsync(4);
     }
 
     [RedisFact]
     public async Task Restart_WithALiveNewSession_KeepsIt()
     {
+        await Migration().RunAsync(Wait, CancellationToken.None); // the first deployment: no marker yet
         var v3 = await IssueV3Async(Guid.NewGuid());
-        await Migration().RunAsync(Wait, CancellationToken.None);
+        var (mux, steps) = Watched();
 
-        await Migration().RunAsync(Wait, CancellationToken.None);
+        await Migration(mux).RunAsync(Wait, CancellationToken.None);
 
         Assert.NotNull(await TestRedis.Store(_mux).RetrieveAsync(v3, new DefaultHttpContext(), CancellationToken.None));
+        Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
+        await AssertFinishedAsync(1);
     }
 
-    // ---- R30 ----------------------------------------------------------------------------------
+    [RedisFact]
+    public async Task Start_WithoutTheMarker_AndWithoutAFormerHash_EndsEverySessionRow()
+    {
+        var first = await IssueV3Async(Guid.NewGuid());
+        var second = await IssueV3Async(Guid.NewGuid());
+
+        await Migration().RunAsync(Wait, CancellationToken.None);
+
+        Assert.False(await Db.KeyExistsAsync(first));
+        Assert.False(await Db.KeyExistsAsync(second));
+        await AssertFinishedAsync(1);
+    }
 
     [RedisFact]
-    public async Task AnotherReplica_WaitsForTheMarker_AndFailsOnTimeoutWithoutIt()
+    public async Task RolloutAfterARollback_WithTheMarkerKept_EndsEverySession_IncludingTheRowsThatSurvivedTheRollback()
     {
+        await Migration().RunAsync(Wait, CancellationToken.None);
+        var v3 = await IssueV3Async(Guid.NewGuid()); // survives the rollback
+        var rolledBack = Legacy();
+        await LegacyHashAsync(rolledBack); // written by the former version during the rollback
+
+        await Migration().RunAsync(Wait, CancellationToken.None);
+
+        var store = TestRedis.Store(_mux);
+        Assert.False(await Db.KeyExistsAsync(rolledBack));
+        Assert.False(await Db.KeyExistsAsync(v3));
+        Assert.Null(await store.RetrieveAsync(v3, new DefaultHttpContext(), CancellationToken.None));
+        await AssertFinishedAsync(2);
+    }
+
+    [RedisFact]
+    public async Task RolloutAfterARollback_WithTheMarkerDeleted_EndsEverySession()
+    {
+        await Migration().RunAsync(Wait, CancellationToken.None);
+        var v3 = await IssueV3Async(Guid.NewGuid());
+        var rolledBack = Legacy();
+        await LegacyHashAsync(rolledBack);
+        await Db.KeyDeleteAsync(SessionStoreMigration.MarkerKey);
+
+        await Migration().RunAsync(Wait, CancellationToken.None);
+
+        Assert.False(await Db.KeyExistsAsync(rolledBack));
+        Assert.False(await Db.KeyExistsAsync(v3));
+        await AssertFinishedAsync(2);
+    }
+
+    [RedisFact]
+    public async Task TheLastFormerHashExpiringBeforeTheBegin_DoesNotCancelThePass()
+    {
+        await MarkAsync();
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var v3 = await IssueV3Async(Guid.NewGuid());
+        var (mux, steps) = Watched((step, n) =>
+        {
+            if (step == CleanupStep.Begin && n == 1)
+            {
+                Db.KeyDelete(legacy); // its own lifetime ran out between the observation and the begin
+            }
+            return null;
+        });
+
+        await Migration(mux).RunAsync(Wait, CancellationToken.None);
+
+        Assert.False(await Db.KeyExistsAsync(v3));
+        Assert.Equal(1, CountOf(steps, CleanupStep.Begin));
+        await AssertFinishedAsync(1);
+    }
+
+    // ---- the protocol of the pass (ОСТ-3-1) ------------------------------------------------------
+
+    [RedisFact]
+    public async Task ABeginWithAStaleCount_FindsThePassFinishedAfterTheObservation_DeletesNothing_AndTheNextStartIsOrdinary()
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var issuedDuringTheOtherPass = await IssueV3Async(Guid.NewGuid());
+        var lockAfterTheBegin = new List<bool>();
+        var db = DbProxy.Create(Db, out var proxy);
+        var steps = new List<CleanupStep>();
+        proxy.Before = (name, args) =>
+        {
+            var step = CleanupCalls.Of(name, args);
+            steps.Add(step);
+            if (step == CleanupStep.Begin)
+            {
+                // Another replica ran its whole pass between this replica's observation and its begin;
+                // the row issued during that pass was kept by it.
+                Db.KeyDelete(legacy);
+                Db.StringSet(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
+                Db.StringIncrement(SessionStoreMigration.GenerationKey);
+            }
+            else if (step == CleanupStep.Status && steps.Contains(CleanupStep.Begin))
+            {
+                // The late claimant is interrupted right after the answer of its begin.
+                return new RedisException("interrupted");
+            }
+            return null;
+        };
+        proxy.After = (name, args) =>
+        {
+            if (CleanupCalls.Of(name, args) == CleanupStep.Begin)
+            {
+                lockAfterTheBegin.Add(Db.KeyExists(SessionStoreMigration.LockKey));
+            }
+            return Task.CompletedTask;
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
+
+        // The begin answered "a pass finished after the observation": no lock was taken, nothing deleted.
+        Assert.DoesNotContain("skein:", ex.Message);
+        Assert.Equal(new[] { false }, lockAfterTheBegin);
+        Assert.DoesNotContain(CleanupStep.Delete, steps);
+        Assert.True(await Db.KeyExistsAsync(issuedDuringTheOtherPass));
+        await AssertFinishedAsync(1);
+
+        // The next start is ordinary: it begins no pass and deletes nothing.
+        var (mux, next) = Watched();
+        await Migration(mux).RunAsync(Wait, CancellationToken.None);
+
+        Assert.Equal(0, CountOf(next, CleanupStep.Begin));
+        Assert.True(await Db.KeyExistsAsync(issuedDuringTheOtherPass));
+        await AssertFinishedAsync(1);
+    }
+
+    [RedisFact]
+    public async Task TheLock_HasAFiniteLifetime_FromTheMomentItIsTaken()
+    {
+        await LegacyHashAsync(Legacy());
+        var db = DbProxy.Create(Db, out var proxy);
+        TimeSpan? lifetime = null;
+        var extendedBefore = false;
+        proxy.Before = (name, args) =>
+        {
+            extendedBefore |= CleanupCalls.Of(name, args) == CleanupStep.Extend;
+            return null;
+        };
+        proxy.After = (name, args) =>
+        {
+            if (CleanupCalls.Of(name, args) == CleanupStep.Begin)
+            {
+                Assert.False(extendedBefore); // before the first page of the scan
+                lifetime = Db.KeyTimeToLive(SessionStoreMigration.LockKey);
+            }
+            return Task.CompletedTask;
+        };
+
+        await Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None);
+
+        Assert.NotNull(lifetime);
+        Assert.InRange(lifetime.Value, TimeSpan.FromMilliseconds(1), SessionStoreMigration.LockLifetime);
+    }
+
+    // ---- the marks of a pass (ОСТ-3-2, R30) --------------------------------------------------------
+
+    [RedisFact]
+    public async Task ANewPass_DropsTheMarksOfAnInterruptedOne_AtItsBegin()
+    {
+        var v3 = await IssueV3Async(Guid.NewGuid());
+        // An interrupted pass marked that row; its lock is gone, its marks are not.
+        await Db.SetAddAsync(SessionStoreMigration.IssuedDuringKey, "interrupted:" + v3);
+        bool? marksAfterTheBegin = null;
+        var db = DbProxy.Create(Db, out var proxy);
+        proxy.After = (name, args) =>
+        {
+            if (CleanupCalls.Of(name, args) == CleanupStep.Begin)
+            {
+                marksAfterTheBegin = Db.KeyExists(SessionStoreMigration.IssuedDuringKey);
+            }
+            return Task.CompletedTask;
+        };
+
+        await Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None);
+
+        Assert.False(marksAfterTheBegin);
+        Assert.False(await Db.KeyExistsAsync(v3));
+        await AssertFinishedAsync(1);
+    }
+
+    [RedisFact]
+    public async Task AMarkOfAnotherToken_ProtectsNoRow_WhileAMarkOfThisPassDoes()
+    {
+        await LegacyHashAsync(Legacy());
+        var foreign = await IssueV3Async(Guid.NewGuid());
+        var own = await IssueV3Async(Guid.NewGuid());
+        var db = DbProxy.Create(Db, out var proxy);
+        proxy.After = (name, args) =>
+        {
+            if (CleanupCalls.Of(name, args) == CleanupStep.Begin)
+            {
+                var token = (string)Db.StringGet(SessionStoreMigration.LockKey)!;
+                Db.SetAdd(SessionStoreMigration.IssuedDuringKey, ["another-token:" + foreign, token + ":" + own]);
+            }
+            return Task.CompletedTask;
+        };
+
+        await Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None);
+
+        Assert.False(await Db.KeyExistsAsync(foreign));
+        Assert.True(await Db.KeyExistsAsync(own));
+        await AssertFinishedAsync(1);
+    }
+
+    // ---- the loss of the lock (R30) ---------------------------------------------------------------
+
+    [RedisTheory]
+    [InlineData("Extend")] // before the first page: the extension of that page finds the lock taken
+    [InlineData("Delete")] // after a page was extended: the delete script itself checks the token
+    [InlineData("Finish")] // before the finish: the rows were deleted while the lock was the owner's
+    public async Task AnOwnerThatLostItsLock_DeletesNoMore_WritesNoMarker_AndTouchesNoMarkOfTheOtherPass_AndAFullPassFollows(string step)
+    {
+        var at = Enum.Parse<CleanupStep>(step);
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var thiefMark = "thief:skein:session:issued-by-the-other-pass";
+        var (mux, _) = Watched((step, n) =>
+        {
+            if (step == at && n == 1)
+            {
+                Db.StringSet(SessionStoreMigration.LockKey, "thief", TimeSpan.FromMinutes(1));
+                Db.SetAdd(SessionStoreMigration.IssuedDuringKey, thiefMark);
+            }
+            return null;
+        });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Migration(mux).RunAsync(Wait, CancellationToken.None));
+
+        Assert.DoesNotContain("skein:", ex.Message);
+        Assert.Equal(at != CleanupStep.Finish, await Db.KeyExistsAsync(legacy));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
+        Assert.Equal(0, await GenerationAsync());
+        Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey)); // not released by the loser
+        Assert.True(await Db.SetContainsAsync(SessionStoreMigration.IssuedDuringKey, thiefMark));
+
+        // The lock of the interrupted pass runs out by itself; the next start runs a full pass.
+        await Db.KeyExpireAsync(SessionStoreMigration.LockKey, TimeSpan.FromMilliseconds(200));
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (await Db.KeyExistsAsync(SessionStoreMigration.LockKey))
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the lock did not run out");
+            await Task.Delay(20);
+        }
+        var survivor = await IssueV3Async(Guid.NewGuid()); // issued between the interrupted pass and the next one
+
+        await Migration().RunAsync(Wait, CancellationToken.None);
+
+        Assert.False(await Db.KeyExistsAsync(legacy));
+        Assert.False(await Db.KeyExistsAsync(survivor));
+        await AssertFinishedAsync(1);
+    }
+
+    // ---- another replica waits for the pass (US-5, the condition of the start) ----------------------
+
+    [RedisFact]
+    public async Task AnotherReplica_WaitsForThePass_AndFailsOnTimeoutWithoutIt()
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
         await Db.StringSetAsync(SessionStoreMigration.LockKey, "somebody-else", TimeSpan.FromMinutes(1));
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
@@ -147,121 +497,65 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.DoesNotContain("skein:", ex.Message);
         Assert.Equal("somebody-else", await Db.StringGetAsync(SessionStoreMigration.LockKey));
+        Assert.True(await Db.KeyExistsAsync(legacy));
     }
 
     [RedisFact]
-    public async Task AnotherReplica_ReturnsAsSoonAsTheMarkerAppears_AndDeletesNothing()
+    public async Task AnotherReplica_LeavesTheWaitOnlyWhenThePassFinished_NotOnTheMarkerAlone_AndDeletesNothing()
     {
         var legacy = Legacy();
         await LegacyHashAsync(legacy);
         await Db.StringSetAsync(SessionStoreMigration.LockKey, "somebody-else", TimeSpan.FromMinutes(1));
-        var waiting = Migration().RunAsync(Wait, CancellationToken.None);
-        await Task.Delay(500);
-        await Db.StringSetAsync(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
+        var (mux, steps) = Watched();
+        var waiting = Migration(mux).RunAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
+        await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= 3, "the replica polls the state");
 
-        await waiting;
+        // The marker alone: the wait goes on through several more polls.
+        await MarkAsync();
+        var polls = CountOf(steps, CleanupStep.Status);
+        await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= polls + 3, "the replica keeps polling");
+        Assert.False(waiting.IsCompleted);
 
-        Assert.True(await Db.KeyExistsAsync(legacy));
-    }
-
-    private static bool IsScript(string name, object?[] args, string fragment) =>
-        name == nameof(IDatabase.ScriptEvaluateAsync) && args[0] is string text && text.Contains(fragment, StringComparison.Ordinal);
-
-    // The lock is taken over right before one chosen script of the cleanup runs.
-    private async Task<(DbProxy Proxy, IDatabase Db)> StealBeforeAsync(string scriptFragment)
-    {
-        var db = DbProxy.Create(Db, out var proxy);
-        proxy.Before = (name, args) =>
-        {
-            if (IsScript(name, args, scriptFragment))
-            {
-                proxy.Before = null;
-                Db.StringSet(SessionStoreMigration.LockKey, "thief", TimeSpan.FromMinutes(1));
-            }
-            return null;
-        };
-        await Task.CompletedTask;
-        return (proxy, db);
-    }
-
-    [RedisFact]
-    public async Task LockLostBeforeTheExtension_StopsTheCleanup_AndTheNextStartFinishesIt()
-    {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
-        var (_, db) = await StealBeforeAsync("PEXPIRE");
-
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
-
-        Assert.True(await Db.KeyExistsAsync(legacy));
-        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey)); // not released by the loser
-
+        // The other pass finishes: its rows are gone, its count grows, its lock goes; a row issued
+        // during it was kept.
+        var issuedDuringIt = await IssueV3Async(Guid.NewGuid());
+        await Db.KeyDeleteAsync(legacy);
+        await Db.StringIncrementAsync(SessionStoreMigration.GenerationKey);
         await Db.KeyDeleteAsync(SessionStoreMigration.LockKey);
-        await Migration().RunAsync(Wait, CancellationToken.None);
 
+        await waiting.WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
+        Assert.True(await Db.KeyExistsAsync(issuedDuringIt));
+        Assert.Equal(1, await GenerationAsync());
+    }
+
+    [RedisFact]
+    public async Task TwoReplicasStartingTogether_RunOnePass_AndBothReturn()
+    {
+        await MarkAsync();
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var v3 = await IssueV3Async(Guid.NewGuid());
+        var dbA = DbProxy.Create(Db, out var proxyA);
+        var heldA = proxyA.Hold((name, args) => CleanupCalls.Of(name, args) == CleanupStep.Extend);
+        var a = Migration(TestRedis.Over(_mux, dbA)).RunAsync(Wait, CancellationToken.None);
+        await heldA.Reached.WaitAsync(TimeSpan.FromSeconds(15));
+
+        var (muxB, stepsB) = Watched();
+        var b = Migration(muxB).RunAsync(Wait, CancellationToken.None);
+        await UntilAsync(() => CountOf(stepsB, CleanupStep.Status) >= 3, "the second replica waits for the pass of the first");
+        heldA.Release();
+
+        await Task.WhenAll(a, b).WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Equal(0, CountOf(stepsB, CleanupStep.Begin));
         Assert.False(await Db.KeyExistsAsync(legacy));
-        Assert.Equal(SessionStoreMigration.MarkerValue, await Db.StringGetAsync(SessionStoreMigration.MarkerKey));
+        Assert.False(await Db.KeyExistsAsync(v3));
+        await AssertFinishedAsync(1);
     }
 
-    [RedisFact]
-    public async Task LockLostAfterTheExtension_TheDeleteScriptItselfChecksTheToken_AndDeletesNothing()
-    {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
-        var (_, db) = await StealBeforeAsync("TYPE"); // the delete batch: the extension before it already succeeded
-
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
-
-        Assert.True(await Db.KeyExistsAsync(legacy));
-        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-    }
-
-    [RedisFact]
-    public async Task LockLostBeforeTheMarkerScript_WritesNoMarker()
-    {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
-        var (_, db) = await StealBeforeAsync("KEYS[2]");
-
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None));
-
-        Assert.False(await Db.KeyExistsAsync(legacy)); // the deletion was legitimate: the lock was ours then
-        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey));
-    }
-
-    [RedisFact]
-    public async Task TheLockIsExtendedByTheScan()
-    {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
-        var db = DbProxy.Create(Db, out var proxy);
-        TimeSpan? afterExtension = null;
-        proxy.Before = (name, args) =>
-        {
-            if (IsScript(name, args, "PEXPIRE"))
-            {
-                Db.KeyExpire(SessionStoreMigration.LockKey, TimeSpan.FromSeconds(2)); // as if the scan had run long
-            }
-            return null;
-        };
-        proxy.After = (name, args) =>
-        {
-            if (IsScript(name, args, "PEXPIRE"))
-            {
-                afterExtension = Db.KeyTimeToLive(SessionStoreMigration.LockKey);
-            }
-            return Task.CompletedTask;
-        };
-
-        await Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, CancellationToken.None);
-
-        Assert.True(afterExtension > TimeSpan.FromSeconds(20), "the extension did not renew the lock");
-    }
+    // ---- the failures of the start ------------------------------------------------------------------
 
     [RedisFact]
     public async Task Scan_RunsInTheDatabaseOfTheProcess()
@@ -278,40 +572,51 @@ public sealed class SessionStoreMigrationTest : IDisposable
         Assert.True(await _mux.GetDatabase(0).KeyExistsAsync(elsewhere));
     }
 
-
     [RedisTheory]
-    [InlineData(false)] // no primary known
-    [InlineData(true)]  // a known primary that is not connected
-    public async Task Cleanup_WithoutEveryPrimaryReachable_FailsTheStart_AndWritesNoMarker(bool knownButDisconnected)
+    [InlineData(false, false)] // no primary known, a rollback to clean up after
+    [InlineData(true, false)]  // a known primary that is not connected, a rollback to clean up after
+    [InlineData(false, true)]  // no primary known, a plain restart
+    [InlineData(true, true)]   // a known primary that is not connected, a plain restart
+    public async Task Start_WithoutEveryPrimaryReachable_Fails_EvenOnAPlainRestart_AndWritesNothing(bool knownButDisconnected, bool plainRestart)
     {
-        var legacy = Legacy();
-        await LegacyHashAsync(legacy);
+        var row = Legacy();
+        if (plainRestart)
+        {
+            await MarkAsync();
+            row = await IssueV3Async(Guid.NewGuid());
+        }
+        else
+        {
+            await LegacyHashAsync(row);
+        }
         var servers = new List<IServer>();
         if (knownButDisconnected)
         {
-            var server = new Moq.Mock<IServer>();
+            var server = new Mock<IServer>();
             server.SetupGet(x => x.IsConnected).Returns(false);
             server.SetupGet(x => x.IsReplica).Returns(false);
             servers.Add(server.Object);
         }
-        var mux = new Moq.Mock<IConnectionMultiplexer>();
+        var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(Db);
         mux.Setup(m => m.GetServers()).Returns(servers.ToArray());
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => Migration(mux.Object).RunAsync(Wait, CancellationToken.None));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Migration(mux.Object).RunAsync(Wait, CancellationToken.None));
 
-        Assert.True(await Db.KeyExistsAsync(legacy));
-        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.LockKey)); // the lock was released
+        Assert.DoesNotContain("skein:", ex.Message);
+        Assert.True(await Db.KeyExistsAsync(row));
+        Assert.Equal(plainRestart, await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.LockKey));
+        Assert.Equal(0, await GenerationAsync());
     }
 
     [RedisFact]
     public async Task ATimeoutOfTheClient_IsTheSameStartupFailure_NotTheRawException()
     {
-        var db = new Moq.Mock<IDatabase>();
-        db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisTimeoutException("timed out", CommandStatus.Unknown));
-        var mux = new Moq.Mock<IConnectionMultiplexer>();
+        var db = new Mock<IDatabase>();
+        db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
+            .ThrowsAsync(new RedisTimeoutException("timed out on skein:session-format", CommandStatus.Unknown));
+        var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() =>
@@ -319,38 +624,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
                 .RunAsync(TimeSpan.FromSeconds(1), CancellationToken.None));
 
         Assert.Null(ex.InnerException);
-    }
-
-    // ---- R31 ----------------------------------------------------------------------------------
-
-    [RedisFact]
-    public async Task RolloutAfterARollback_WithTheMarkerKept_SkipsTheCleanup_AndStillRejectsTheFormerHash()
-    {
-        await Migration().RunAsync(Wait, CancellationToken.None);
-        var v3 = await IssueV3Async(Guid.NewGuid());
-        var rolledBack = Legacy();
-        await LegacyHashAsync(rolledBack); // written by the former version during the rollback
-
-        await Migration().RunAsync(Wait, CancellationToken.None);
-
-        var store = TestRedis.Store(_mux);
-        Assert.True(await Db.KeyExistsAsync(rolledBack));
-        Assert.Null(await store.RetrieveAsync(rolledBack, new DefaultHttpContext(), CancellationToken.None));
-        Assert.NotNull(await store.RetrieveAsync(v3, new DefaultHttpContext(), CancellationToken.None));
-    }
-
-    [RedisFact]
-    public async Task RolloutAfterARollback_WithTheMarkerDeleted_RemovesTheFormerHashes()
-    {
-        await Migration().RunAsync(Wait, CancellationToken.None);
-        var rolledBack = Legacy();
-        await LegacyHashAsync(rolledBack);
-        await Db.KeyDeleteAsync(SessionStoreMigration.MarkerKey);
-
-        await Migration().RunAsync(Wait, CancellationToken.None);
-
-        Assert.False(await Db.KeyExistsAsync(rolledBack));
-        Assert.Equal(SessionStoreMigration.MarkerValue, await Db.StringGetAsync(SessionStoreMigration.MarkerKey));
+        Assert.DoesNotContain("skein:", ex.Message);
     }
 }
 
@@ -408,7 +682,7 @@ public sealed class SessionFormatRejectionTest
     public async Task AfterTheCleanup_AReaderOfTheFormerVersionAcceptsNothingOfThisOne()
     {
         await using var host = await SessionPipelineHost.StartAsync();
-        var (cookie, key, set) = await host.SignInAsync(Alice);
+        var (before, beforeKey, _) = await host.SignInAsync(Alice);
         var preUpdate = "skein:session:legacy-" + Guid.NewGuid().ToString("N");
         await host.Db.HashSetAsync(preUpdate, [new HashEntry("absexp", -1), new HashEntry("sldexp", 86400), new HashEntry("data", new byte[] { 1 })]);
         await host.Db.KeyDeleteAsync(SessionStoreMigration.MarkerKey);
@@ -416,12 +690,19 @@ public sealed class SessionFormatRejectionTest
         await new SessionStoreMigration(host.Mux, TimeProvider.System, Microsoft.Extensions.Logging.Abstractions.NullLogger<SessionStoreMigration>.Instance)
             .RunAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
 
-        // The reader of the former version: its cookie purpose and HGETALL of the row.
+        // (а) The session issued before the cleanup has ended with it (US-5), as has the row of the former version.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await host.SendAsync("/test/me", before)).Status);
+        Assert.False(await host.Db.KeyExistsAsync(beforeKey));
+        Assert.False(await host.Db.KeyExistsAsync(preUpdate));
+
+        // (б) A session issued after the cleanup lives, and the reader of the former version accepts
+        // neither its cookie (the purpose differs) nor its row (HGETALL of a string: WRONGTYPE).
+        var (after, afterKey, set) = await host.SignInAsync(Alice);
+        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/me", after)).Status);
         var former = new TicketDataFormat(host.Services.GetRequiredService<IDataProtectionProvider>().CreateProtector(
             "Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationMiddleware", "Cookies", "v2"));
-        Assert.Null(former.Unprotect(Uri.UnescapeDataString(set.Value))); // the cookie of this version
-        await Assert.ThrowsAsync<RedisServerException>(() => host.Db.HashGetAllAsync(key)); // WRONGTYPE: a string row
-        Assert.Empty(await host.Db.HashGetAllAsync(preUpdate)); // the row issued before the update is gone
-        Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/me", cookie)).Status); // this version still works
+        Assert.Null(former.Unprotect(Uri.UnescapeDataString(set.Value)));
+        var wrongType = await Assert.ThrowsAsync<RedisServerException>(() => host.Db.HashGetAllAsync(afterKey));
+        Assert.StartsWith("WRONGTYPE", wrongType.Message, StringComparison.Ordinal);
     }
 }
