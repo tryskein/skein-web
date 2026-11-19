@@ -42,7 +42,8 @@ public sealed class SessionCleanupPipelineTest
 
         var reply = await host.SendAsync($"/test/issue?user={Alice}");
 
-        Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
+        // The issuer refuses (SessionIssueException); the endpoint of the stand does not map it, so it is a 500.
+        Assert.Equal(HttpStatusCode.InternalServerError, reply.Status);
         Assert.Empty(reply.SessionWrites());
         Assert.Equal(rows, SessionRows(host));
         // The refusal came from the issue script: Redis refused the mark (WRONGTYPE) and the store failed the issue.
