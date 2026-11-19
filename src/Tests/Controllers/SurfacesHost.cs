@@ -170,8 +170,12 @@ internal sealed class SurfacesHost : IAsyncDisposable
     /// <param name="mode">Authentication mode; local by default.</param>
     /// <param name="sso">Settings for the mode (the OIDC client for the native mode).</param>
     /// <param name="configure">Extra registrations, after the standard ones.</param>
+    /// <param name="trustHeaders">The legacy trust-headers mode with the SSO middleware in the pipeline.</param>
+    /// <param name="time">The clock of the cookie schemes, the store and the issuer; the system clock when omitted.</param>
+    /// <param name="timeouts">The session limits; the defaults of the settings when omitted.</param>
     public static async Task<SurfacesHost> StartAsync(
-        WebAuthMode? mode = null, SsoOptions? sso = null, Action<IServiceCollection>? configure = null, bool trustHeaders = false)
+        WebAuthMode? mode = null, SsoOptions? sso = null, Action<IServiceCollection>? configure = null, bool trustHeaders = false,
+        TimeProvider? time = null, SessionTimeouts? timeouts = null)
     {
         // The legacy trust-headers mode with passwords kept (hybrid), so the explicit operations work too.
         mode = trustHeaders ? new WebAuthMode(WebAuthKind.Keycloak, Hybrid: true) : mode;
@@ -196,8 +200,8 @@ internal sealed class SurfacesHost : IAsyncDisposable
         services.AddSingleton<IUserSessionRevoker>(sp => sp.GetRequiredService<RedisTicketStore>());
         var replica = new HubTestReplica(new HubTestWorld(), new FakeTimeProvider(DateTimeOffset.UtcNow));
         services.AddSingleton(replica.Registry);
-        services.AddSingleton<TimeProvider>(TimeProvider.System);
-        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
+        services.AddSingleton(time ?? TimeProvider.System);
+        services.AddSingleton(timeouts ?? new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, SessionTimeouts.DefaultAbsoluteTimeoutHours));
         services.AddSkeinAuthentication(mode ?? WebAuthMode.FromApi("local", null), sso ?? new SsoOptions());
         configure?.Invoke(services);
         services.AddAuthorization();

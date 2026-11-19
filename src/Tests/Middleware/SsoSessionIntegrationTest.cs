@@ -5,6 +5,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
 using SkeinWeb.Auth;
 using SkeinWeb.Tests.Auth;
 using SkeinWeb.Tests.Controllers;
@@ -16,7 +17,9 @@ namespace SkeinWeb.Tests.Middleware;
 /// The trust-headers (oauth2-proxy) middleware on the real controllers, issuer, store (real Redis) and cookie
 /// schemes, against an API model: the local comparison of the remembered pair, the confirmation of the subject
 /// and its three branches (another user, the same user in another epoch, the same user and epoch), the
-/// outcomes of the renewal, the trust boundary, the explicit operations and the refusals.
+/// outcomes of the renewal, the trust boundary, the explicit operations and the refusals; the window of the
+/// session and the expiry of its cookie across sign-ins by headers and explicit renewals, and the end of the
+/// session reached by the moment of a renewal.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("session-surfaces")]
@@ -33,7 +36,71 @@ public sealed class SsoSessionIntegrationTest
     private static readonly (string, string)[] HeadersA = [("X-Auth-Request-Email", "pa@corp.io"), ("X-Auth-Request-User", "pa")];
     private static readonly (string, string)[] HeadersB = [("X-Auth-Request-Email", "b@corp.io"), ("X-Auth-Request-User", "b")];
 
-    private static Task<SurfacesHost> StartAsync() => SurfacesHost.StartAsync(trustHeaders: true);
+    // Another pair of headers of user A (the API model maps every email not starting with "b" to A).
+    private static readonly (string, string)[] HeadersA2 = [("X-Auth-Request-Email", "pa2@corp.io"), ("X-Auth-Request-User", "pa2")];
+
+    /// <summary>The absolute limit of the stand when a test names none: the default of the setting, 720 h.</summary>
+    private const int DefaultAbsoluteHours = 720;
+
+    private static Task<SurfacesHost> StartAsync(TimeProvider? time = null, SessionTimeouts? timeouts = null) =>
+        SurfacesHost.StartAsync(trustHeaders: true, time: time, timeouts: timeouts);
+
+    /// <summary>The ticket of the row as stored, read without the store (a read through it would write the row's lifetime).</summary>
+    private static async Task<AuthenticationTicket> RowAsync(SurfacesHost host, string key) =>
+        TicketSerializer.Default.Deserialize((byte[])(await host.Db.StringGetAsync(key))!)!;
+
+    /// <summary>
+    /// Gives the row of <paramref name="key"/> the window [<paramref name="issued"/>, <paramref name="expires"/>]
+    /// and the lifetime <paramref name="lifetime"/>, as the process that wrote it would have; nothing else changes.
+    /// </summary>
+    private static async Task SeedWindowAsync(
+        SurfacesHost host, string key, DateTimeOffset issued, DateTimeOffset expires, TimeSpan lifetime)
+    {
+        var ticket = await RowAsync(host, key);
+        ticket.Properties.IssuedUtc = issued;
+        ticket.Properties.ExpiresUtc = expires;
+        await host.Db.StringSetAsync(key, TicketSerializer.Default.Serialize(ticket), lifetime);
+    }
+
+    /// <summary>The moment truncated to whole seconds, the precision of a stored ticket and of a cookie expiry.</summary>
+    private static DateTimeOffset Whole(DateTimeOffset moment) => DateTimeOffset.FromUnixTimeSeconds(moment.ToUnixTimeSeconds());
+
+    private static long ExpiresSeconds(SessionPipelineHost.SetCookie set) =>
+        (SessionPipelineIntegrationTest.ExpiresOf(set) ?? throw new Xunit.Sdk.XunitException("the session cookie is not persistent"))
+            .ToUnixTimeSeconds();
+
+    private static async Task<DateTimeOffset> RedisNowAsync(SurfacesHost host) =>
+        new(DateTime.SpecifyKind(await host.Mux.GetServers().First(s => !s.IsReplica).TimeAsync(), DateTimeKind.Utc));
+
+    /// <summary>Polls <paramref name="condition"/>; a condition not met within 15 s fails the test's precondition.</summary>
+    private static async Task UntilAsync(Func<Task<bool>> condition, string what)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!await condition())
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail($"precondition not met within 15 s: {what}");
+            }
+            await Task.Delay(20);
+        }
+    }
+
+    /// <summary>
+    /// The window of a session signed in by this request: it starts at the sign-in (not before
+    /// <paramref name="requested"/>, not after <paramref name="latest"/>), runs the absolute limit
+    /// <paramref name="absoluteHours"/>, and the persistent cookie expires at its end.
+    /// </summary>
+    private static async Task AssertOwnWindowAsync(
+        SurfacesHost host, SessionPipelineHost.SetCookie set, string key, DateTimeOffset requested, DateTimeOffset latest,
+        int absoluteHours = DefaultAbsoluteHours)
+    {
+        var row = await RowAsync(host, key);
+        var issued = row.Properties.IssuedUtc!.Value;
+        Assert.InRange(issued, Whole(requested), latest);
+        Assert.Equal(issued.AddHours(absoluteHours), row.Properties.ExpiresUtc);
+        Assert.Equal(row.Properties.ExpiresUtc!.Value.ToUnixTimeSeconds(), ExpiresSeconds(set));
+    }
 
     private static Task<SessionPipelineHost.Reply> GetAsync(
         SurfacesHost host, string? cookie, (string, string)[] headers, string path = "/test/me") =>
@@ -92,12 +159,14 @@ public sealed class SsoSessionIntegrationTest
     public async Task Bootstrap_WithNoCookie_IssuesASessionWithThePairInTheNewTicket()
     {
         await using var host = await StartAsync();
+        var requested = DateTimeOffset.UtcNow;
 
         var reply = await GetAsync(host, null, HeadersA);
 
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         var set = Assert.Single(reply.Sessions(host.CookieName));
         var key = host.KeyOf(set);
+        await AssertOwnWindowAsync(host, set, key, requested, DateTimeOffset.UtcNow);
         Assert.Equal(A.ToString(), UserOf(reply));
         Assert.Equal(1, host.Api.CallsTo(Provision));
         var stored = await StoredAsync(host, key);
@@ -120,10 +189,14 @@ public sealed class SsoSessionIntegrationTest
             "expired" => bobCookie,
             _ => $"{host.CookieName}=not-a-session-value",
         };
+        // The old session signed in five hours ago: a window it passed on would start then.
+        var oldSignIn = Whole(DateTimeOffset.UtcNow.AddHours(-5));
+        await SeedWindowAsync(host, bobKey, oldSignIn, oldSignIn.AddHours(DefaultAbsoluteHours), TimeSpan.FromHours(1));
         if (kind == "expired")
         {
             await host.Db.KeyDeleteAsync(bobKey);
         }
+        var requested = DateTimeOffset.UtcNow;
 
         var reply = await GetAsync(host, cookie, HeadersA);
 
@@ -131,6 +204,7 @@ public sealed class SsoSessionIntegrationTest
         var set = Assert.Single(reply.Sessions(host.CookieName));
         var fresh = host.KeyOf(set);
         Assert.NotEqual(bobKey, fresh);
+        await AssertOwnWindowAsync(host, set, fresh, requested, DateTimeOffset.UtcNow);
         Assert.Equal(A.ToString(), UserOf(reply));
         if (kind != "arbitrary") // an unreadable cookie names no key: nothing of B's is touched by it
         {
@@ -156,21 +230,321 @@ public sealed class SsoSessionIntegrationTest
         Assert.Equal(before, (byte[])(await host.Db.StringGetAsync(key))!); // not due: the ticket is not rewritten by a read
     }
 
+    // SC-003, D-1, INV-8: a matching pair with no refresh due moves only the lifetime of the row; the
+    // ticket is written only by an explicit confirmation, which keeps the window of the sign-in.
     [RedisFact]
-    public async Task AMatchingPair_RenewalWritesTheTicketByThePrincipal_WhenItIsDue()
+    public async Task AMatchingPair_OnlyMovesTheRowLifetime_AndAnExplicitConfirmation_WritesTheClaimsInTheSignInWindow()
     {
         await using var host = await StartAsync();
         var (cookie, key) = await BootstrapAsync(host);
-        await PasswordResetSessionTest.MakeSlidingDueAsync(host, key);
-        var oldExpiry = (await StoredAsync(host, key)).Properties.ExpiresUtc;
+        var signedIn = (await RowAsync(host, key)).Properties;
+        byte[] before = (await host.Db.StringGetAsync(key))!;
+        Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromMinutes(1)));
+
+        var local = await GetAsync(host, cookie, HeadersA);
+
+        Assert.Equal(HttpStatusCode.OK, local.Status);
+        Assert.Equal(1, host.Api.CallsTo(Provision)); // still local
+        Assert.Empty(local.SessionWrites());
+        Assert.Equal(before, (byte[])(await host.Db.StringGetAsync(key))!); // the ticket is not written ...
+        Assert.True(await host.Db.KeyTimeToLiveAsync(key) > TimeSpan.FromHours(1)); // ... the lifetime of the row moved
+
+        await AgeRefreshAsync(host, key);
+        host.Api.Override = Provisioned(WithRole(SurfacesApi.UserJson(A, "a@x.io", 3), "admin"));
+
+        var confirmed = await GetAsync(host, cookie, HeadersA);
+
+        Assert.Equal(HttpStatusCode.OK, confirmed.Status);
+        Assert.Equal(2, host.Api.CallsTo(Provision));
+        var row = await RowAsync(host, key);
+        Assert.Equal("admin", row.Principal.FindFirstValue(ClaimTypes.Role)); // the confirmed claims are written
+        Assert.Equal("pa@corp.io", row.Properties.Items[RedisTicketStore.SsoEmailItem]);
+        Assert.Equal(signedIn.IssuedUtc, row.Properties.IssuedUtc); // in the window of the sign-in
+        Assert.Equal(signedIn.ExpiresUtc, row.Properties.ExpiresUtc);
+    }
+
+    // SC-003, E-3, INV-1: a series of confirmations, then ordinary requests and confirmations of the same
+    // session in parallel, on a replica whose clock moves on: the window of the row stays the sign-in's.
+    [RedisFact]
+    public async Task ConfirmationsInSeries_AndParallelRequestsOfTheSession_KeepTheSignInWindow()
+    {
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var host = await StartAsync(time);
+        var (cookie, key) = await host.SignInAsync("a@x.io"); // no remembered pair: every new pair is confirmed
+        var signedIn = (await RowAsync(host, key)).Properties;
+        (string, string)[] headersA3 = [("X-Auth-Request-Email", "pa3@corp.io"), ("X-Auth-Request-User", "pa3")];
+
+        foreach (var headers in new[] { HeadersA, HeadersA2, headersA3 })
+        {
+            time.Advance(TimeSpan.FromHours(1));
+            var reply = await GetAsync(host, cookie, headers);
+            Assert.Equal(HttpStatusCode.OK, reply.Status);
+            Assert.Equal(key, host.KeyOf(Assert.Single(reply.Sessions(host.CookieName))));
+        }
+        Assert.Equal(3, host.Api.CallsTo(Provision));
+
+        time.Advance(TimeSpan.FromHours(1));
+        var parallel = await Task.WhenAll(
+            GetAsync(host, cookie, headersA3), // ordinary: the remembered pair
+            GetAsync(host, cookie, headersA3),
+            GetAsync(host, cookie, HeadersA),  // confirmations of other pairs
+            GetAsync(host, cookie, HeadersA2));
+
+        Assert.All(parallel, r => Assert.Equal(HttpStatusCode.OK, r.Status));
+        Assert.All(parallel, r => Assert.All(r.Sessions(host.CookieName), c => Assert.Equal(key, host.KeyOf(c))));
+        Assert.True(host.Api.CallsTo(Provision) >= 5, "the parallel confirmations were not made");
+        var row = await RowAsync(host, key);
+        Assert.Equal(signedIn.IssuedUtc, row.Properties.IssuedUtc);
+        Assert.Equal(signedIn.ExpiresUtc, row.Properties.ExpiresUtc);
+    }
+
+    // SC-007, D-3, INV-6, US-3: the cookie of a successful explicit renewal expires at the end of the session
+    // as of the renewal, and the row lives no longer than what is left. The row is seeded as a process with
+    // the limit of 720 h wrote it an hour after its sign-in; the stand runs the limit of the case.
+    [RedisTheory]
+    [InlineData(720, 720)]  // the limit of the sign-in: L + 720 h
+    [InlineData(11, 11)]    // a lowered limit: L + 11 h
+    [InlineData(1000, 720)] // a raised limit: the written end of the window, not L + 1000 h
+    public async Task ASuccessfulExplicitRenewal_ExpiresTheCookieAtTheEndOfTheSession_AndTheRowLivesNoLonger(
+        int absoluteHours, int expectedEndHours)
+    {
+        await using var host = await StartAsync(
+            timeouts: new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, absoluteHours));
+        var (cookie, key) = await host.SignInAsync("a@x.io");
+        var signIn = Whole(DateTimeOffset.UtcNow.AddHours(-1));
+        await SeedWindowAsync(host, key, signIn, signIn.AddHours(720), TimeSpan.FromHours(SessionTimeouts.DefaultIdleTimeoutHours));
+        var end = signIn.AddHours(expectedEndHours);
+
+        var reply = await GetAsync(host, cookie, HeadersA);
+        var observedAt = DateTimeOffset.UtcNow;
+        var lifetime = await host.Db.KeyTimeToLiveAsync(key);
+
+        Assert.Equal(HttpStatusCode.OK, reply.Status);
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        Assert.Equal(key, host.KeyOf(set));
+        Assert.Equal(end.ToUnixTimeSeconds(), ExpiresSeconds(set));
+        Assert.NotNull(lifetime);
+        Assert.True(lifetime > TimeSpan.Zero);
+        Assert.True(lifetime <= end - observedAt, $"the row lives {lifetime}, past the end of the session");
+        Assert.Equal(signIn, (await RowAsync(host, key)).Properties.IssuedUtc); // the window is the written one
+    }
+
+    // ---- E-8: the session ends by the moment of the renewal ---------------------------------------------
+
+    /// <summary>
+    /// The outcome of a renewal whose session ended: the old row is gone, no Set-Cookie of the old key, and a
+    /// new key with its own persistent cookie, its own window (from no earlier than <paramref name="notBefore"/>)
+    /// and the pair of the headers.
+    /// </summary>
+    private static async Task AssertReplacedByANewKeyAsync(
+        SurfacesHost host, SessionPipelineHost.Reply reply, string oldKey, DateTimeOffset notBefore, DateTimeOffset latest)
+    {
+        Assert.Equal(HttpStatusCode.OK, reply.Status);
+        Assert.False(await host.Db.KeyExistsAsync(oldKey));
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        var fresh = host.KeyOf(set);
+        Assert.NotEqual(oldKey, fresh);
+        await AssertOwnWindowAsync(host, set, fresh, notBefore, latest);
+        var row = await RowAsync(host, fresh);
+        Assert.Equal("pa@corp.io", row.Properties.Items[RedisTicketStore.SsoEmailItem]);
+        Assert.Equal("pa", row.Properties.Items[RedisTicketStore.SsoUserItem]);
+        Assert.Equal(A.ToString(), UserOf(reply));
+    }
+
+    // (a) The replica decides: the answer of skein-api moves the clock of the stand past the end of the window.
+    [RedisFact]
+    public async Task TheSessionEndingDuringTheConfirmation_ByTheClockOfTheReplica_SendsNoCompareAndSet_AndIssuesANewKey()
+    {
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var host = await StartAsync(time);
+        var (cookie, key) = await host.SignInAsync("a@x.io");
+        var end = (await RowAsync(host, key)).Properties.ExpiresUtc!.Value;
+        var after = end.AddMinutes(1);
+        host.Api.Override = Provisioned(SurfacesApi.UserJson(A, "a@x.io", 3), () => time.SetUtcNow(after));
+        var compareAndSets = 0;
+        host.Faults.Before = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, StoreScripts.Renew))
+            {
+                Interlocked.Increment(ref compareAndSets);
+            }
+            return null;
+        };
+
+        var reply = await GetAsync(host, cookie, HeadersA);
+
+        host.Faults.Before = null;
+        Assert.Equal(1, host.Api.CallsTo(Provision)); // the confirmation was made, and moved the clock
+        Assert.Equal(0, compareAndSets);
+        await AssertReplacedByANewKeyAsync(host, reply, key, after, after);
+    }
+
+    /// <summary>
+    /// (b) The script decides. The row's window ends at <paramref name="end"/> (a few seconds of real time
+    /// ahead); the compare-and-set of the renewal is held. While it is held the test gives the row a lifetime
+    /// of 60 s (the read of the request set it to the time left), and checks that the held call is that
+    /// compare-and-set and the replica decided with time left. <paramref name="beforeRelease"/> waits for the
+    /// moment of the case; right before the release the row is checked alive with the bytes the renewal read
+    /// and a lifetime far above the command timeout of the stand.
+    /// </summary>
+    private static async Task<SessionPipelineHost.Reply> RenewalHeldUntilAsync(
+        SurfacesHost host, string cookie, string key, DateTimeOffset end, Func<Task> beforeRelease)
+    {
+        await SeedWindowAsync(host, key, end.AddHours(-1), end, TimeSpan.FromMinutes(1));
+        byte[] read = (await host.Db.StringGetAsync(key))!;
+        var compareAndSet = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
+        try
+        {
+            var request = GetAsync(host, cookie, HeadersA);
+            await compareAndSet.Reached.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(DateTimeOffset.UtcNow < end, "precondition: the replica decided after the end of the session");
+            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(60)), "precondition: the row is gone before the release");
+
+            await beforeRelease();
+
+            Assert.Equal(read, (byte[]?)await host.Db.StringGetAsync(key));
+            var lifetime = await host.Db.KeyTimeToLiveAsync(key);
+            Assert.True(lifetime > TimeSpan.FromSeconds(10), $"precondition: the row has {lifetime} left at the release");
+            compareAndSet.Release();
+            return await request.WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            compareAndSet.Release();
+        }
+    }
+
+    [RedisFact]
+    public async Task TheSessionEndingBeforeTheCompareAndSet_ByTheClockOfRedis_WritesNothing_AndIssuesANewKey()
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await host.SignInAsync("a@x.io");
+        var end = Whole(DateTimeOffset.UtcNow).AddSeconds(3);
+
+        var reply = await RenewalHeldUntilAsync(host, cookie, key, end,
+            () => UntilAsync(async () => await RedisNowAsync(host) >= end, "the clock of Redis reaches the end of the session"));
+
+        await AssertReplacedByANewKeyAsync(host, reply, key, end, DateTimeOffset.UtcNow);
+    }
+
+    // The control at the boundary: the same compare-and-set released with at least 1 s left by the clock of Redis.
+    [RedisFact]
+    public async Task TheCompareAndSet_ReleasedASecondBeforeTheEnd_IsWritten_WithTheCookieOfTheSameKey()
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await host.SignInAsync("a@x.io");
+        var end = Whole(DateTimeOffset.UtcNow).AddSeconds(6);
+
+        var reply = await RenewalHeldUntilAsync(host, cookie, key, end, async () =>
+            Assert.True(await RedisNowAsync(host) <= end.AddSeconds(-1), "precondition: less than 1 s left at the release"));
+
+        Assert.Equal(HttpStatusCode.OK, reply.Status);
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        Assert.Equal(key, host.KeyOf(set));
+        Assert.Equal(end.ToUnixTimeSeconds(), ExpiresSeconds(set));
+        Assert.Equal("pa@corp.io", (await RowAsync(host, key)).Properties.Items[RedisTicketStore.SsoEmailItem]); // written
+    }
+
+    // INV-8, residual 2-4: another explicit confirmation of the same owner and epoch replaces the pair and the
+    // claims in the same window, and the next ordinary request keeps the replacement.
+    [RedisFact]
+    public async Task AnotherConfirmation_ReplacesThePairAndTheClaims_InTheSameWindow_AndAnOrdinaryRequestKeepsThem()
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await BootstrapAsync(host);
+        var signedIn = (await RowAsync(host, key)).Properties;
+        host.Api.Override = Provisioned(WithRole(SurfacesApi.UserJson(A, "a@x.io", 3), "admin"));
+
+        var confirmed = await GetAsync(host, cookie, HeadersA2);
+
+        Assert.Equal(HttpStatusCode.OK, confirmed.Status);
+        Assert.Equal(key, host.KeyOf(Assert.Single(confirmed.Sessions(host.CookieName))));
+        var row = await RowAsync(host, key);
+        Assert.Equal("pa2@corp.io", row.Properties.Items[RedisTicketStore.SsoEmailItem]);
+        Assert.Equal("pa2", row.Properties.Items[RedisTicketStore.SsoUserItem]);
+        Assert.Equal("admin", row.Principal.FindFirstValue(ClaimTypes.Role));
+        Assert.Equal(signedIn.IssuedUtc, row.Properties.IssuedUtc);
+        Assert.Equal(signedIn.ExpiresUtc, row.Properties.ExpiresUtc);
+        byte[] written = (await host.Db.StringGetAsync(key))!;
+
+        var ordinary = await GetAsync(host, cookie, HeadersA2);
+
+        Assert.Equal(HttpStatusCode.OK, ordinary.Status);
+        Assert.Equal(2, host.Api.CallsTo(Provision)); // the replaced pair is the remembered one: local
+        Assert.Empty(ordinary.SessionWrites());
+        Assert.Equal(written, (byte[])(await host.Db.StringGetAsync(key))!);
+    }
+
+    // SC-001 for an SSO request: the read script set the lifetime of the row, the renewal's compare-and-set is
+    // held, the test sets the lifetime to 1 s; once released, the renewal (the last write) sets min(idle, time left).
+    [RedisFact]
+    public async Task OnARequestWithAnExplicitRenewal_TheRenewalAsTheLastWrite_SetsTheRowLifetime()
+    {
+        await using var host = await StartAsync();
+        var (cookie, key) = await host.SignInAsync("a@x.io");
+        var lifetimeRead = false;
+        host.Faults.After = (name, args) =>
+        {
+            lifetimeRead |= DbProxy.IsScript(name, args, StoreScripts.Read, key);
+            return Task.CompletedTask;
+        };
+        var compareAndSet = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
+        try
+        {
+            var request = GetAsync(host, cookie, HeadersA);
+            await compareAndSet.Reached.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(lifetimeRead, "precondition: the read of the request did not write the lifetime of the row");
+            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(1)));
+            compareAndSet.Release();
+            var reply = await request.WaitAsync(TimeSpan.FromSeconds(30));
+
+            Assert.Equal(HttpStatusCode.OK, reply.Status);
+            Assert.Equal(key, host.KeyOf(Assert.Single(reply.Sessions(host.CookieName))));
+            var lifetime = await host.Db.KeyTimeToLiveAsync(key);
+            // min(idle 120 h, about 720 h left) = 120 h.
+            Assert.NotNull(lifetime);
+            Assert.InRange(lifetime.Value, TimeSpan.FromHours(120) - TimeSpan.FromMinutes(1), TimeSpan.FromHours(120));
+        }
+        finally
+        {
+            compareAndSet.Release();
+            host.Faults.After = null;
+        }
+    }
+
+    // US-1, SC-002, the trust-headers chain: once the old session has ended — (a) idle, its row gone by its
+    // own lifetime in Redis; (b) its session end passed on the stand's clock — valid headers sign in afresh.
+    [RedisTheory]
+    [InlineData("idle")]
+    [InlineData("absolute")]
+    public async Task AfterTheOldSessionEnded_TheProvidersHeaders_SignInAfresh_UnderANewKeyWithItsOwnWindow(string ending)
+    {
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var host = await StartAsync(time);
+        var (cookie, key) = await BootstrapAsync(host);
+        var oldIssued = (await RowAsync(host, key)).Properties.IssuedUtc;
+        if (ending == "idle")
+        {
+            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromMilliseconds(300)));
+            await UntilAsync(async () => !await host.Db.KeyExistsAsync(key), "the row expires in Redis");
+            time.Advance(TimeSpan.FromHours(1));
+        }
+        else
+        {
+            time.Advance(TimeSpan.FromHours(DefaultAbsoluteHours + 1));
+        }
+        var requested = time.GetUtcNow();
 
         var reply = await GetAsync(host, cookie, HeadersA);
 
         Assert.Equal(HttpStatusCode.OK, reply.Status);
-        Assert.Equal(1, host.Api.CallsTo(Provision)); // still local
-        var stored = await StoredAsync(host, key);
-        Assert.True(stored.Properties.ExpiresUtc > oldExpiry); // the ticket itself moved on, not only the row's TTL
-        Assert.Equal("pa@corp.io", stored.Properties.Items[RedisTicketStore.SsoEmailItem]);
+        Assert.Equal(A.ToString(), UserOf(reply));
+        var set = Assert.Single(reply.Sessions(host.CookieName));
+        var fresh = host.KeyOf(set);
+        Assert.NotEqual(key, fresh);
+        Assert.False(await host.Db.KeyExistsAsync(key)); // the old key is not renewed
+        await AssertOwnWindowAsync(host, set, fresh, requested, requested);
+        Assert.NotEqual(oldIssued, (await RowAsync(host, fresh)).Properties.IssuedUtc);
     }
 
     [RedisTheory]
@@ -240,6 +614,9 @@ public sealed class SsoSessionIntegrationTest
     {
         await using var host = await StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
+        // The old session signed in five hours ago: a window it passed on would start then.
+        var oldSignIn = Whole(DateTimeOffset.UtcNow.AddHours(-5));
+        await SeedWindowAsync(host, key, oldSignIn, oldSignIn.AddHours(DefaultAbsoluteHours), TimeSpan.FromHours(1));
         var onOld = JsonDocument.Parse((await host.SendAsync(HttpMethod.Get, "/test/hub", cookie: cookie)).Body)
             .RootElement.GetProperty("connection").GetString()!;
         var aliveAtConfirmation = false;
@@ -252,12 +629,15 @@ public sealed class SsoSessionIntegrationTest
             return null;
         };
 
+        var requested = DateTimeOffset.UtcNow;
+
         var reply = await GetAsync(host, cookie, HeadersB);
 
         Assert.True(aliveAtConfirmation); // the old key lives until the subject is confirmed
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         var set = Assert.Single(reply.Sessions(host.CookieName));
         var fresh = host.KeyOf(set);
+        await AssertOwnWindowAsync(host, set, fresh, requested, DateTimeOffset.UtcNow); // not the old session's window
         Assert.Equal(B.ToString(), UserOf(reply)); // downstream sees B ...
         Assert.Equal(fresh, JsonDocument.Parse(reply.Body).RootElement.GetProperty("key").GetString()); // ... on the new key
         Assert.False(await host.Db.KeyExistsAsync(key));
@@ -291,12 +671,11 @@ public sealed class SsoSessionIntegrationTest
     [RedisTheory]
     [InlineData("server-error", 502, "sso_unavailable")]
     [InlineData("not-provisioned", 403, "user_not_provisioned")]
-    public async Task AFailedConfirmation_WithASlidingRenewalDue_KeepsTheStatusAndCode_WritesNoCookie_AndLeavesTheRow(
+    public async Task AFailedConfirmation_KeepsTheStatusAndCode_WritesNoCookie_AndLeavesTheRow(
         string failure, int status, string code)
     {
         await using var host = await StartAsync();
         var (cookie, key) = await BootstrapAsync(host);
-        await PasswordResetSessionTest.MakeSlidingDueAsync(host, key); // Main plans a sliding renewal
         byte[] before = (await host.Db.StringGetAsync(key))!;
         host.Api.Override = r => r.RequestUri!.AbsolutePath != Provision
             ? null
@@ -553,7 +932,7 @@ public sealed class SsoSessionIntegrationTest
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         Assert.True(round >= 3);
         Assert.True(await host.Db.KeyExistsAsync(key)); // a live key is not revoked
-        Assert.All(reply.Sessions(host.CookieName), c => Assert.Equal(key, host.KeyOf(c))); // and not rotated
+        Assert.Empty(reply.SessionWrites()); // not rotated, and no Set-Cookie of the old key
         Assert.Equal(A.ToString(), UserOf(reply));
     }
 
@@ -570,7 +949,7 @@ public sealed class SsoSessionIntegrationTest
         var reply = await GetAsync(host, cookie, HeadersA);
 
         Assert.Equal(HttpStatusCode.OK, reply.Status);
-        Assert.All(reply.Sessions(host.CookieName), c => Assert.Equal(key, host.KeyOf(c)));
+        Assert.Empty(reply.SessionWrites()); // not rotated, and no Set-Cookie of the old key
         var stored = await StoredAsync(host, key);
         Assert.Equal(B.ToString(), stored.Principal.FindFirstValue(ClaimTypes.NameIdentifier)); // the owner was not changed to A
     }
@@ -590,6 +969,7 @@ public sealed class SsoSessionIntegrationTest
         Assert.Equal(HttpStatusCode.BadGateway, reply.Status);
         Assert.Equal("sso_unavailable", ErrorOf(reply));
         Assert.Empty(reply.Cookies);
+        Assert.DoesNotContain("\"user\"", reply.Body); // /test/me did not run
         Assert.True(await host.Db.KeyExistsAsync(key));
     }
 

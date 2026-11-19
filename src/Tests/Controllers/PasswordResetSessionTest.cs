@@ -128,16 +128,6 @@ public sealed class PasswordResetSessionTest
         Assert.Contains(Token, host.Api.SpentTokens);      // and the token is spent
     }
 
-    internal static async Task MakeSlidingDueAsync(SurfacesHost host, string key)
-    {
-        var store = host.Services.GetRequiredService<RedisTicketStore>();
-        var ticket = (await store.RetrieveAsync(key, new DefaultHttpContext(), CancellationToken.None))!;
-        var issued = DateTimeOffset.UtcNow.AddHours(-13);
-        ticket.Properties.IssuedUtc = issued;
-        ticket.Properties.ExpiresUtc = issued.AddHours(24);
-        await host.Db.StringSetAsync(key, TicketSerializer.Default.Serialize(ticket), TimeSpan.FromHours(24));
-    }
-
     [RedisFact]
     public async Task Partial_WhenTheIncomingKeyCannotBeDeleted_Is502_WithNoCookie_AndTheRowIsNotRewritten()
     {

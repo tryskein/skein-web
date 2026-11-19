@@ -1,12 +1,16 @@
 using System.Globalization;
 using System.Net;
 using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Time.Testing;
 using SkeinWeb.Auth;
 using SkeinWeb.Middleware;
+using SkeinWeb.Tests.Auth;
+using SkeinWeb.Tests.Controllers;
 
 namespace SkeinWeb.Tests.Middleware;
 
@@ -32,10 +36,12 @@ namespace SkeinWeb.Tests.Middleware;
 ///     (e.g. internal probe): pass through without provisioning (the
 ///     TTL-refresh path is silent when oauth2-proxy didn't sit in front).
 ///   - Keycloak mode + bypass path: short-circuit even with headers set.
+///   - The explicit renewal of the same key signs Main in with the sign-in time and the end of the
+///     session as of the renewal; an ended session or an invalid window issues a new session instead,
+///     and a confirmation in another epoch signs nothing in.
 ///
-/// The happy path (and the TTL-refresh-DOES-fire branch) requires a live
-/// skein-api on the other side and is covered by the integration suite,
-/// not here.
+/// The rest of the happy path (and the TTL-refresh-DOES-fire branch) needs the real store and is
+/// covered by the integration suite, not here.
 /// </summary>
 public class SsoSessionMiddlewareTest
 {
@@ -385,5 +391,181 @@ public class SsoSessionMiddlewareTest
 
         Assert.True(nextCalled);
         Assert.Empty(touched);
+    }
+
+    // ---- The explicit renewal of the same key: its window and its end (matrix row 58) -----------------
+
+    private static readonly Guid RenewedUser = SurfacesApi.UserA;
+
+    /// <summary>The sign-in time of the session under renewal; its written window is [L, L + 720 h].</summary>
+    private static readonly DateTimeOffset SignIn = new(2026, 11, 19, 10, 0, 0, TimeSpan.Zero);
+
+    /// <summary>
+    /// Records every sign-in a request asks for, by scheme, and answers them as the store would on
+    /// success: Main's renewal is written, an issue through the Issue scheme gets a key.
+    /// <c>AuthenticateAsync</c> returns the session Main read for the request.
+    /// </summary>
+    private sealed class RecordingAuthentication(AuthenticationTicket current) : IAuthenticationService
+    {
+        public List<(string? Scheme, AuthenticationProperties? Properties)> SignIns { get; } = [];
+
+        public Task<AuthenticateResult> AuthenticateAsync(HttpContext context, string? scheme) =>
+            Task.FromResult(AuthenticateResult.Success(current));
+
+        public Task SignInAsync(HttpContext context, string? scheme, ClaimsPrincipal principal, AuthenticationProperties? properties)
+        {
+            SignIns.Add((scheme, properties));
+            var state = SessionRequestState.Of(context);
+            if (scheme == SessionSchemes.Main)
+            {
+                state.RenewOutcome = RenewOutcome.Written;
+            }
+            else
+            {
+                state.IssuedKey = "skein:session:issued-by-the-test";
+            }
+            return Task.CompletedTask;
+        }
+
+        public Task ChallengeAsync(HttpContext context, string? scheme, AuthenticationProperties? properties) => Task.CompletedTask;
+
+        public Task ForbidAsync(HttpContext context, string? scheme, AuthenticationProperties? properties) => Task.CompletedTask;
+
+        public Task SignOutAsync(HttpContext context, string? scheme, AuthenticationProperties? properties) => Task.CompletedTask;
+    }
+
+    /// <summary>skein-api confirming the headers as the session's user, in <paramref name="epoch"/>.</summary>
+    private sealed class ConfirmingApi(long epoch) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(SurfacesApi.UserJson(RenewedUser, "a@x.io", epoch), System.Text.Encoding.UTF8, "application/json"),
+            });
+    }
+
+    /// <summary>
+    /// A request of the session of <see cref="RenewedUser"/> in epoch 3, with no remembered pair (so the
+    /// headers are confirmed), whose ticket carries <paramref name="issued"/> and <paramref name="expires"/>,
+    /// on a replica whose clock reads <paramref name="now"/> and whose absolute limit is
+    /// <paramref name="absoluteHours"/>; skein-api answers with <paramref name="confirmedEpoch"/>.
+    /// </summary>
+    private static (SsoSessionMiddleware Middleware, HttpContext Context, RecordingAuthentication Auth) RenewalRequest(
+        int absoluteHours, DateTimeOffset now, DateTimeOffset? issued, DateTimeOffset? expires, long confirmedEpoch = 3)
+    {
+        var principal = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim(ClaimTypes.NameIdentifier, RenewedUser.ToString()),
+                new Claim(SessionPrincipal.SessionEpochClaim, "3"),
+                new Claim(SessionPrincipal.SessionKeyClaim, "skein:session:renewed"),
+                FreshRefreshedAtClaim(),
+            ],
+            authenticationType: "Cookies"));
+        var current = new AuthenticationTicket(
+            principal, new AuthenticationProperties { IssuedUtc = issued, ExpiresUtc = expires, IsPersistent = true }, SessionSchemes.Main);
+        var auth = new RecordingAuthentication(current);
+
+        var services = new ServiceCollection();
+        services.AddSingleton<IAuthenticationService>(auth);
+        services.AddSingleton(new SkeinApiClient(
+            new HttpClient(new ConfirmingApi(confirmedEpoch)) { BaseAddress = new Uri("http://skein-api.test") },
+            NullLogger<SkeinApiClient>.Instance));
+        services.AddSingleton(new SessionTimeouts(SessionTimeouts.DefaultIdleTimeoutHours, absoluteHours));
+        services.AddSingleton<TimeProvider>(new FakeTimeProvider(now));
+        services.AddSingleton(TestRedis.Issuer());
+        services.AddOptions<Microsoft.AspNetCore.Authentication.Cookies.CookieAuthenticationOptions>(SessionSchemes.Main)
+            .Configure(o =>
+            {
+                o.CookieManager = new Microsoft.AspNetCore.Authentication.Cookies.ChunkingCookieManager();
+                o.Cookie.Name = "skein.sid";
+            });
+        var provider = services.BuildServiceProvider();
+
+        var ctx = new DefaultHttpContext { RequestServices = provider };
+        ctx.Request.Path = "/";
+        WithTrustedPeer(ctx);
+        ctx.Request.Headers["X-Auth-Request-Email"] = "pa@corp.io";
+        ctx.Request.Headers["X-Auth-Request-User"] = "pa";
+        ctx.Response.Body = new MemoryStream();
+        ctx.User = principal;
+        var middleware = new SsoSessionMiddleware(KeycloakMode, TrustedProxies, provider, NullLogger<SsoSessionMiddleware>.Instance);
+        return (middleware, ctx, auth);
+    }
+
+    private const long Hour = TimeSpan.TicksPerHour;
+    private const long Millisecond = TimeSpan.TicksPerMillisecond;
+
+    public static TheoryData<string, int, long, int> LiveRenewals() => new()
+    {
+        // case, absolute limit (h), time since the sign-in (ticks), expected end of the session after the sign-in (h)
+        { "the limit of the sign-in", 720, Hour, 720 },
+        { "a lowered limit", 11, Hour, 11 },
+        { "a lowered limit, 1 ms before the end", 11, 11 * Hour - Millisecond, 11 },
+        { "a raised limit: the written window", 1000, Hour, 720 },
+    };
+
+    [Theory]
+    [MemberData(nameof(LiveRenewals))]
+    public async Task AnExplicitRenewal_SignsInWithTheSignInTime_AndTheEndOfTheSessionAsOfTheRenewal(
+        string _, int absoluteHours, long sinceSignIn, int expectedEndHours)
+    {
+        var (middleware, ctx, auth) = RenewalRequest(
+            absoluteHours, SignIn.AddTicks(sinceSignIn), SignIn, SignIn.AddHours(720));
+
+        var nextCalled = false;
+        await middleware.InvokeAsync(ctx, _ => { nextCalled = true; return Task.CompletedTask; });
+
+        var (scheme, properties) = Assert.Single(auth.SignIns);
+        Assert.Equal(SessionSchemes.Main, scheme);
+        Assert.Equal(SignIn, properties!.IssuedUtc);
+        Assert.Equal(SignIn.AddHours(expectedEndHours), properties.ExpiresUtc);
+        Assert.True(properties.IsPersistent);
+        Assert.True(nextCalled);
+    }
+
+    public static TheoryData<string, int, long?, long?, long> EndedRenewals() => new()
+    {
+        // case, absolute limit (h), ticket issued / expires after the sign-in (h; null = absent), time since the sign-in (ticks)
+        { "the end of the written window", 720, 0, 720, 720 * Hour },
+        { "past the end of a lowered limit", 11, 0, 720, 12 * Hour },
+        { "at the end of a lowered limit", 11, 0, 720, 11 * Hour },
+        { "half a millisecond before the end", 11, 0, 720, 11 * Hour - Millisecond / 2 },
+        { "an expiry equal to the issue time", 720, 0, 0, Hour },
+        { "no expiry", 720, 0, null, Hour },
+        { "no issue time", 720, null, 720, Hour },
+    };
+
+    [Theory]
+    [MemberData(nameof(EndedRenewals))]
+    public async Task ARenewalOfAnEndedSessionOrOfAnInvalidWindow_DoesNotSignInMain_AndIssuesANewSession(
+        string _, int absoluteHours, long? issuedHours, long? expiresHours, long sinceSignIn)
+    {
+        var (middleware, ctx, auth) = RenewalRequest(
+            absoluteHours,
+            SignIn.AddTicks(sinceSignIn),
+            issuedHours is { } i ? SignIn.AddHours(i) : null,
+            expiresHours is { } e ? SignIn.AddHours(e) : null);
+
+        await middleware.InvokeAsync(ctx, _ => Task.CompletedTask);
+
+        Assert.DoesNotContain(auth.SignIns, s => s.Scheme == SessionSchemes.Main);
+        var (scheme, _) = Assert.Single(auth.SignIns);
+        Assert.Equal(SessionSchemes.Issue, scheme); // the branch of an absent key: a new session
+        Assert.Equal(200, ctx.Response.StatusCode);
+    }
+
+    // INV-8: the store compares only the owner of the row, so the epoch is compared before any write of
+    // the same key: a confirmation in another epoch ends the session and signs nothing in.
+    [Fact]
+    public async Task AConfirmationInAnotherEpoch_SignsInNoScheme()
+    {
+        var (middleware, ctx, auth) = RenewalRequest(720, SignIn.AddHours(1), SignIn, SignIn.AddHours(720), confirmedEpoch: 4);
+
+        var nextCalled = false;
+        await middleware.InvokeAsync(ctx, _ => { nextCalled = true; return Task.CompletedTask; });
+
+        Assert.Empty(auth.SignIns);
+        Assert.True(nextCalled); // the request goes on anonymous
+        Assert.False(ctx.User.Identity?.IsAuthenticated);
     }
 }
