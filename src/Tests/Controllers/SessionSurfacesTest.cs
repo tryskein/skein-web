@@ -281,6 +281,10 @@ public sealed class SessionSurfacesTest
         Assert.Empty(reply.Cookies);
         Assert.EndsWith("/account-created-session-not-issued", Json(reply).GetProperty("type").GetString());
         Assert.Equal(1, host.Api.Calls.Count(c => c.EndsWith("/signup", StringComparison.Ordinal))); // the account is created once, not retried
+        host.Faults.Before = null;
+        host.Faults.After = null;
+        // delete failed → the old row lives; write failed after the confirmed delete → it is gone.
+        Assert.Equal(failing == "write", !await host.Db.KeyExistsAsync(key));
     }
 
     [RedisTheory]

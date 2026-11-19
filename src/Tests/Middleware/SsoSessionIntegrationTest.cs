@@ -446,13 +446,24 @@ public sealed class SsoSessionIntegrationTest
             revoked |= DbProxy.IsScript(name, args, StoreScripts.Revoke, key);
             return Task.CompletedTask;
         };
+        // The step that follows the confirmed DEL of the row: the removal of its member from the index.
+        var injected = false;
         host.Faults.Before = (name, args) =>
-            revoked && !DbProxy.IsScript(name, args, StoreScripts.Revoke) ? new InvalidOperationException("injected") : null;
+        {
+            if (revoked && name == nameof(IDatabase.SetRemoveAsync))
+            {
+                injected = true;
+                return new InvalidOperationException("injected");
+            }
+            return null;
+        };
 
         var reply = await GetAsync(host, cookie, HeadersA);
 
         host.Faults.Before = null;
+        host.Faults.After = null;
         Assert.True(revoked);
+        Assert.True(injected, "the failure after the confirmed revocation never fired: the test proves nothing");
         Assert.Equal(HttpStatusCode.Unauthorized, reply.Status); // not an unavailable answer
         Assert.NotEmpty(reply.Cookies);
         Assert.All(reply.Cookies, c => Assert.True(c.IsDeletion));
