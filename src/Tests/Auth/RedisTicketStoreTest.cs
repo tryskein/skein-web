@@ -21,11 +21,6 @@ public sealed class RedisTicketStoreTest : IDisposable
 {
     private const string KeyPrefix = "skein:session:";
 
-    // Distinctive fragments of the store's scripts, to tell its calls apart on the Redis boundary.
-    private const string ReadScript = "PEXPIRE', KEYS[1], ARGV[1]";
-    private const string IssueScript = "'NX', 'PX'";
-    private const string RenewScript = "redis.call('TIME')";
-
     private static readonly SessionTimeouts Defaults = new(120, 720);
 
     private readonly ConnectionMultiplexer _mux = TestRedis.Connect();
@@ -141,7 +136,7 @@ public sealed class RedisTicketStoreTest : IDisposable
         var issueKeys = new List<RedisKey[]>();
         proxy.Before = (name, args) =>
         {
-            if (DbProxy.IsScript(name, args, IssueScript))
+            if (DbProxy.IsScript(name, args, StoreScripts.Issue))
             {
                 lock (issueKeys)
                 {
@@ -297,6 +292,17 @@ public sealed class RedisTicketStoreTest : IDisposable
     }
 
     [RedisFact]
+    public async Task Retrieve_OfAnEmptyRow_IsNoSession_AndTheRowIsDeleted()
+    {
+        var key = NewKey("empty");
+        await Db.StringSetAsync(key, Array.Empty<byte>(), TimeSpan.FromHours(1));
+        Assert.True(await Db.KeyExistsAsync(key)); // control: the empty value is stored
+
+        Assert.Null(await ReadAsync(Store(), key));
+        Assert.False(await Db.KeyExistsAsync(key));
+    }
+
+    [RedisFact]
     public async Task Retrieve_OfARowGoneBeforeItsLifetimeIsWritten_IsNoSession_AndRecreatesNothing()
     {
         var user = NewUser();
@@ -362,8 +368,13 @@ public sealed class RedisTicketStoreTest : IDisposable
     public async Task AbsoluteLimitLoweredAndRaisedAgain_WithoutARequest_TheRequestIsJudgedByTheLimitThen()
     {
         var signIn = WholeSecond(DateTimeOffset.UtcNow);
-        var key = await IssueAsync(Store(Defaults, ClockAt(signIn)), SignedInAt(NewUser(), signIn));
-        _ = Store(new SessionTimeouts(120, 24), ClockAt(signIn.AddHours(30))); // a process that served no request of it
+        var user = NewUser();
+        var key = await IssueAsync(Store(Defaults, ClockAt(signIn)), SignedInAt(user, signIn));
+        var other = await IssueAsync(Store(Defaults, ClockAt(signIn)), SignedInAt(user, signIn));
+        // The process with the lowered limit ran and judged by it: another session of the same sign-in
+        // time is rejected by it. The session under test got no request from that process.
+        Assert.Null(await ReadAsync(Store(new SessionTimeouts(120, 24), ClockAt(signIn.AddHours(30))), other));
+        Assert.False(await Db.KeyExistsAsync(other));
 
         Assert.NotNull(await ReadAsync(Store(Defaults, ClockAt(signIn.AddHours(48))), key));
     }
@@ -589,46 +600,100 @@ public sealed class RedisTicketStoreTest : IDisposable
     private async Task<DateTimeOffset> RedisNowAsync() =>
         new(await _mux.GetServers()[0].TimeAsync(), TimeSpan.Zero);
 
+    /// <summary>Polls the clock of Redis until <paramref name="reached"/> holds; fails after 15 s.</summary>
+    private async Task<DateTimeOffset> RedisClockUntilAsync(Func<DateTimeOffset, bool> reached)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (true)
+        {
+            var now = await RedisNowAsync();
+            if (reached(now))
+            {
+                return now;
+            }
+            Assert.True(DateTime.UtcNow < deadline, $"the clock of Redis never reached the moment; last {now:O}");
+            await Task.Delay(20);
+        }
+    }
+
     [RedisTheory]
-    [InlineData(false)] // released while the clock of Redis is at least 1 s before the end
+    [InlineData(false)] // released while the clock of Redis is in (end − 2 s, end − 1 s]
     [InlineData(true)] // released once the clock of Redis is past the end
     public async Task Renew_TheEndIsDecidedByTheScript_ByTheClockOfRedis_AtTheMomentOfTheWrite(bool crossTheEnd)
     {
         var owner = NewUser();
         var key = NewKey("boundary");
-        // A window that ends about 3 s from now in real time, a row that would live 60 s: no natural expiry.
+        // A window that ends 3 to 4 s from now by the clock of Redis, a row that would live 60 s: no natural expiry.
         var end = WholeSecond(await RedisNowAsync()).AddSeconds(4);
         var ticket = TestRedis.Ticket(owner);
         ticket.Properties.IssuedUtc = end.AddHours(-720);
         ticket.Properties.ExpiresUtc = end;
         await SeedAsync(key, ticket, TimeSpan.FromSeconds(60));
         var db = DbProxy.Create(Db, out var proxy);
-        var cas = proxy.Hold((name, args) => DbProxy.IsScript(name, args, RenewScript, key));
+        // The compare-and-set of this row, told by its compare, not by the clock read under test.
+        var cas = proxy.Hold((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
         var store = StoreOver(db, Defaults, ClockAt(end.AddMinutes(-10))); // the replica's last check allows the write
 
         var renewal = RenewAsync(store, key, TestRedis.Ticket(owner));
-        await cas.Reached.WaitAsync(TimeSpan.FromSeconds(10));
-
-        if (crossTheEnd)
+        try
         {
-            while (await RedisNowAsync() <= end)
+            await cas.Reached.WaitAsync(TimeSpan.FromSeconds(10));
+
+            if (crossTheEnd)
             {
-                await Task.Delay(50);
+                await RedisClockUntilAsync(now => now > end);
+                Assert.True(await Db.KeyExistsAsync(key)); // the row is still there on its own
+                cas.Release();
+
+                Assert.Equal(RenewOutcome.KeyAbsent, await renewal.WaitAsync(TimeSpan.FromSeconds(10)));
+                Assert.False(await Db.KeyExistsAsync(key));
             }
-            Assert.True(await Db.KeyExistsAsync(key)); // the row is still there on its own
-            cas.Release();
+            else
+            {
+                // As close to the end as the positive arm allows: an early refusal 1–2 s before it turns red.
+                var at = await RedisClockUntilAsync(now => now > end.AddSeconds(-2));
+                Assert.True(at <= end.AddSeconds(-1), $"the clock of Redis passed end − 1 s before the release: {at:O}");
+                cas.Release();
 
-            Assert.Equal(RenewOutcome.KeyAbsent, await renewal);
-            Assert.False(await Db.KeyExistsAsync(key));
+                Assert.Equal(RenewOutcome.Written, await renewal.WaitAsync(TimeSpan.FromSeconds(10)));
+                Assert.True(await Db.KeyExistsAsync(key));
+            }
         }
-        else
+        finally
         {
-            Assert.True(await RedisNowAsync() <= end.AddSeconds(-1));
             cas.Release();
-
-            Assert.Equal(RenewOutcome.Written, await renewal);
-            Assert.True(await Db.KeyExistsAsync(key));
         }
+    }
+
+    [RedisFact]
+    public async Task Renew_OfAKeyGoneBeforeTheLastCompareAndSet_IsKeyAbsent_AndWritesNothing()
+    {
+        var owner = NewUser();
+        var key = await IssueAsync(Store(), TestRedis.Ticket(owner));
+        var db = DbProxy.Create(Db, out var proxy);
+        var reads = 0;
+        proxy.After = async (name, args) =>
+        {
+            if (name == nameof(IDatabase.StringGetAsync) && (RedisKey)args[0]! == key)
+            {
+                if (++reads < 3)
+                {
+                    // The first two attempts lose to a rival write.
+                    var rival = TicketSerializer.Default.Serialize(TestRedis.Ticket(owner, extra: new Claim("rival", reads.ToString())));
+                    await Db.StringSetAsync(key, rival, TimeSpan.FromHours(1));
+                }
+                else
+                {
+                    await Db.KeyDeleteAsync(key); // gone before the last compare-and-set
+                }
+            }
+        };
+
+        var outcome = await RenewAsync(StoreOver(db), key, TestRedis.Ticket(owner));
+
+        Assert.Equal(3, reads);
+        Assert.Equal(RenewOutcome.KeyAbsent, outcome);
+        Assert.False(await Db.KeyExistsAsync(key));
     }
 
     // ---- Index (rows 33–38, 84) ---------------------------------------------------------------
@@ -819,18 +884,23 @@ public sealed class RedisTicketStoreTest : IDisposable
     {
         var owner = NewUser();
         var existing = path == WritePath.Issue ? null : await IssueAsync(Store(), TestRedis.Ticket(owner));
+        if (existing is not null)
+        {
+            await Db.KeyExpireAsync(existing, TimeSpan.FromSeconds(30)); // a row lifetime the write must visibly move
+        }
         await Db.SetAddAsync(IndexOf(owner), await LiveMemberAsync());
         await Db.KeyExpireAsync(IndexOf(owner), TimeSpan.FromMilliseconds(300)); // an index about to expire
+        var indexSeededAt = await RedisNowAsync();
 
-        // Everything up to the first actual write of the row or its lifetime passes; whatever the request
-        // sends after it is held, so the test observes the state that write left behind.
+        // Everything up to the first actual write of the row or its lifetime passes; every command the
+        // request sends after it is held until the observation ends.
         var db = DbProxy.Create(Db, out var proxy);
         var written = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         var writeFragment = path switch
         {
-            WritePath.Read => ReadScript,
-            WritePath.Issue => IssueScript,
-            _ => RenewScript,
+            WritePath.Read => StoreScripts.Read,
+            WritePath.Issue => StoreScripts.Issue,
+            _ => StoreScripts.Renew,
         };
         proxy.After = (name, args) =>
         {
@@ -840,7 +910,7 @@ public sealed class RedisTicketStoreTest : IDisposable
             }
             return Task.CompletedTask;
         };
-        var later = proxy.Hold((_, _) => written.Task.IsCompleted);
+        var later = proxy.HoldAll((_, _) => written.Task.IsCompleted);
         var store = StoreOver(db);
 
         Task request = path switch
@@ -849,24 +919,25 @@ public sealed class RedisTicketStoreTest : IDisposable
             WritePath.Issue => IssueAsync(store, TestRedis.Ticket(owner)),
             _ => RenewAsync(store, existing!, TestRedis.Ticket(owner)),
         };
-        var key = await written.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        _keys.Add(key);
-        await Task.Delay(500); // the former lifetime of the index has passed
-        Assert.True(await Db.KeyExistsAsync(key));
-
-        var result = await Store().RemoveSessionsAsync(owner, keepKey: null, CancellationToken.None);
-
-        Assert.True(result.Removed >= 1);
-        Assert.False(await Db.KeyExistsAsync(key)); // the removal found the live row through the index
-        later.Release();
         try
         {
-            await request.WaitAsync(TimeSpan.FromSeconds(10));
+            var key = await written.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            _keys.Add(key);
+            // The row is written: a new key, or a lifetime moved far past the seeded 30 s.
+            Assert.True(await PttlAsync(key) > (long)TimeSpan.FromMinutes(1).TotalMilliseconds);
+            // The former lifetime of the index has passed, by the clock of Redis.
+            await RedisClockUntilAsync(now => now > indexSeededAt.AddMilliseconds(400));
+
+            var result = await Store().RemoveSessionsAsync(owner, keepKey: null, CancellationToken.None);
+
+            Assert.True(result.Removed >= 1);
+            Assert.False(await Db.KeyExistsAsync(key)); // the removal found the live row through the index
         }
-        catch (Exception)
+        finally
         {
-            // The outcome of the request itself is not the subject here.
+            later.Release();
         }
+        await request.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     // ---- Revocation, removal, probes, cancellation --------------------------------------------

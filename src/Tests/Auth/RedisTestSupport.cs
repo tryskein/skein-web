@@ -163,9 +163,16 @@ public class DbProxy : DispatchProxy
     /// arguments) before it is passed to Redis, until the test releases it. The call returns a
     /// pending task at once; nothing reaches Redis until <see cref="Barrier.Release"/>.
     /// </summary>
-    public Barrier Hold(Func<string, object?[], bool> match)
+    public Barrier Hold(Func<string, object?[], bool> match) => AddBarrier(new Barrier(match, all: false));
+
+    /// <summary>
+    /// Holds every asynchronous call that <paramref name="match"/> accepts, from now until the test
+    /// releases them: none of them reaches Redis before <see cref="Barrier.Release"/>.
+    /// </summary>
+    public Barrier HoldAll(Func<string, object?[], bool> match) => AddBarrier(new Barrier(match, all: true));
+
+    private Barrier AddBarrier(Barrier barrier)
     {
-        var barrier = new Barrier(match);
         lock (_barriers)
         {
             _barriers.Add(barrier);
@@ -201,8 +208,11 @@ public class DbProxy : DispatchProxy
         {
             lock (_barriers)
             {
-                held = _barriers.FirstOrDefault(b => !b.Taken && b.Match(method.Name, args));
-                held?.Take();
+                held = _barriers.FirstOrDefault(b => !b.Taken && !b.IsReleased && b.Match(method.Name, args));
+                if (held is { All: false })
+                {
+                    held.Take();
+                }
             }
         }
         if (held is not null)
@@ -254,8 +264,12 @@ public class DbProxy : DispatchProxy
     }
 
     /// <summary>One held call: the test awaits <see cref="Reached"/>, then calls <see cref="Release"/>.</summary>
-    public sealed class Barrier(Func<string, object?[], bool> match)
+    public sealed class Barrier(Func<string, object?[], bool> match, bool all)
     {
+        internal bool All { get; } = all;
+
+        internal bool IsReleased => _released.Task.IsCompleted;
+
         private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -287,7 +301,7 @@ internal static class StoreScripts
     public const string Read = "PEXPIRE', KEYS[1], ARGV[1]";
     public const string Revoke = "redis.pcall('GET', KEYS[1])";
     public const string Issue = "'NX', 'PX'";
-    public const string Renew = "redis.call('TIME')";
+    public const string Renew = "if current ~= ARGV[1]"; // the compare of the compare-and-set
     public const string Prune = "SMEMBERS";
 }
 

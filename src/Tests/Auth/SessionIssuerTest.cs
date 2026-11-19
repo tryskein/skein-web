@@ -23,13 +23,6 @@ public sealed class SessionIssuerTest
     private static IEnumerable<string> RowsOf(SessionPipelineHost host, Guid user) =>
         host.Db.SetMembers("skein:user-tickets:" + user).Select(m => (string)m!);
 
-    // Distinctive fragments of the store's scripts: the lifetime write of a read, the revocation
-    // (read and delete), the issue and the compare-and-set of the explicit renewal.
-    private const string ReadScript = "PEXPIRE', KEYS[1], ARGV[1]";
-    private const string RevokeScript = "redis.pcall('GET', KEYS[1])";
-    private const string IssueScript = "'NX', 'PX'";
-    private const string RenewScript = "redis.call('TIME')";
-
     /// <summary>
     /// Fails the revocation script of <paramref name="key"/>, and only once a read of a ticket has
     /// completed in the request (the failure is the revocation's, not the read's).
@@ -40,7 +33,7 @@ public sealed class SessionIssuerTest
         var injected = false;
         host.Faults.After = (name, args) =>
         {
-            if (DbProxy.IsScript(name, args, ReadScript))
+            if (DbProxy.IsScript(name, args, StoreScripts.Read))
             {
                 read = true;
             }
@@ -48,7 +41,7 @@ public sealed class SessionIssuerTest
         };
         host.Faults.Before = (name, args) =>
         {
-            if (read && DbProxy.IsScript(name, args, RevokeScript, key))
+            if (read && DbProxy.IsScript(name, args, StoreScripts.Revoke, key))
             {
                 injected = true;
                 return new InvalidOperationException("injected");
@@ -153,7 +146,7 @@ public sealed class SessionIssuerTest
         var injected = false;
         host.Faults.After = (name, args) =>
         {
-            if (DbProxy.IsScript(name, args, RevokeScript, bobKey))
+            if (DbProxy.IsScript(name, args, StoreScripts.Revoke, bobKey))
             {
                 revoked = true;
             }
@@ -161,7 +154,7 @@ public sealed class SessionIssuerTest
         };
         host.Faults.Before = (name, args) =>
         {
-            if (revoked && DbProxy.IsScript(name, args, IssueScript))
+            if (revoked && DbProxy.IsScript(name, args, StoreScripts.Issue))
             {
                 injected = true;
                 return new InvalidOperationException("injected");
@@ -292,7 +285,7 @@ public sealed class SessionIssuerTest
     {
         await using var host = await SessionPipelineHost.StartAsync();
         var (cookie, key, _) = await host.SignInAsync(Alice);
-        var cas = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, RenewScript, key));
+        var cas = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
 
         var renewal = host.SendAsync("/test/renew", cookie);
         await cas.Reached.WaitAsync(TimeSpan.FromSeconds(10)); // decided, not yet sent to Redis
@@ -315,7 +308,7 @@ public sealed class SessionIssuerTest
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         host.Faults.After = async (name, args) =>
         {
-            if (DbProxy.IsScript(name, args, RenewScript, key))
+            if (DbProxy.IsScript(name, args, StoreScripts.Renew, key))
             {
                 written.TrySetResult();
                 await release.Task;
