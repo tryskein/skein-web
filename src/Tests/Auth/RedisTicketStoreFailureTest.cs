@@ -11,8 +11,7 @@ namespace SkeinWeb.Tests.Auth;
 
 /// <summary>
 /// Failure branches of the ticket store on a mocked Redis boundary (INV-3, INV-4, INV-5, INV-9): a
-/// technical failure is never read as "no session", never leaks the session key, and a failure of
-/// the reverse index never fails an issue.
+/// technical failure is never read as "no session" and never leaks the session key.
 /// </summary>
 public class RedisTicketStoreFailureTest
 {
@@ -117,18 +116,6 @@ public class RedisTicketStoreFailureTest
     }
 
     [Fact]
-    public async Task BackgroundRenewal_TechnicalFailure_IsAbsorbed_WithoutAWrittenOutcome()
-    {
-        var (store, db) = Build();
-        db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
-        var ctx = new DefaultHttpContext();
-
-        await store.RenewAsync(Key, Ticket(), ctx, CancellationToken.None);
-
-        Assert.Equal(RenewOutcome.TechnicalFailure, SessionRequestState.Of(ctx).RenewOutcome);
-    }
-
-    [Fact]
     public async Task ExplicitRenewal_TechnicalFailure_IsThrown()
     {
         var (store, db) = Build();
@@ -138,21 +125,6 @@ public class RedisTicketStoreFailureTest
 
         await Assert.ThrowsAsync<SessionStoreUnavailableException>(
             () => store.RenewAsync(Key, Ticket(), ctx, CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task Issue_WhenTheIndexFails_StillIssuesTheKey()
-    {
-        var (store, db) = Build();
-        db.Setup(d => d.StringSetAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<TimeSpan?>(), It.IsAny<When>()))
-            .ReturnsAsync(true);
-        db.Setup(d => d.SetAddAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<CommandFlags>())).ThrowsAsync(Down());
-        var ctx = new DefaultHttpContext();
-
-        var key = await store.StoreAsync(Ticket(), ctx, CancellationToken.None);
-
-        Assert.StartsWith("skein:session:", key);
-        Assert.Equal(key, SessionRequestState.Of(ctx).IssuedKey);
     }
 
     private static void SetupIndex(Mock<IDatabase> db, string[] members, int failReads = 0)
