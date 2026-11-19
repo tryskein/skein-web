@@ -283,16 +283,41 @@ public sealed class SsoSessionIntegrationTest
         }
         Assert.Equal(3, host.Api.CallsTo(Provision));
 
+        // Two confirmations of other pairs in parallel: both compare-and-sets are held until both have
+        // arrived (each read the row and was confirmed before either writes); ordinary requests of the
+        // remembered pair run to the end meanwhile.
         time.Advance(TimeSpan.FromHours(1));
-        var parallel = await Task.WhenAll(
-            GetAsync(host, cookie, headersA3), // ordinary: the remembered pair
-            GetAsync(host, cookie, headersA3),
-            GetAsync(host, cookie, HeadersA),  // confirmations of other pairs
-            GetAsync(host, cookie, HeadersA2));
+        var compareAndSets = 0;
+        host.Faults.Before = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, StoreScripts.Renew, key))
+            {
+                Interlocked.Increment(ref compareAndSets);
+            }
+            return null;
+        };
+        var held = host.Faults.HoldAll((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
+        SessionPipelineHost.Reply[] confirmations;
+        try
+        {
+            var pending = new[] { GetAsync(host, cookie, HeadersA), GetAsync(host, cookie, HeadersA2) };
+            await UntilAsync(() => Task.FromResult(Volatile.Read(ref compareAndSets) >= 2), "both confirmations reach their compare-and-set");
+            var ordinary = await Task.WhenAll(GetAsync(host, cookie, headersA3), GetAsync(host, cookie, headersA3));
+            Assert.All(ordinary, r => Assert.Equal(HttpStatusCode.OK, r.Status));
+            Assert.All(ordinary, r => Assert.Empty(r.SessionWrites())); // the remembered pair: local, no write
+            Assert.All(pending, t => Assert.False(t.IsCompleted)); // the confirmations are still in flight
+            held.Release();
+            confirmations = await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        finally
+        {
+            held.Release();
+            host.Faults.Before = null;
+        }
 
-        Assert.All(parallel, r => Assert.Equal(HttpStatusCode.OK, r.Status));
-        Assert.All(parallel, r => Assert.All(r.Sessions(host.CookieName), c => Assert.Equal(key, host.KeyOf(c))));
-        Assert.True(host.Api.CallsTo(Provision) >= 5, "the parallel confirmations were not made");
+        Assert.All(confirmations, r => Assert.Equal(HttpStatusCode.OK, r.Status));
+        Assert.All(confirmations, r => Assert.Equal(key, host.KeyOf(Assert.Single(r.Sessions(host.CookieName)))));
+        Assert.Equal(5, host.Api.CallsTo(Provision)); // three in series, two in parallel
         var row = await RowAsync(host, key);
         Assert.Equal(signedIn.IssuedUtc, row.Properties.IssuedUtc);
         Assert.Equal(signedIn.ExpiresUtc, row.Properties.ExpiresUtc);
@@ -326,7 +351,9 @@ public sealed class SsoSessionIntegrationTest
         Assert.NotNull(lifetime);
         Assert.True(lifetime > TimeSpan.Zero);
         Assert.True(lifetime <= end - observedAt, $"the row lives {lifetime}, past the end of the session");
-        Assert.Equal(signIn, (await RowAsync(host, key)).Properties.IssuedUtc); // the window is the written one
+        var row = await RowAsync(host, key);
+        Assert.Equal(signIn, row.Properties.IssuedUtc); // the window is the written one ...
+        Assert.Equal(signIn.AddHours(720), row.Properties.ExpiresUtc); // ... whatever end the cookie got
     }
 
     // ---- E-8: the session ends by the moment of the renewal ---------------------------------------------
@@ -381,30 +408,40 @@ public sealed class SsoSessionIntegrationTest
 
     /// <summary>
     /// (b) The script decides. The row's window ends at <paramref name="end"/> (a few seconds of real time
-    /// ahead); the compare-and-set of the renewal is held. While it is held the test gives the row a lifetime
-    /// of 60 s (the read of the request set it to the time left), and checks that the held call is that
-    /// compare-and-set and the replica decided with time left. <paramref name="beforeRelease"/> waits for the
-    /// moment of the case; right before the release the row is checked alive with the bytes the renewal read
-    /// and a lifetime far above the command timeout of the stand.
+    /// ahead); the replica's clock stands at the start of the test, so the replica always decides with time
+    /// left and the read of the request gives the row a lifetime that outlasts <paramref name="end"/>. The
+    /// compare-and-set of the renewal is held. Once it is held — before the end by the clock of Redis — the
+    /// test gives the row a lifetime of 60 s and checks its bytes. <paramref name="beforeRelease"/> waits for
+    /// the moment of the case; right before the release the row is checked alive with the bytes the renewal
+    /// read and a lifetime above the command timeout of the stand: a released call either reaches Redis
+    /// within that timeout or fails, so the row is alive when the script decides.
     /// </summary>
     private static async Task<SessionPipelineHost.Reply> RenewalHeldUntilAsync(
         SurfacesHost host, string cookie, string key, DateTimeOffset end, Func<Task> beforeRelease)
     {
+        var commandTimeout = TimeSpan.FromMilliseconds(ConfigurationOptions.Parse(host.Mux.Configuration).AsyncTimeout);
         await SeedWindowAsync(host, key, end.AddHours(-1), end, TimeSpan.FromMinutes(1));
         byte[] read = (await host.Db.StringGetAsync(key))!;
         var compareAndSet = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
         try
         {
             var request = GetAsync(host, cookie, HeadersA);
-            await compareAndSet.Reached.WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.True(DateTimeOffset.UtcNow < end, "precondition: the replica decided after the end of the session");
+            var first = await Task.WhenAny(compareAndSet.Reached, request, Task.Delay(TimeSpan.FromSeconds(10)));
+            if (first != compareAndSet.Reached)
+            {
+                Assert.Fail(first == request
+                    ? $"precondition: the request ended without reaching the compare-and-set of the renewal ({request.Result.Status})"
+                    : "precondition: the compare-and-set of the renewal was not reached within 10 s");
+            }
+            Assert.True(await RedisNowAsync(host) < end, "precondition: the compare-and-set was reached after the end of the session");
             Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(60)), "precondition: the row is gone before the release");
 
             await beforeRelease();
 
             Assert.Equal(read, (byte[]?)await host.Db.StringGetAsync(key));
             var lifetime = await host.Db.KeyTimeToLiveAsync(key);
-            Assert.True(lifetime > TimeSpan.FromSeconds(10), $"precondition: the row has {lifetime} left at the release");
+            Assert.True(lifetime > commandTimeout + TimeSpan.FromSeconds(5),
+                $"precondition: the row has {lifetime} left at the release, the command timeout is {commandTimeout}");
             compareAndSet.Release();
             return await request.WaitAsync(TimeSpan.FromSeconds(30));
         }
@@ -417,26 +454,33 @@ public sealed class SsoSessionIntegrationTest
     [RedisFact]
     public async Task TheSessionEndingBeforeTheCompareAndSet_ByTheClockOfRedis_WritesNothing_AndIssuesANewKey()
     {
-        await using var host = await StartAsync();
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var host = await StartAsync(time);
         var (cookie, key) = await host.SignInAsync("a@x.io");
         var end = Whole(DateTimeOffset.UtcNow).AddSeconds(3);
 
         var reply = await RenewalHeldUntilAsync(host, cookie, key, end,
             () => UntilAsync(async () => await RedisNowAsync(host) >= end, "the clock of Redis reaches the end of the session"));
 
-        await AssertReplacedByANewKeyAsync(host, reply, key, end, DateTimeOffset.UtcNow);
+        // The new session is issued on the replica's clock, which stands at the start of the test.
+        await AssertReplacedByANewKeyAsync(host, reply, key, time.GetUtcNow(), time.GetUtcNow());
     }
 
-    // The control at the boundary: the same compare-and-set released with at least 1 s left by the clock of Redis.
+    // The control at the boundary: the same compare-and-set released when the clock of Redis is in
+    // (end − 2 s, end − 1 s] — a script refusing a second or two early turns this red.
     [RedisFact]
     public async Task TheCompareAndSet_ReleasedASecondBeforeTheEnd_IsWritten_WithTheCookieOfTheSameKey()
     {
-        await using var host = await StartAsync();
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var host = await StartAsync(time);
         var (cookie, key) = await host.SignInAsync("a@x.io");
         var end = Whole(DateTimeOffset.UtcNow).AddSeconds(6);
 
         var reply = await RenewalHeldUntilAsync(host, cookie, key, end, async () =>
-            Assert.True(await RedisNowAsync(host) <= end.AddSeconds(-1), "precondition: less than 1 s left at the release"));
+        {
+            await UntilAsync(async () => await RedisNowAsync(host) > end.AddSeconds(-2), "the clock of Redis passes the end − 2 s");
+            Assert.True(await RedisNowAsync(host) <= end.AddSeconds(-1), "precondition: the clock of Redis passed the end − 1 s before the release");
+        });
 
         Assert.Equal(HttpStatusCode.OK, reply.Status);
         var set = Assert.Single(reply.Sessions(host.CookieName));
@@ -476,25 +520,33 @@ public sealed class SsoSessionIntegrationTest
     }
 
     // SC-001 for an SSO request: the read script set the lifetime of the row, the renewal's compare-and-set is
-    // held, the test sets the lifetime to 1 s; once released, the renewal (the last write) sets min(idle, time left).
+    // held, the test lowers the lifetime to 60 s (not 1 s: the row must not expire on its own before the
+    // released call); once released, the renewal (the last write) sets min(idle, time left).
     [RedisFact]
     public async Task OnARequestWithAnExplicitRenewal_TheRenewalAsTheLastWrite_SetsTheRowLifetime()
     {
         await using var host = await StartAsync();
         var (cookie, key) = await host.SignInAsync("a@x.io");
-        var lifetimeRead = false;
-        host.Faults.After = (name, args) =>
+        // A lifetime below what a write gives, so the write of the read is seen.
+        Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromHours(1)));
+        TimeSpan? afterTheRead = null;
+        host.Faults.After = async (name, args) =>
         {
-            lifetimeRead |= DbProxy.IsScript(name, args, StoreScripts.Read, key);
-            return Task.CompletedTask;
+            if (DbProxy.IsScript(name, args, StoreScripts.Read, key))
+            {
+                afterTheRead = await host.Db.KeyTimeToLiveAsync(key);
+            }
         };
         var compareAndSet = host.Faults.Hold((name, args) => DbProxy.IsScript(name, args, StoreScripts.Renew, key));
         try
         {
             var request = GetAsync(host, cookie, HeadersA);
             await compareAndSet.Reached.WaitAsync(TimeSpan.FromSeconds(10));
-            Assert.True(lifetimeRead, "precondition: the read of the request did not write the lifetime of the row");
-            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(1)));
+            // The read wrote min(idle 120 h, about 720 h left) = 120 h.
+            Assert.NotNull(afterTheRead);
+            Assert.InRange(afterTheRead.Value, TimeSpan.FromHours(120) - TimeSpan.FromMinutes(1), TimeSpan.FromHours(120));
+            // Then the test lowers it, far above the time the held call needs to reach Redis once released.
+            Assert.True(await host.Db.KeyExpireAsync(key, TimeSpan.FromSeconds(60)));
             compareAndSet.Release();
             var reply = await request.WaitAsync(TimeSpan.FromSeconds(30));
 
