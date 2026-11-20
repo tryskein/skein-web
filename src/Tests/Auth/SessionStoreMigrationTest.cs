@@ -151,6 +151,34 @@ public sealed class SessionStoreMigrationTest : IDisposable
         return (TestRedis.Over(_mux, db), steps);
     }
 
+    /// <summary>
+    /// <paramref name="inner"/> with the servers of the harness wrapped so that every <c>SCAN</c>
+    /// page of the cleanup is counted in <paramref name="scans"/>.
+    /// </summary>
+    private IConnectionMultiplexer WithCountedScans(IConnectionMultiplexer inner, System.Runtime.CompilerServices.StrongBox<int> scans)
+    {
+        var servers = _mux.GetServers().Select(server =>
+        {
+            var wrapped = new Mock<IServer>();
+            wrapped.SetupGet(x => x.IsReplica).Returns(() => server.IsReplica);
+            wrapped.SetupGet(x => x.IsConnected).Returns(() => server.IsConnected);
+            wrapped.Setup(x => x.ExecuteAsync(It.IsAny<int?>(), It.IsAny<string>(), It.IsAny<ICollection<object>>(), It.IsAny<CommandFlags>()))
+                .Returns((int? database, string command, ICollection<object> args, CommandFlags flags) =>
+                {
+                    if (command == "SCAN")
+                    {
+                        Interlocked.Increment(ref scans.Value);
+                    }
+                    return server.ExecuteAsync(database, command, args, flags);
+                });
+            return wrapped.Object;
+        }).ToArray();
+        var mux = new Mock<IConnectionMultiplexer>();
+        mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(inner.GetDatabase());
+        mux.Setup(m => m.GetServers()).Returns(servers);
+        return mux.Object;
+    }
+
     private static int CountOf(List<CleanupStep> steps, CleanupStep step)
     {
         lock (steps)
@@ -584,15 +612,21 @@ public sealed class SessionStoreMigrationTest : IDisposable
         var legacy = Legacy();
         await LegacyHashAsync(legacy);
         await Db.StringSetAsync(SessionStoreMigration.LockKey, "somebody-else", TimeSpan.FromMinutes(1));
-        var (mux, steps) = Watched();
+        var (watched, steps) = Watched();
+        var scans = new System.Runtime.CompilerServices.StrongBox<int>();
+        var mux = WithCountedScans(watched, scans);
         var waiting = Migration(mux).RunAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
         await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= 3, "the replica polls the state");
+        var scansInTheWait = Volatile.Read(ref scans.Value);
+        Assert.True(scansInTheWait > 0, "the replica did not scan before it waited");
 
-        // The marker alone, with the lock alive: the wait goes on through several more polls.
+        // The marker alone, with the lock alive: the wait goes on through several more polls, and the
+        // replica does not leave it to observe anew (no new scan).
         await MarkAsync();
         var polls = CountOf(steps, CleanupStep.Status);
         await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= polls + 3, "the replica keeps polling");
         Assert.False(waiting.IsCompleted);
+        Assert.Equal(scansInTheWait, Volatile.Read(ref scans.Value));
 
         // The other pass finishes: its rows are gone, its count grows, its lock goes; a row issued
         // during it was kept.
