@@ -15,6 +15,7 @@ internal enum CleanupStep
 {
     None,
     Status,
+    Confirm,
     Begin,
     Extend,
     Delete,
@@ -31,6 +32,13 @@ internal static class CleanupCalls
 {
     public const string SessionPattern = "skein:session:*";
 
+    /// <summary>
+    /// The step of a script with <paramref name="keys"/> and <paramref name="arguments"/> values of
+    /// <c>ARGV</c>: the confirmation of readiness has the keys of the status and carries the observed count.
+    /// </summary>
+    public static CleanupStep Of(IReadOnlyList<string> keys, int arguments) =>
+        Of(keys) == CleanupStep.Status && arguments > 0 ? CleanupStep.Confirm : Of(keys);
+
     public static CleanupStep Of(IReadOnlyList<string> keys) => keys switch
     {
         [SessionStoreMigration.MarkerKey, SessionStoreMigration.LockKey, SessionStoreMigration.GenerationKey] => CleanupStep.Status,
@@ -43,7 +51,9 @@ internal static class CleanupCalls
     };
 
     public static CleanupStep Of(string method, object?[] args) =>
-        DbProxy.ScriptOf(method, args) is null ? CleanupStep.None : Of(DbProxy.KeysOf(method, args).Select(k => (string)k!).ToArray());
+        DbProxy.ScriptOf(method, args) is null
+            ? CleanupStep.None
+            : Of(DbProxy.KeysOf(method, args).Select(k => (string)k!).ToArray(), args.Length > 2 && args[2] is RedisValue[] values ? values.Length : 0);
 
     /// <summary>The <c>KEYS</c> of an <c>EVAL</c> or <c>EVALSHA</c> command; empty for any other command.</summary>
     public static string[] KeysOf(RedisCommand command) =>
@@ -51,7 +61,11 @@ internal static class CleanupCalls
             ? command.Args.Skip(2).Take(n).ToArray()
             : [];
 
-    public static CleanupStep Of(RedisCommand command) => Of(KeysOf(command));
+    public static CleanupStep Of(RedisCommand command)
+    {
+        var keys = KeysOf(command);
+        return keys.Length == 0 ? CleanupStep.None : Of(keys, command.Args.Length - 2 - keys.Length);
+    }
 }
 
 /// <summary>
@@ -213,7 +227,8 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.True(await Db.KeyExistsAsync(v3));
         Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
-        await AssertFinishedAsync(4);
+        Assert.Equal(1, CountOf(steps, CleanupStep.Confirm));
+        await AssertFinishedAsync(5); // the confirmation of readiness counted once
     }
 
     [RedisFact]
@@ -227,7 +242,8 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.NotNull(await TestRedis.Store(_mux).RetrieveAsync(v3, new DefaultHttpContext(), CancellationToken.None));
         Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
-        await AssertFinishedAsync(1);
+        Assert.Equal(1, CountOf(steps, CleanupStep.Confirm));
+        await AssertFinishedAsync(2); // the pass of the first deployment, then the confirmation
     }
 
     [RedisFact]
@@ -354,7 +370,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.Equal(0, CountOf(next, CleanupStep.Begin));
         Assert.True(await Db.KeyExistsAsync(issuedDuringTheOtherPass));
-        await AssertFinishedAsync(1);
+        await AssertFinishedAsync(2); // the other pass, then this start's confirmation
     }
 
     [RedisFact]
@@ -437,6 +453,9 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
     // ---- the loss of the lock (R30) ---------------------------------------------------------------
 
+    /// <summary>The lifetime the other pass gave its marks: below the lifetime a page of the loser would give them.</summary>
+    private static readonly TimeSpan TheirMarksLifetime = TimeSpan.FromSeconds(20);
+
     [RedisTheory]
     [InlineData("Extend")] // before the first page: the extension of that page finds the lock taken
     [InlineData("Delete")] // after a page was extended: the delete script itself checks the token
@@ -453,6 +472,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
             {
                 Db.StringSet(SessionStoreMigration.LockKey, "thief", TimeSpan.FromMinutes(1));
                 Db.SetAdd(SessionStoreMigration.IssuedDuringKey, thiefMark);
+                Db.KeyExpire(SessionStoreMigration.IssuedDuringKey, TheirMarksLifetime);
             }
             return null;
         });
@@ -465,6 +485,10 @@ public sealed class SessionStoreMigrationTest : IDisposable
         Assert.Equal(0, await GenerationAsync());
         Assert.Equal("thief", await Db.StringGetAsync(SessionStoreMigration.LockKey)); // not released by the loser
         Assert.True(await Db.SetContainsAsync(SessionStoreMigration.IssuedDuringKey, thiefMark));
+        // The loser did not extend the marks of the other pass either.
+        var theirs = await Db.KeyTimeToLiveAsync(SessionStoreMigration.IssuedDuringKey);
+        Assert.NotNull(theirs);
+        Assert.True(theirs <= TheirMarksLifetime, $"the marks of the other pass were extended to {theirs}");
 
         // The lock of the interrupted pass runs out by itself; the next start runs a full pass.
         await Db.KeyExpireAsync(SessionStoreMigration.LockKey, TimeSpan.FromMilliseconds(200));
@@ -501,7 +525,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
     }
 
     [RedisFact]
-    public async Task AnotherReplica_LeavesTheWaitOnlyWhenThePassFinished_NotOnTheMarkerAlone_AndDeletesNothing()
+    public async Task AnotherReplica_LeavesTheWaitWhenTheLockIsGone_NotOnTheMarkerAlone_AndDeletesNothingAfterAFinishedPass()
     {
         var legacy = Legacy();
         await LegacyHashAsync(legacy);
@@ -510,7 +534,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
         var waiting = Migration(mux).RunAsync(TimeSpan.FromSeconds(30), CancellationToken.None);
         await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= 3, "the replica polls the state");
 
-        // The marker alone: the wait goes on through several more polls.
+        // The marker alone, with the lock alive: the wait goes on through several more polls.
         await MarkAsync();
         var polls = CountOf(steps, CleanupStep.Status);
         await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= polls + 3, "the replica keeps polling");
@@ -527,7 +551,120 @@ public sealed class SessionStoreMigrationTest : IDisposable
 
         Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
         Assert.True(await Db.KeyExistsAsync(issuedDuringIt));
+        await AssertFinishedAsync(2); // the other pass, then this replica's confirmation
+    }
+
+    [RedisFact]
+    public async Task AnotherReplica_WhoseOwnerStopped_RunsItsOwnPassWhenTheLockIsGone_NotATimeout()
+    {
+        // The owner began its pass (the marker is deleted) and stopped; its lock is still there.
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        await Db.StringSetAsync(SessionStoreMigration.LockKey, "stopped-owner", TimeSpan.FromMinutes(1));
+        var (mux, steps) = Watched();
+        var waiting = Migration(mux).RunAsync(TimeSpan.FromSeconds(60), CancellationToken.None);
+        await UntilAsync(() => CountOf(steps, CleanupStep.Status) >= 3, "the replica waits for the lock");
+        Assert.False(waiting.IsCompleted);
+
+        await Db.KeyDeleteAsync(SessionStoreMigration.LockKey); // the lock runs out; the count did not grow
+
+        await waiting.WaitAsync(TimeSpan.FromSeconds(15)); // well before the startup timeout
+
+        Assert.Equal(1, CountOf(steps, CleanupStep.Begin));
+        Assert.Equal(1, CountOf(steps, CleanupStep.Finish));
+        Assert.False(await Db.KeyExistsAsync(legacy));
+        await AssertFinishedAsync(1);
+    }
+
+    // ---- the confirmation of readiness against a late claimant (row 101) ---------------------------
+
+    [RedisFact]
+    public async Task AConfirmedStart_TurnsTheBeginOfALateClaimantIntoAFinishedPass_AndNoPassRuns()
+    {
+        // Replica A observes the last former hash; the hash runs out before replica B scans.
+        await MarkAsync();
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var live = await IssueV3Async(Guid.NewGuid());
+        var dbA = DbProxy.Create(Db, out var proxyA);
+        var stepsA = new List<CleanupStep>();
+        proxyA.Before = (name, args) =>
+        {
+            lock (stepsA)
+            {
+                stepsA.Add(CleanupCalls.Of(name, args));
+            }
+            return null;
+        };
+        var beginA = proxyA.Hold((name, args) => CleanupCalls.Of(name, args) == CleanupStep.Begin);
+        var a = Migration(TestRedis.Over(_mux, dbA)).RunAsync(Wait, CancellationToken.None);
+        await beginA.Reached.WaitAsync(TimeSpan.FromSeconds(15));
+        await Db.KeyDeleteAsync(legacy);
+
+        // B finds no hash and confirms its readiness: it serves, and the count grows.
+        var (muxB, stepsB) = Watched();
+        await Migration(muxB).RunAsync(Wait, CancellationToken.None);
+        Assert.Equal(1, CountOf(stepsB, CleanupStep.Confirm));
         Assert.Equal(1, await GenerationAsync());
+
+        // A's begin with its old count finds a pass finished after its observation; A observes anew
+        // and starts without a pass, so nothing runs while B serves.
+        beginA.Release();
+        await a.WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Equal(1, CountOf(stepsA, CleanupStep.Begin));
+        Assert.DoesNotContain(CleanupStep.Extend, stepsA);
+        Assert.DoesNotContain(CleanupStep.Finish, stepsA);
+        Assert.True(await Db.KeyExistsAsync(live));
+        await AssertFinishedAsync(2);
+    }
+
+    [RedisFact]
+    public async Task ABeginBeforeTheConfirmation_RefusesTheConfirmation_AndTheOtherReplicaWaitsForThePass()
+    {
+        await MarkAsync();
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy);
+        var live = await IssueV3Async(Guid.NewGuid());
+        // A observes the hash and is held at its begin, and later inside its pass.
+        var dbA = DbProxy.Create(Db, out var proxyA);
+        var beginA = proxyA.Hold((name, args) => CleanupCalls.Of(name, args) == CleanupStep.Begin);
+        var pageA = proxyA.Hold((name, args) => CleanupCalls.Of(name, args) == CleanupStep.Extend);
+        var a = Migration(TestRedis.Over(_mux, dbA)).RunAsync(Wait, CancellationToken.None);
+        await beginA.Reached.WaitAsync(TimeSpan.FromSeconds(15));
+        await Db.KeyDeleteAsync(legacy);
+
+        // B observes the clean state and is held at its confirmation.
+        var dbB = DbProxy.Create(Db, out var proxyB);
+        var stepsB = new List<CleanupStep>();
+        proxyB.Before = (name, args) =>
+        {
+            lock (stepsB)
+            {
+                stepsB.Add(CleanupCalls.Of(name, args));
+            }
+            return null;
+        };
+        var confirmB = proxyB.Hold((name, args) => CleanupCalls.Of(name, args) == CleanupStep.Confirm);
+        var b = Migration(TestRedis.Over(_mux, dbB)).RunAsync(Wait, CancellationToken.None);
+        await confirmB.Reached.WaitAsync(TimeSpan.FromSeconds(15));
+
+        // A begins first and holds its pass; then B's confirmation runs and is refused.
+        beginA.Release();
+        await pageA.Reached.WaitAsync(TimeSpan.FromSeconds(15));
+        Assert.True(await Db.KeyExistsAsync(SessionStoreMigration.LockKey));
+        var polls = CountOf(stepsB, CleanupStep.Status);
+        confirmB.Release();
+        await UntilAsync(() => CountOf(stepsB, CleanupStep.Status) >= polls + 4, "the second replica observes the pass");
+        Assert.False(b.IsCompleted); // B does not serve during A's pass
+        Assert.Equal(0, await GenerationAsync());
+
+        pageA.Release();
+        await Task.WhenAll(a, b).WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.Equal(0, CountOf(stepsB, CleanupStep.Begin));
+        Assert.False(await Db.KeyExistsAsync(live)); // A's pass ended the rows of its start
+        await AssertFinishedAsync(2); // A's pass, then B's confirmation
     }
 
     [RedisFact]
@@ -552,7 +689,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
         Assert.Equal(0, CountOf(stepsB, CleanupStep.Begin));
         Assert.False(await Db.KeyExistsAsync(legacy));
         Assert.False(await Db.KeyExistsAsync(v3));
-        await AssertFinishedAsync(1);
+        await AssertFinishedAsync(2); // A's pass, then B's confirmation
     }
 
     // ---- the failures of the start ------------------------------------------------------------------
