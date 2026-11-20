@@ -1,5 +1,4 @@
 using System.Net;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SkeinWeb.Auth;
 
@@ -39,21 +38,35 @@ public sealed class SessionCleanupPipelineTest
         // The set of marks of the running pass is of another type: the mark cannot be written.
         await host.Db.StringSetAsync(SessionStoreMigration.IssuedDuringKey, "not-a-set");
         var rows = SessionRows(host);
+        // The issue script on the boundary of the store's Redis: called, and never completed.
+        var issueCalls = 0;
+        var issueCompleted = 0;
+        host.Faults.Before = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, StoreScripts.Issue))
+            {
+                Interlocked.Increment(ref issueCalls);
+            }
+            return null;
+        };
+        host.Faults.After = (name, args) =>
+        {
+            if (DbProxy.IsScript(name, args, StoreScripts.Issue))
+            {
+                Interlocked.Increment(ref issueCompleted);
+            }
+            return Task.CompletedTask;
+        };
 
         var reply = await host.SendAsync($"/test/issue?user={Alice}");
 
-        // The issuer refuses (SessionIssueException); the endpoint of the stand does not map it, so it is a 500.
-        Assert.Equal(HttpStatusCode.InternalServerError, reply.Status);
+        // The issue is refused; the status a real surface gives is pinned by its own rows, not here.
+        Assert.False(reply.Status is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices, $"the issue succeeded: {reply.Status}");
         Assert.Empty(reply.SessionWrites());
         Assert.Equal(rows, SessionRows(host));
-        // The refusal came from the issue script: Redis refused the mark (WRONGTYPE) and the store failed the issue.
-        lock (host.Logs.Entries)
-        {
-            Assert.Contains(host.Logs.Entries, e => e.Level == LogLevel.Warning
-                && e.Category == typeof(RedisTicketStore).FullName
-                && e.Text.Contains("operation=store", StringComparison.Ordinal)
-                && e.Text.Contains("code=WRONGTYPE", StringComparison.Ordinal));
-        }
+        // The refusal came from the issue script: it ran and failed on the mark, before any row.
+        Assert.True(Volatile.Read(ref issueCalls) > 0, "the issue script was not called");
+        Assert.Equal(0, Volatile.Read(ref issueCompleted));
 
         // The pass then finishes as usual.
         await host.Db.KeyDeleteAsync(SessionStoreMigration.IssuedDuringKey);
