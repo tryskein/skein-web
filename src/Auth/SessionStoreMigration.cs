@@ -179,7 +179,8 @@ public sealed class SessionStoreMigration(
                 }
                 if (first.Generation != second.Generation)
                 {
-                    continue; // a pass finished between the observations
+                    ThrowPastDeadline(deadline); // a pass finished, or a start was confirmed, between the observations
+                    continue;
                 }
                 if (first.Marked && second.Marked && !formerFound)
                 {
@@ -191,7 +192,8 @@ public sealed class SessionStoreMigration(
                     {
                         return;
                     }
-                    continue; // the state changed after the observation
+                    ThrowPastDeadline(deadline); // the state changed after the observation
+                    continue;
                 }
 
                 var token = Guid.NewGuid().ToString("N");
@@ -206,6 +208,7 @@ public sealed class SessionStoreMigration(
                 }
                 if (begun == FinishedAfterObservation)
                 {
+                    ThrowPastDeadline(deadline);
                     continue;
                 }
                 if (begun != Begun)
@@ -230,6 +233,16 @@ public sealed class SessionStoreMigration(
     /// lock ran out or was released. The marker alone does not end the wait. The caller then
     /// observes anew and runs its own pass when the other one did not finish.
     /// </summary>
+    /// <summary>The start observes anew only within its window: past the deadline it fails, as the wait does.</summary>
+    private void ThrowPastDeadline(DateTimeOffset deadline)
+    {
+        if (timeProvider.GetUtcNow() >= deadline)
+        {
+            throw new InvalidOperationException(
+                "The session store cleanup could not observe a settled state within the startup timeout.");
+        }
+    }
+
     private async Task WaitForLockGoneAsync(IDatabase db, DateTimeOffset deadline, CancellationToken ct)
     {
         while (true)
