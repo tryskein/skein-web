@@ -264,7 +264,7 @@ public sealed class StandardStartupIntegrationTest
 
         Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
         Assert.True(await second.WaitForHealthAsync(TimeSpan.FromSeconds(60)), second.Output);
-        Assert.Equal(1, await GenerationAsync(stand));
+        Assert.Equal(2, await GenerationAsync(stand)); // the pass of the first, then the confirmation of the second
         Assert.Single(stand.Proxy.Commands(), c => CleanupCalls.Of(c) == CleanupStep.Finish);
         Assert.Equal(SessionStoreMigration.MarkerValue, await stand.Db.StringGetAsync(SessionStoreMigration.MarkerKey));
         Assert.False(await stand.Db.KeyExistsAsync(Legacy));
@@ -343,7 +343,11 @@ public sealed class StandardStartupIntegrationTest
         // /mcp with the same cookie: the same — no new lifetime is written (the time left only goes down).
         lifetime = await stand.Db.KeyTimeToLiveAsync(key);
         mark = stand.Proxy.Commands().Count;
-        await stand.SendAsync("/mcp", cookie, HttpMethod.Post, ("X-Skein-Api-Key", "ska_test"));
+        var mcp = await stand.SendAsync("/mcp", cookie, HttpMethod.Post, ("X-Skein-Api-Key", "ska_test"));
+
+        // The answer came from the application through to skein-api, not from an earlier refusal.
+        Assert.Equal(HttpStatusCode.OK, mcp.Status);
+        Assert.Equal(1, stand.Api.McpCalls);
 
         Assert.DoesNotContain(stand.Proxy.Commands().Skip(mark), c => c.Mentions(key));
         Assert.Equal(before, (byte[])(await stand.Db.StringGetAsync(key))!);
