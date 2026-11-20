@@ -19,26 +19,31 @@ namespace SkeinWeb.Auth;
 /// </para>
 /// <para>
 /// PASS: the state is four keys — the marker, the lock <c>skein:session-format:lock</c> (the
-/// random token of its owner, with a finite lifetime from the moment it is taken), the count of
-/// finished passes <c>skein:session-format:generation</c> (no key = 0) and the set of marks
-/// <c>skein:session-format:issued-during</c>. A replica observes the state (marker, lock, count),
-/// scans for hashes and observes again. It serves only when both observations show the marker
-/// <c>3</c>, no lock and the same count, and the scan found nothing. Otherwise it enters a pass only
-/// through <see cref="BeginPassScript"/> with the count of its first observation: when the lock is
-/// taken it waits until the lock is gone and the count has grown; when the count differs a pass
-/// finished after the observation and it observes again; else the script takes the lock and
-/// deletes the marker and the marks of an earlier pass in one step.
+/// random token of its owner, with a finite lifetime from the moment it is taken), the count
+/// <c>skein:session-format:generation</c> (no key = 0) of finished passes and confirmed starts,
+/// and the set of marks <c>skein:session-format:issued-during</c>. A replica observes the state
+/// (marker, lock, count), scans for hashes and observes again. It serves only when both
+/// observations show the marker <c>3</c>, no lock and the same count, the scan found nothing, and
+/// <see cref="ConfirmReadyScript"/> confirms that state against the count of the first observation
+/// in one step and counts the confirmation; else it observes again. When the scan found a hash or
+/// the marker is missing, it enters a pass only through <see cref="BeginPassScript"/> with the
+/// count of its first observation: when the lock is taken it waits until the lock is gone and
+/// observes again; when the count differs (a pass finished, or a replica confirmed its start,
+/// after the observation) it observes again; else the script takes the lock and deletes the marker
+/// and the marks of an earlier pass in one step.
 /// </para>
 /// <para>
 /// The owner scans <c>skein:session:*</c> page by page. Every page first extends the lock and the
 /// set of marks by its token, then deletes the hashes and strings of the page except the rows
 /// marked "own token:key": a session issued during the pass by a replica that is serving is marked
 /// by the issue script before its row is written, and survives. The end
-/// (<see cref="FinishPassScript"/>) writes the marker, counts the pass, drops the marks and the
+/// (<see cref="FinishPassScript"/>) counts the pass, writes the marker, drops the marks and the
 /// lock in one step. Every step checks the token: an owner that lost its lock deletes nothing,
-/// writes no marker and touches no mark of another pass; its lock expires and the next start
-/// runs a full pass. A replica waiting for another pass fails its start on the startup timeout
-/// when the pass does not finish; the marker alone does not end the wait.
+/// writes no marker and touches no mark of another pass. An owner whose pass fails releases its
+/// lock; the lock of a process that stopped runs out by its lifetime. A replica waiting for
+/// another pass leaves the wait when the lock is gone — the marker alone does not end it — and
+/// observes again: a pass that did not finish is then run by that replica. A lock that is not gone
+/// within the startup timeout fails the start.
 /// </para>
 /// <para>
 /// Keys of the data-protection key ring, the login throttle, the SignalR backplane and the
@@ -111,12 +116,26 @@ public sealed class SessionStoreMigration(
         "end return n";
 
     // End a pass (KEYS: lock, marker, count, marks; ARGV: token, marker value): if the lock is ours,
-    // write the marker, count the pass, drop the marks and the lock. 0 = it is not ours.
+    // count the pass, write the marker, drop the marks and the lock. 0 = it is not ours. The count
+    // goes first: a script stops at a failed command and keeps what it already wrote, so a failure
+    // of INCR leaves no marker behind with the old count.
     private const string FinishPassScript =
         "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end " +
-        "redis.call('SET', KEYS[2], ARGV[2]) " +
         "redis.call('INCR', KEYS[3]) " +
+        "redis.call('SET', KEYS[2], ARGV[2]) " +
         "redis.call('DEL', KEYS[4], KEYS[1]) " +
+        "return 1";
+
+    // Confirm the readiness of a replica (KEYS: marker, lock, count; ARGV: the count of its first
+    // observation, marker value): when the marker is in place, there is no lock and the count is
+    // still the observed one, count the confirmation and answer 1; else 0. A replica that observed
+    // the same state before and begins a pass with the old count then finds "a pass finished after
+    // the observation", so no replica serves while another one runs a pass.
+    private const string ConfirmReadyScript =
+        "if redis.call('GET', KEYS[1]) ~= ARGV[2] then return 0 end " +
+        "if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end " +
+        "if tonumber(redis.call('GET', KEYS[3]) or '0') ~= tonumber(ARGV[1]) then return 0 end " +
+        "redis.call('INCR', KEYS[3]) " +
         "return 1";
 
     // Release the lock of a pass that failed, if it is still ours; the marks expire or are
@@ -155,7 +174,7 @@ public sealed class SessionStoreMigration(
 
                 if (first.Locked || second.Locked)
                 {
-                    await WaitForPassAsync(db, first.Generation, deadline, cancellationToken);
+                    await WaitForLockGoneAsync(db, deadline, cancellationToken);
                     continue;
                 }
                 if (first.Generation != second.Generation)
@@ -164,7 +183,15 @@ public sealed class SessionStoreMigration(
                 }
                 if (first.Marked && second.Marked && !formerFound)
                 {
-                    return;
+                    var confirmed = (long)await db.ScriptEvaluateAsync(
+                        ConfirmReadyScript,
+                        [(RedisKey)MarkerKey, (RedisKey)LockKey, (RedisKey)GenerationKey],
+                        [(RedisValue)first.Generation, (RedisValue)MarkerValue]);
+                    if (confirmed == 1)
+                    {
+                        return;
+                    }
+                    continue; // the state changed after the observation
                 }
 
                 var token = Guid.NewGuid().ToString("N");
@@ -174,7 +201,7 @@ public sealed class SessionStoreMigration(
                     [(RedisValue)first.Generation, (RedisValue)token, (RedisValue)(long)LockLifetime.TotalMilliseconds]);
                 if (begun == Busy)
                 {
-                    await WaitForPassAsync(db, first.Generation, deadline, cancellationToken);
+                    await WaitForLockGoneAsync(db, deadline, cancellationToken);
                     continue;
                 }
                 if (begun == FinishedAfterObservation)
@@ -198,12 +225,17 @@ public sealed class SessionStoreMigration(
         }
     }
 
-    private async Task WaitForPassAsync(IDatabase db, long observed, DateTimeOffset deadline, CancellationToken ct)
+    /// <summary>
+    /// Wait until the lock of another pass is gone: the pass finished, or its owner stopped and the
+    /// lock ran out or was released. The marker alone does not end the wait. The caller then
+    /// observes anew and runs its own pass when the other one did not finish.
+    /// </summary>
+    private async Task WaitForLockGoneAsync(IDatabase db, DateTimeOffset deadline, CancellationToken ct)
     {
         while (true)
         {
             var status = await ReadStatusAsync(db);
-            if (!status.Locked && status.Generation > observed)
+            if (!status.Locked)
             {
                 return;
             }
@@ -225,6 +257,7 @@ public sealed class SessionStoreMigration(
             {
                 await ScanAsync(server, db.Database, type: null, async page =>
                 {
+                    ct.ThrowIfCancellationRequested(); // no write of the page after a cancellation
                     var extended = (long)await db.ScriptEvaluateAsync(
                         ExtendPassScript,
                         [(RedisKey)LockKey, (RedisKey)IssuedDuringKey],
@@ -252,6 +285,7 @@ public sealed class SessionStoreMigration(
                 }, ct);
             }
 
+            ct.ThrowIfCancellationRequested();
             var finished = (long)await db.ScriptEvaluateAsync(
                 FinishPassScript,
                 [(RedisKey)LockKey, (RedisKey)MarkerKey, (RedisKey)GenerationKey, (RedisKey)IssuedDuringKey],
