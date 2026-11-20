@@ -69,6 +69,9 @@ internal sealed class RedisReplyHold(Func<RedisCommand, RedisReply, bool> predic
         _reached.TrySetResult();
     }
 
+    /// <summary>The proxy could not parse a reply: the test that waits on this hold fails with that error.</summary>
+    public void Fail(Exception error) => _reached.TrySetException(error);
+
     public Task WaitReleased() => _released.Task;
     public void Release() => _released.TrySetResult();
 }
@@ -78,8 +81,12 @@ internal sealed class RedisReplyHold(Func<RedisCommand, RedisReply, bool> predic
 /// command, can keep a chosen command back (not forwarded) until released, can keep the reply to a
 /// chosen command back (answered by the server, not yet passed to the client) until released, can be
 /// cut for good, and selects database <see cref="Database"/> on every upstream connection so the
-/// stand has a Redis of its own. Replies are matched to commands in the order of the connection;
-/// push frames (RESP3 <c>&gt;</c>) answer no command.
+/// stand has a Redis of its own. Replies are parsed only by a proxy made with
+/// <c>parseReplies: true</c> (the one <see cref="HoldReply"/> needs); otherwise they are passed on
+/// untouched. A parsed reply is matched to the commands in the order of the connection; push frames
+/// (RESP3 <c>&gt;</c>) answer no command. A reply the proxy cannot parse is recorded in
+/// <see cref="ReplyFailure"/>, fails the armed reply hold, and the rest of that connection is
+/// passed on untouched.
 /// </summary>
 internal sealed class RedisProxy : IDisposable
 {
@@ -90,9 +97,12 @@ internal sealed class RedisProxy : IDisposable
     private RedisHold? _hold;
     private RedisReplyHold? _replyHold;
     private volatile bool _cut;
+    private readonly bool _parseReplies;
+    private Exception? _replyFailure;
 
-    public RedisProxy(string host, int port)
+    public RedisProxy(string host, int port, bool parseReplies = false)
     {
+        _parseReplies = parseReplies;
         _listener.Start();
         _ = Task.Run(async () =>
         {
@@ -112,9 +122,17 @@ internal sealed class RedisProxy : IDisposable
                         _sockets.Add(client);
                         _sockets.Add(upstream);
                     }
-                    var sent = new Queue<RedisCommand>();
-                    _ = Pump(client, upstream, sent);
-                    _ = PumpReplies(upstream, client, sent);
+                    if (_parseReplies)
+                    {
+                        var sent = new Queue<RedisCommand>();
+                        _ = Pump(client, upstream, sent);
+                        _ = PumpReplies(upstream, client, sent);
+                    }
+                    else
+                    {
+                        _ = Pump(client, upstream, null);
+                        _ = upstream.GetStream().CopyToAsync(client.GetStream()).ContinueWith(_ => { });
+                    }
                 }
                 catch (Exception)
                 {
@@ -144,12 +162,32 @@ internal sealed class RedisProxy : IDisposable
     /// </summary>
     public RedisReplyHold HoldReply(Func<RedisCommand, RedisReply, bool> predicate)
     {
+        if (!_parseReplies)
+        {
+            throw new InvalidOperationException("this proxy passes replies on untouched; make it with parseReplies: true");
+        }
         var hold = new RedisReplyHold(predicate);
         lock (_gate)
         {
+            if (_replyFailure is not null)
+            {
+                throw new InvalidOperationException("the proxy could not parse a reply", _replyFailure);
+            }
             _replyHold = hold;
         }
         return hold;
+    }
+
+    /// <summary>The error of a reply the proxy could not parse, or null.</summary>
+    public Exception? ReplyFailure
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _replyFailure;
+            }
+        }
     }
 
     public void Cut()
@@ -173,7 +211,7 @@ internal sealed class RedisProxy : IDisposable
         }
     }
 
-    private async Task Pump(TcpClient client, TcpClient upstream, Queue<RedisCommand> sent)
+    private async Task Pump(TcpClient client, TcpClient upstream, Queue<RedisCommand>? sent)
     {
         var input = client.GetStream();
         var output = upstream.GetStream();
@@ -211,9 +249,12 @@ internal sealed class RedisProxy : IDisposable
                         hold.MarkReached();
                         await hold.WaitReleased();
                     }
-                    lock (sent)
+                    if (sent is not null)
                     {
-                        sent.Enqueue(command);
+                        lock (sent)
+                        {
+                            sent.Enqueue(command);
+                        }
                     }
                     await output.WriteAsync(raw);
                 }
@@ -241,8 +282,31 @@ internal sealed class RedisProxy : IDisposable
                     return;
                 }
                 buffer.AddRange(chunk.AsSpan(0, read).ToArray());
-                while (TryParseReply(buffer, out var reply, out var push, out var length))
+                while (true)
                 {
+                    RedisReply reply;
+                    bool push;
+                    int length;
+                    try
+                    {
+                        if (!TryParseReply(buffer, out reply, out push, out length))
+                        {
+                            break;
+                        }
+                    }
+                    catch (InvalidOperationException error)
+                    {
+                        // Recorded and reported to the waiting test; the connection is passed on untouched.
+                        lock (_gate)
+                        {
+                            _replyFailure ??= error;
+                            _replyHold?.Fail(error);
+                            _replyHold = null;
+                        }
+                        await output.WriteAsync(buffer.ToArray());
+                        await input.CopyToAsync(output);
+                        return;
+                    }
                     var raw = buffer.GetRange(0, length).ToArray();
                     buffer.RemoveRange(0, length);
                     RedisCommand? command = null;
@@ -428,11 +492,13 @@ internal sealed class StubSkeinApi : IAsyncDisposable
     private int _provision;
     private int _me;
     private int _agent;
+    private int _mcp;
 
     public string Url { get; }
     public int Provisions => Volatile.Read(ref _provision);
     public int MeCalls => Volatile.Read(ref _me);
     public int AgentCalls => Volatile.Read(ref _agent);
+    public int McpCalls => Volatile.Read(ref _mcp);
 
     private StubSkeinApi(WebApplication app, string url)
     {
@@ -484,6 +550,11 @@ internal sealed class StubSkeinApi : IAsyncDisposable
         app.Map("/agent/v1/{**rest}", () =>
         {
             Interlocked.Increment(ref self!._agent);
+            return Results.Json(new { ok = true });
+        });
+        app.Map("/mcp", () =>
+        {
+            Interlocked.Increment(ref self!._mcp);
             return Results.Json(new { ok = true });
         });
         await app.StartAsync();
