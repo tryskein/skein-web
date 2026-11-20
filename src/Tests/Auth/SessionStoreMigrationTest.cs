@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Http;
 using Moq;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Time.Testing;
 using SkeinWeb.Auth;
 using StackExchange.Redis;
 
@@ -729,6 +730,33 @@ public sealed class SessionStoreMigrationTest : IDisposable
         Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
         Assert.True(await Db.KeyExistsAsync(live));
         await AssertFinishedAsync(2);
+    }
+
+    [RedisFact]
+    public async Task AnObservationThatKeepsChanging_FailsTheStartOnItsTimeout()
+    {
+        await MarkAsync();
+        var time = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        // Every confirmation finds the count moved by another replica, and the clock of the start
+        // passes its window meanwhile.
+        var (mux, steps) = Watched((step, _) =>
+        {
+            if (step == CleanupStep.Confirm)
+            {
+                Db.StringIncrement(SessionStoreMigration.GenerationKey);
+                time.Advance(TimeSpan.FromSeconds(11));
+            }
+            return null;
+        });
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new SessionStoreMigration(mux, time, NullLogger<SessionStoreMigration>.Instance)
+                .RunAsync(TimeSpan.FromSeconds(10), CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(30)));
+
+        Assert.DoesNotContain("skein:", ex.Message);
+        Assert.Equal(1, CountOf(steps, CleanupStep.Confirm)); // no further round past the deadline
+        Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
     }
 
     [RedisFact]
