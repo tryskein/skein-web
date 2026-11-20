@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging.Abstractions;
 using SkeinWeb.Auth;
@@ -101,11 +102,17 @@ public sealed class SessionCleanupProxyTest
 
         public async ValueTask DisposeAsync()
         {
+            var parsed = Proxy.ReplyFailure;
             Proxy.Dispose();
             await Cleanup.DisposeAsync();
             await Issuing.DisposeAsync();
             Direct.GetServers().First(s => !s.IsReplica).FlushDatabase(RedisProxy.Database);
             await Direct.DisposeAsync();
+            // Every scenario that parses replies ends with this check: an unparsed reply fails it.
+            if (parsed is not null)
+            {
+                throw new InvalidOperationException("the Redis proxy met a reply it could not parse", parsed);
+            }
         }
     }
 
@@ -128,6 +135,63 @@ public sealed class SessionCleanupProxyTest
         Assert.Equal(generation, await bench.GenerationAsync());
         Assert.False(await bench.Db.KeyExistsAsync(SessionStoreMigration.LockKey));
         Assert.False(await bench.Db.KeyExistsAsync(SessionStoreMigration.IssuedDuringKey));
+    }
+
+    // ---- the proxy of the bench fails a scenario on a reply it cannot parse --------------------------
+
+    [Fact]
+    public async Task AReplyOfAnUnknownType_AfterTheLastReplyHold_FailsTheScenario()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        // An upstream that answers the proxy's SELECT, then a known reply, then a reply of a type
+        // the proxy does not know.
+        var upstream = new TcpListener(IPAddress.Loopback, 0);
+        upstream.Start();
+        var port = ((IPEndPoint)upstream.LocalEndpoint).Port;
+        var served = Task.Run(async () =>
+        {
+            using var socket = await upstream.AcceptTcpClientAsync(ct);
+            var stream = socket.GetStream();
+            var buffer = new byte[1024];
+            foreach (var reply in new[] { "+OK\r\n", "+PONG\r\n", "?unknown\r\n" })
+            {
+                if (await stream.ReadAsync(buffer, ct) == 0)
+                {
+                    return;
+                }
+                await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes(reply), ct);
+            }
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        }, ct);
+        using var proxy = new RedisProxy("127.0.0.1", port, parseReplies: true);
+        using var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, proxy.Port, ct);
+        var stream = client.GetStream();
+        var ping = System.Text.Encoding.ASCII.GetBytes("*1\r\n$4\r\nPING\r\n");
+        var answer = new byte[64];
+
+        // The last reply hold of the scenario: armed, reached and released.
+        var hold = proxy.HoldReply((c, _) => c.Name == "PING");
+        await stream.WriteAsync(ping, ct);
+        await hold.Reached.WaitAsync(Wait, ct);
+        hold.Release();
+        Assert.Equal("+PONG\r\n", System.Text.Encoding.ASCII.GetString(answer, 0, await stream.ReadAsync(answer, ct)));
+
+        // A reply of an unknown type afterwards: passed on, recorded, and the final check fails.
+        await stream.WriteAsync(ping, ct);
+        Assert.Equal("?unknown\r\n", System.Text.Encoding.ASCII.GetString(answer, 0, await stream.ReadAsync(answer, ct)));
+        Assert.NotNull(proxy.ReplyFailure);
+        Assert.Throws<InvalidOperationException>(proxy.AssertRepliesParsed);
+
+        upstream.Stop();
+        try
+        {
+            await served.WaitAsync(Wait, ct);
+        }
+        catch (Exception)
+        {
+            // the stub upstream ends with the proxy; how it ends is not the subject
+        }
     }
 
     // ---- a session issued between two pages of the pass (US-5, the guarantee of T006, ОСТ-3-2) -------

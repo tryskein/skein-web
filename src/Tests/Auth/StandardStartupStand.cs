@@ -190,6 +190,18 @@ internal sealed class RedisProxy : IDisposable
         }
     }
 
+    /// <summary>
+    /// Fails when the proxy met a reply it could not parse, whether or not a reply hold was armed
+    /// then: the final check of every test whose proxy parses replies.
+    /// </summary>
+    public void AssertRepliesParsed()
+    {
+        if (ReplyFailure is { } failure)
+        {
+            throw new InvalidOperationException("the Redis proxy met a reply it could not parse", failure);
+        }
+    }
+
     public void Cut()
     {
         _cut = true;
