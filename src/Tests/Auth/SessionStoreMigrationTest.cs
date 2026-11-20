@@ -545,7 +545,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
         var issuedDuringIt = await IssueV3Async(Guid.NewGuid());
         await Db.KeyDeleteAsync(legacy);
         await Db.StringIncrementAsync(SessionStoreMigration.GenerationKey);
-        await Db.KeyDeleteAsync(SessionStoreMigration.LockKey);
+        await Db.KeyDeleteAsync([SessionStoreMigration.IssuedDuringKey, SessionStoreMigration.LockKey]); // its finish drops its marks too
 
         await waiting.WaitAsync(TimeSpan.FromSeconds(15));
 
