@@ -708,6 +708,30 @@ public sealed class SessionStoreMigrationTest : IDisposable
     }
 
     [RedisFact]
+    public async Task AConfirmationWithAStaleCount_IsRefused_AndTheReplicaObservesAnew()
+    {
+        await MarkAsync();
+        var live = await IssueV3Async(Guid.NewGuid());
+        // Another replica confirms its start after this one observed: the marker and no lock stay,
+        // only the count moves.
+        var (mux, steps) = Watched((step, n) =>
+        {
+            if (step == CleanupStep.Confirm && n == 1)
+            {
+                Db.StringIncrement(SessionStoreMigration.GenerationKey);
+            }
+            return null;
+        });
+
+        await Migration(mux).RunAsync(Wait, CancellationToken.None);
+
+        Assert.Equal(2, CountOf(steps, CleanupStep.Confirm)); // the stale one refused, the next one confirmed
+        Assert.Equal(0, CountOf(steps, CleanupStep.Begin));
+        Assert.True(await Db.KeyExistsAsync(live));
+        await AssertFinishedAsync(2);
+    }
+
+    [RedisFact]
     public async Task ABeginBeforeTheConfirmation_RefusesTheConfirmation_AndTheOtherReplicaWaitsForThePass()
     {
         await MarkAsync();
