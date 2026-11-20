@@ -266,6 +266,7 @@ public sealed class SessionStoreMigration(
                     {
                         throw new InvalidOperationException("The session store cleanup lost its lock.");
                     }
+                    ct.ThrowIfCancellationRequested(); // a cancellation while the extension was answered
                     if (page.Length == 0)
                     {
                         return true;
