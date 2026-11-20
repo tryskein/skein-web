@@ -489,7 +489,7 @@ public sealed class SessionHandlerCharacterizationTest(ITestOutputHelper output)
 
     private sealed record SetCookie(string Name, string Value, string Raw)
     {
-        public bool IsDeletion => Raw.Contains("1970", StringComparison.Ordinal);
+        public bool IsDeletion => SessionPipelineHost.SetCookie.IsDeletionHeader(Raw);
 
         public static SetCookie Parse(string raw)
         {

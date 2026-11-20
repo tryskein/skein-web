@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Reflection;
 using System.Security.Claims;
@@ -323,7 +324,18 @@ internal sealed class SessionPipelineHost : IAsyncDisposable
 
     public sealed record SetCookie(string Name, string Value, string Raw)
     {
-        public bool IsDeletion => Raw.Contains("1970", StringComparison.Ordinal);
+        public bool IsDeletion => IsDeletionHeader(Raw);
+
+        /// <summary>
+        /// A deletion: an <c>expires</c> attribute at or before the Unix epoch, as
+        /// <c>Response.Cookies.Delete</c> writes it. Only the attributes are read: the value of a live
+        /// cookie is random and may carry any digits, "1970" included.
+        /// </summary>
+        public static bool IsDeletionHeader(string raw) =>
+            raw.Split(';').Skip(1).Select(a => a.Trim()).Any(a =>
+                a.StartsWith("expires=", StringComparison.OrdinalIgnoreCase)
+                && DateTimeOffset.TryParse(a["expires=".Length..], CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var at)
+                && at <= DateTimeOffset.UnixEpoch);
 
         public static SetCookie Parse(string raw)
         {
