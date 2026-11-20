@@ -507,6 +507,60 @@ public sealed class SessionStoreMigrationTest : IDisposable
         await AssertFinishedAsync(1);
     }
 
+    // ---- a cancelled pass -------------------------------------------------------------------------
+
+    [RedisTheory]
+    [InlineData("AfterBegin")]      // before the first extension: no extension is sent
+    [InlineData("AfterExtend")]     // while the extension of a page is answered: no delete of that page
+    [InlineData("AfterLastDelete")] // after the last page: no finish
+    public async Task ACancelledPass_WritesNothingMore_ReleasesItsLock_AndLeavesNoMarker(string point)
+    {
+        var legacy = Legacy();
+        await LegacyHashAsync(legacy); // one page of the scan
+        using var cancellation = new CancellationTokenSource();
+        var cancelAfter = point switch
+        {
+            "AfterBegin" => CleanupStep.Begin,
+            "AfterExtend" => CleanupStep.Extend,
+            _ => CleanupStep.Delete,
+        };
+        var db = DbProxy.Create(Db, out var proxy);
+        var steps = new List<CleanupStep>();
+        proxy.Before = (name, args) =>
+        {
+            var step = CleanupCalls.Of(name, args);
+            if (step != CleanupStep.None)
+            {
+                lock (steps)
+                {
+                    steps.Add(step);
+                }
+            }
+            return null;
+        };
+        proxy.After = (name, args) =>
+        {
+            if (CleanupCalls.Of(name, args) == cancelAfter)
+            {
+                cancellation.Cancel();
+            }
+            return Task.CompletedTask;
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => Migration(TestRedis.Over(_mux, db)).RunAsync(Wait, cancellation.Token));
+
+        Assert.Equal(point == "AfterBegin" ? 0 : 1, CountOf(steps, CleanupStep.Extend));
+        Assert.Equal(point == "AfterLastDelete" ? 1 : 0, CountOf(steps, CleanupStep.Delete));
+        Assert.Equal(0, CountOf(steps, CleanupStep.Finish));
+        Assert.Equal(point != "AfterLastDelete", await Db.KeyExistsAsync(legacy));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
+        Assert.Equal(0, await GenerationAsync());
+        // The way out of a failed pass releases the lock of its owner.
+        Assert.Equal(1, CountOf(steps, CleanupStep.Release));
+        Assert.False(await Db.KeyExistsAsync(SessionStoreMigration.LockKey));
+    }
+
     // ---- another replica waits for the pass (US-5, the condition of the start) ----------------------
 
     [RedisFact]
