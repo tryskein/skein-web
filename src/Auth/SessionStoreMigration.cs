@@ -65,7 +65,10 @@ public sealed class SessionStoreMigration(
     /// <summary>The key of the lock of a pass; its value is the token of the owner.</summary>
     public const string LockKey = "skein:session-format:lock";
 
-    /// <summary>The key of the count of finished passes; no key means none.</summary>
+    /// <summary>
+    /// The key of the count of finished passes and confirmed starts; no key means 0. A change of it
+    /// after an observation tells the replica that the observation is stale.
+    /// </summary>
     public const string GenerationKey = "skein:session-format:generation";
 
     /// <summary>The set of the marks of a pass; a member is "token of the pass:key of the row".</summary>
@@ -79,14 +82,14 @@ public sealed class SessionStoreMigration(
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
 
     // The state in one call (KEYS: marker, lock, count): the marker or false, 1 when the lock
-    // exists, the count of finished passes.
+    // exists, the count of finished passes and confirmed starts.
     private const string PassStatusScript =
         "return {redis.call('GET', KEYS[1]), redis.call('EXISTS', KEYS[2]), " +
         "tonumber(redis.call('GET', KEYS[3]) or '0')}";
 
     // Enter a pass (KEYS: lock, count, marker, marks; ARGV: expected count, token, lifetime ms):
-    // 1 = the lock is taken, 2 = the count is not the expected one (a pass finished after the
-    // observation), 3 = begun: the lock is taken with its lifetime, the marker and the marks of an
+    // 1 = the lock is taken, 2 = the count is not the expected one (a pass finished, or a start was
+    // confirmed, after the observation), 3 = begun: the lock is taken with its lifetime, the marker and the marks of an
     // earlier pass are deleted.
     private const string BeginPassScript =
         "if redis.call('EXISTS', KEYS[1]) == 1 then return 1 end " +
@@ -150,14 +153,17 @@ public sealed class SessionStoreMigration(
     private readonly record struct PassStatus(bool Marked, bool Locked, long Generation);
 
     /// <summary>
-    /// Make sure the store holds no session that predates a rollback: observe the state, run the
-    /// pass when it is needed, or wait for the pass of another replica to finish.
+    /// Make sure the store holds no session that predates a rollback: observe the state and confirm
+    /// the readiness, run the pass when it is needed, or wait until the lock of another pass is gone
+    /// and observe again.
     /// </summary>
-    /// <param name="timeout">How long to wait for the pass of another replica to finish.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="timeout">The window of the start: how long the lock of another pass may stay
+    /// and the observation may keep changing.</param>
+    /// <param name="cancellationToken">Cancellation token; a cancelled pass writes nothing more and
+    /// releases its lock.</param>
     /// <exception cref="InvalidOperationException">The pass failed, lost its lock, a Redis primary
-    /// was not reachable, or the pass of another replica did not finish within
-    /// <paramref name="timeout"/>. The message names no key.</exception>
+    /// was not reachable, the lock of another pass was not gone, or no settled state was observed,
+    /// within <paramref name="timeout"/>. The message names no key.</exception>
     public async Task RunAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
         var deadline = timeProvider.GetUtcNow() + timeout;
