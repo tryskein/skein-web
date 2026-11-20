@@ -145,9 +145,14 @@ spellings are shown below; the environment form is the one used in deployments.
     looks again and runs the cleanup itself if it did not finish. A lock that
     is not gone within the `SKEIN_API_STARTUP_TIMEOUT_SECONDS` window stops the
     start.
+  - The rollback is recognised by what the former version left when the start
+    looks. When its last sessions run out while replicas are starting, and one
+    replica has already confirmed its start, the cleanup does not run: that is
+    the case of a rollback with no session of the former version left, and the
+    rollback procedure below covers it by deleting the marker.
   - A cleanup that fails with an error releases its lock at once, and the next
     start runs the cleanup again. When the process stops during the cleanup,
-    the lock runs out after 30 s.
+    the lock runs out within 30 s.
   - Rollback procedure: switching between the former version and this one, in
     either direction, is rolled out with every replica of skein-web stopped
     first, never as a rolling update. Delete `skein:session-format` as part of
