@@ -47,7 +47,7 @@ public sealed class SessionCleanupProxyTest
             var (host, port) = endpoint is DnsEndPoint dns
                 ? (dns.Host, dns.Port)
                 : (((IPEndPoint)endpoint).Address.ToString(), ((IPEndPoint)endpoint).Port);
-            var proxy = new RedisProxy(host, port);
+            var proxy = new RedisProxy(host, port, parseReplies: true);
             return new Bench
             {
                 Proxy = proxy,
@@ -59,7 +59,14 @@ public sealed class SessionCleanupProxyTest
 
         private static Task<ConnectionMultiplexer> ThroughAsync(RedisProxy proxy)
         {
-            var options = new ConfigurationOptions { DefaultDatabase = RedisProxy.Database, AbortOnConnectFail = true };
+            // A reply kept back by the test is not a client timeout.
+            var options = new ConfigurationOptions
+            {
+                DefaultDatabase = RedisProxy.Database,
+                AbortOnConnectFail = true,
+                AsyncTimeout = 120_000,
+                SyncTimeout = 120_000,
+            };
             options.EndPoints.Add("127.0.0.1", proxy.Port);
             return ConnectionMultiplexer.ConnectAsync(options);
         }
@@ -128,6 +135,22 @@ public sealed class SessionCleanupProxyTest
     [RedisFact]
     public async Task ASessionIssuedBetweenTwoPagesOfThePass_IsMarkedByTokenAndKey_AndSurvives_WhileTheRowsOfTheStartAreDeleted()
     {
+        // SCAN does not promise to return a key written during the walk: the scenario is repeated
+        // until the pass meets an issued row on a later page, and stops with a named precondition
+        // failure if it never does.
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            if (await IssueBetweenTwoPagesAsync())
+            {
+                return;
+            }
+        }
+        Assert.Fail("precondition not met in 3 attempts: the pass never met a row issued between its pages");
+    }
+
+    /// <summary>One run of the scenario of row 66; false when the pass met none of the issued rows.</summary>
+    private static async Task<bool> IssueBetweenTwoPagesAsync()
+    {
         await using var bench = await Bench.StartAsync();
         var seeded = await bench.SeedAsync(hashes: 300, strings: 300);
         var firstPage = bench.Proxy.HoldReply((c, r) => IsPassScan(c) && r.Cursor is { } cursor && cursor != "0");
@@ -142,7 +165,16 @@ public sealed class SessionCleanupProxyTest
         for (var i = 0; i < 16; i++)
         {
             var user = Guid.NewGuid();
-            issued.Add((user, await store.StoreAsync(TestRedis.Ticket(user), new DefaultHttpContext(), CancellationToken.None)));
+            var key = await store.StoreAsync(TestRedis.Ticket(user), new DefaultHttpContext(), CancellationToken.None);
+            issued.Add((user, key));
+            // The set of marks lives at least as long as the lock (the marks first, the lock later:
+            // both only go down between the two reads).
+            var marks = await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.IssuedDuringKey);
+            var held = await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.LockKey);
+            Assert.NotNull(marks);
+            Assert.NotNull(held);
+            Assert.True(marks > TimeSpan.Zero, $"the set of marks has no positive lifetime: {marks}");
+            Assert.True(marks >= held, $"the set of marks ({marks}) lives shorter than the lock ({held})");
         }
         foreach (var (user, key) in issued)
         {
@@ -157,23 +189,25 @@ public sealed class SessionCleanupProxyTest
         firstPage.Release();
         await run.WaitAsync(Wait);
 
-        foreach (var key in seeded)
-        {
-            Assert.False(await bench.Db.KeyExistsAsync(key));
-        }
-        foreach (var (_, key) in issued)
-        {
-            Assert.True(await bench.Db.KeyExistsAsync(key));
-        }
         // The page deletes name the lock, the set of marks and the keys of the page in KEYS.
         var deletes = bench.Proxy.Commands().Where(c => CleanupCalls.Of(c) == CleanupStep.Delete).Select(CleanupCalls.KeysOf).ToList();
         Assert.NotEmpty(deletes);
         Assert.All(deletes, keys => Assert.All(keys.Skip(2), k => Assert.StartsWith("skein:session:", k)));
         var presented = deletes.SelectMany(keys => keys.Skip(2)).ToHashSet();
         Assert.Subset(presented, seeded.ToHashSet());
-        // Precondition: the pass met an issued row on a later page and kept it for its mark.
-        Assert.Contains(issued, i => presented.Contains(i.Key));
+        foreach (var key in seeded)
+        {
+            Assert.False(await bench.Db.KeyExistsAsync(key));
+        }
         await AssertFinishedAsync(bench, 1);
+
+        // The property, on the issued rows the pass really met: presented to a page delete, kept for the mark.
+        var met = issued.Where(i => presented.Contains(i.Key)).ToList();
+        foreach (var (_, key) in met)
+        {
+            Assert.True(await bench.Db.KeyExistsAsync(key), "a marked row the pass met was deleted");
+        }
+        return met.Count > 0;
     }
 
     // ---- every page extends the lock and the marks --------------------------------------------------
@@ -186,44 +220,63 @@ public sealed class SessionCleanupProxyTest
         var pages = new List<string>();
         var reply = bench.Proxy.HoldReply((c, _) => IsPassScan(c));
         var run = bench.Migration().RunAsync(Wait, CancellationToken.None);
+        TimeSpan? lockLowered = null;
+        TimeSpan? marksLowered = null;
+
+        async Task AssertTheLastPageExtendedBothAsync()
+        {
+            var page = pages.Count - 1;
+            Assert.True(await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.LockKey) > lockLowered, $"page {page} did not extend the lock");
+            Assert.True(await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.IssuedDuringKey) > marksLowered, $"page {page} did not extend the marks");
+        }
 
         while (true)
         {
+            // The reply to every page of the scan is the barrier: the page before it, empty or not,
+            // has been handled by now.
             await reply.Reached.WaitAsync(Wait);
             var cursor = reply.Reply!.Cursor!;
             pages.Add(cursor);
-            if (pages.Count == 1)
+            if (pages.Count > 1)
+            {
+                await AssertTheLastPageExtendedBothAsync();
+            }
+            else
             {
                 // A session issued during the pass: the set of marks exists from here on.
                 await TestRedis.Store(bench.Issuing).StoreAsync(TestRedis.Ticket(Guid.NewGuid()), new DefaultHttpContext(), CancellationToken.None);
             }
             Assert.True(await bench.Db.KeyExistsAsync(SessionStoreMigration.IssuedDuringKey));
 
-            // As if the scan had run long: both lifetimes are low when the page arrives.
+            // As if the scan had run long: both lifetimes are low when this page is handed over.
             await bench.Db.KeyExpireAsync(SessionStoreMigration.LockKey, TimeSpan.FromSeconds(5));
             await bench.Db.KeyExpireAsync(SessionStoreMigration.IssuedDuringKey, TimeSpan.FromSeconds(5));
-            var lockBefore = await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.LockKey);
-            var marksBefore = await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.IssuedDuringKey);
-            var afterThePage = bench.Proxy.Hold(c => CleanupCalls.Of(c) is CleanupStep.Delete or CleanupStep.Finish);
-            reply.Release();
+            lockLowered = await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.LockKey);
+            marksLowered = await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.IssuedDuringKey);
 
-            await afterThePage.Reached.WaitAsync(Wait);
-            Assert.True(await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.LockKey) > lockBefore, $"page {pages.Count} did not extend the lock");
-            Assert.True(await bench.Db.KeyTimeToLiveAsync(SessionStoreMigration.IssuedDuringKey) > marksBefore, $"page {pages.Count} did not extend the marks");
             if (cursor == "0")
             {
-                afterThePage.Release();
+                // The last page: its handling ends before the finish of the pass.
+                var finish = bench.Proxy.Hold(c => CleanupCalls.Of(c) == CleanupStep.Finish);
+                reply.Release();
+                await finish.Reached.WaitAsync(Wait);
+                pages.Add("finish");
+                await AssertTheLastPageExtendedBothAsync();
+                finish.Release();
                 break;
             }
-            reply = bench.Proxy.HoldReply((c, _) => IsPassScan(c));
-            afterThePage.Release();
+            var next = bench.Proxy.HoldReply((c, _) => IsPassScan(c));
+            reply.Release();
+            reply = next;
         }
         await run.WaitAsync(Wait);
+        pages.RemoveAt(pages.Count - 1);
 
         // Two pages and more were really walked: a cursor that goes on, and the last one that ends.
         Assert.True(pages.Count >= 2, $"the scan had {pages.Count} page(s)");
         Assert.NotEqual("0", pages[0]);
         Assert.Equal("0", pages[^1]);
+        Assert.Null(bench.Proxy.ReplyFailure);
         await AssertFinishedAsync(bench, 1);
     }
 
@@ -276,6 +329,6 @@ public sealed class SessionCleanupProxyTest
         {
             Assert.True(await bench.Db.KeyExistsAsync(key));
         }
-        await AssertFinishedAsync(bench, 1);
+        await AssertFinishedAsync(bench, 2); // the other pass, then the confirmation of this replica
     }
 }
