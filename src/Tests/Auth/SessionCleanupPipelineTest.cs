@@ -7,7 +7,7 @@ namespace SkeinWeb.Tests.Auth;
 /// <summary>
 /// The startup session cleanup on the real pipeline (<see cref="SessionPipelineHost"/>, database
 /// <see cref="SessionPipelineHost.Database"/>), run on the multiplexer of the stand: an issue whose
-/// mark fails during a pass is refused without a row and without a cookie (ОСТ-3-2), and after the
+/// mark fails during a pass is refused without a row and without a cookie (OST-3-2), and after the
 /// cleanup the old cookie is no session on a protected request and on a new hub connection (US-5).
 /// </summary>
 [Trait("Category", "Integration")]

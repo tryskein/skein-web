@@ -11,9 +11,9 @@ namespace SkeinWeb.Tests.Auth;
 /// The startup session cleanup and the issue of sessions on the wire, through the Redis proxy of the
 /// stand (<see cref="RedisProxy"/>, database <see cref="RedisProxy.Database"/>), on a store of more
 /// than one page of <c>SCAN</c>: a session issued by a serving replica between two pages of the pass
-/// is marked and survives (US-5, ОСТ-3-2), every page extends the lock and the marks, and a pass of
+/// is marked and survives (US-5, OST-3-2), every page extends the lock and the marks, and a pass of
 /// another replica between the two observations of a start gives no readiness from the stale one
-/// (ОСТ-3-1). The pages are told apart by the cursors of the replies.
+/// (OST-3-1). The pages are told apart by the cursors of the replies.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("startup-stand")]
@@ -194,7 +194,7 @@ public sealed class SessionCleanupProxyTest
         }
     }
 
-    // ---- a session issued between two pages of the pass (US-5, the guarantee of T006, ОСТ-3-2) -------
+    // ---- a session issued between two pages of the pass (US-5, the guarantee of T006, OST-3-2) -------
 
     [RedisFact]
     public async Task ASessionIssuedBetweenTwoPagesOfThePass_IsMarkedByTokenAndKey_AndSurvives_WhileTheRowsOfTheStartAreDeleted()
@@ -344,7 +344,7 @@ public sealed class SessionCleanupProxyTest
         await AssertFinishedAsync(bench, 1);
     }
 
-    // ---- a pass of another replica between the observations (ОСТ-3-1, the condition of the start) ----
+    // ---- a pass of another replica between the observations (OST-3-1, the condition of the start) ----
 
     [RedisTheory]
     [InlineData(false)] // the other pass began between the observations

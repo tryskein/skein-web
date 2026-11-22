@@ -6,8 +6,8 @@ namespace SkeinWeb.Tests.Auth;
 
 /// <summary>
 /// <see cref="SessionWindow"/>, the single definition of the window of a session, its validity,
-/// the end of a session and the lifetime a write gives the session row (spec terms «Окно сессии»,
-/// «Корректное окно», «Срок сессии», «Срок бездействия»; D-2, E-1, E-2, E-10; the plan decision
+/// the end of a session and the lifetime a write gives the session row (spec terms "session window",
+/// "valid window", "session lifetime", "idle lifetime"; D-2, E-1, E-2, E-10; the plan decision
 /// «SessionWindow»: the row lifetime is either «ended» or a whole number of milliseconds ≥ 1,
 /// the time left rounded down).
 /// </summary>

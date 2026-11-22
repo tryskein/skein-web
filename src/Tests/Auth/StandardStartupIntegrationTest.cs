@@ -193,7 +193,7 @@ public sealed class StandardStartupIntegrationTest
     private static async Task<long> GenerationAsync(StartupStand stand) =>
         (long?)await stand.Db.StringGetAsync(SessionStoreMigration.GenerationKey) ?? 0;
 
-    // ---- R68 (а): the early window ------------------------------------------------------------
+    // ---- R68 (a): the early window ------------------------------------------------------------
 
     [StartupFact]
     public async Task EarlyWindow_OnTheScanForFormerRows_NoPortIsOpen_AndTheFormerHashIsThere()
@@ -212,7 +212,7 @@ public sealed class StandardStartupIntegrationTest
         Assert.False(stand.App.HasExited, stand.App.Output);
     }
 
-    // ---- R68 (б), (в): the finish of the pass is the boundary ----------------------------------
+    // ---- R68 (b), (c): the finish of the pass is the boundary ----------------------------------
 
     [StartupFact]
     public async Task TheFinishOfThePass_IsTheBoundary_BeforeIt_NoPortAndNoMarker_AfterIt_TheMarkerTheCountAndService()
@@ -270,7 +270,7 @@ public sealed class StandardStartupIntegrationTest
         Assert.False(await stand.Db.KeyExistsAsync(Legacy));
     }
 
-    // ---- R68 (в) and the release of every window ------------------------------------------------
+    // ---- R68 (c) and the release of every window ------------------------------------------------
 
     [StartupFact]
     public async Task AfterTheCleanup_TheApplicationServes_AndTheEarlyBoundaryRefusesWhenRedisIsGone()

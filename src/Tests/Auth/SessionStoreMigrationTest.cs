@@ -344,7 +344,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
         await AssertFinishedAsync(1);
     }
 
-    // ---- the protocol of the pass (ОСТ-3-1) ------------------------------------------------------
+    // ---- the protocol of the pass (OST-3-1) ------------------------------------------------------
 
     [RedisFact]
     public async Task ABeginWithAStaleCount_FindsThePassFinishedAfterTheObservation_DeletesNothing_AndTheNextStartIsOrdinary()
@@ -430,7 +430,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
         Assert.InRange(lifetime.Value, TimeSpan.FromMilliseconds(1), SessionStoreMigration.LockLifetime);
     }
 
-    // ---- the marks of a pass (ОСТ-3-2, R30) --------------------------------------------------------
+    // ---- the marks of a pass (OST-3-2, R30) --------------------------------------------------------
 
     [RedisFact]
     public async Task ANewPass_DropsTheMarksOfAnInterruptedOne_AtItsBegin()
@@ -967,12 +967,12 @@ public sealed class SessionFormatRejectionTest
         await new SessionStoreMigration(host.Mux, TimeProvider.System, Microsoft.Extensions.Logging.Abstractions.NullLogger<SessionStoreMigration>.Instance)
             .RunAsync(TimeSpan.FromSeconds(10), CancellationToken.None);
 
-        // (а) The session issued before the cleanup has ended with it (US-5), as has the row of the former version.
+        // (a) The session issued before the cleanup has ended with it (US-5), as has the row of the former version.
         Assert.Equal(HttpStatusCode.Unauthorized, (await host.SendAsync("/test/me", before)).Status);
         Assert.False(await host.Db.KeyExistsAsync(beforeKey));
         Assert.False(await host.Db.KeyExistsAsync(preUpdate));
 
-        // (б) A session issued after the cleanup lives, and the reader of the former version accepts
+        // (b) A session issued after the cleanup lives, and the reader of the former version accepts
         // neither its cookie (the purpose differs) nor its row (HGETALL of a string: WRONGTYPE).
         var (after, afterKey, set) = await host.SignInAsync(Alice);
         Assert.Equal(HttpStatusCode.OK, (await host.SendAsync("/test/me", after)).Status);
