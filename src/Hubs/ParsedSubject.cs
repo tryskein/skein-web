@@ -50,7 +50,7 @@ public enum SubjectNamespace
 /// <param name="UserId">User UUID for user-scoped events; null otherwise.</param>
 /// <param name="EntityType">Entity short-name (issue, project, comment, dep, component, user).</param>
 /// <param name="Action">Action token (created, updated, member_added, field_changed, etc.) or "field" for field-changed children.</param>
-/// <param name="EntityId">Trailing entity id token. For user-namespace subjects this is the user UUID string (same value as <see cref="UserId"/>, from subject parts[2]); for project-scoped subjects it is the entity id (issue hierarchical id, component uuid, etc.).</param>
+/// <param name="EntityId">Trailing entity id token. For user-namespace subjects this is the user UUID string (same value as <see cref="UserId"/>, from subject parts[2]); for project-scoped subjects it is the entity id (issue hierarchical id, component uuid, etc.), decoded from the %XX subject token.</param>
 /// <param name="FieldName">Kebab-case field name on field-changed subjects; null otherwise.</param>
 public sealed record ParsedSubject(
     SubjectNamespace Namespace,

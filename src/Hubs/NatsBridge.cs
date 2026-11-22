@@ -209,9 +209,9 @@ public sealed class NatsBridge : IHostedService
     /// </summary>
     internal async Task Dispatch(string subject, byte[]? body, CancellationToken ct)
     {
-        if (!SubjectParser.TryParse(subject, out var parsed))
+        if (!SubjectParser.TryParse(subject, out var parsed, out var failure))
         {
-            _logger.LogWarning("NatsBridge dropping malformed subject {Subject}", subject);
+            _logger.LogWarning("NatsBridge dropping malformed subject {Subject}: {Failure}", subject, failure);
             return;
         }
 

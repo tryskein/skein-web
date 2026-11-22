@@ -32,15 +32,86 @@ public class SubjectParserTests
     }
 
     [Fact]
-    public void IssueClosed_HierarchicalIdPreserved()
+    public void IssueClosed_HierarchicalIdDecoded()
     {
-        // Issue ids may contain dots — demo-42.1 is one entity id, not two
-        // tokens. The parser must reassemble the trailing segment.
-        var subject = $"skein.events.project.{FixedProjectId}.issue.closed.demo-42.1";
+        // sk-977.7.74: skein-api writes the id as one %XX token; demo-42.1
+        // arrives as demo-42%2E1 and must come back as the real id.
+        var subject = $"skein.events.project.{FixedProjectId}.issue.closed.demo-42%2E1";
         Assert.True(SubjectParser.TryParse(subject, out var parsed));
         Assert.Equal("issue", parsed.EntityType);
         Assert.Equal("closed", parsed.Action);
         Assert.Equal("demo-42.1", parsed.EntityId);
+    }
+
+    // sk-977.7.74: the entity id token in the format of skein-api's
+    // EncodeEntityToken (subject_test.go TestBuildSubject_EntityTailIsOneToken
+    // holds the same pairs), for both project-scoped shapes.
+    [Theory]
+    [InlineData("demo-42", "demo-42")]
+    [InlineData("demo-42%2E1%2E3", "demo-42.1.3")]
+    [InlineData("demo-a%2E%2Eb", "demo-a..b")]
+    [InlineData("demo-x%2E", "demo-x.")]
+    [InlineData("demo-a%252Eb", "demo-a%2Eb")]
+    [InlineData("%25", "%")]
+    [InlineData("%", "")]
+    [InlineData("a%20b%2A%3E", "a b*>")]
+    [InlineData("%C3%A9", "\u00e9")]
+    [InlineData("demo-1::demo-2::blocks", "demo-1::demo-2::blocks")]
+    public void ProjectSubject_EntityIdTokenDecoded(string token, string wantId)
+    {
+        var lifecycle = $"skein.events.project.{FixedProjectId}.issue.created.{token}";
+        Assert.True(SubjectParser.TryParse(lifecycle, out var parsed, out var failure));
+        Assert.Null(failure);
+        Assert.Equal("created", parsed.Action);
+        Assert.Equal(wantId, parsed.EntityId);
+
+        var field = $"skein.events.project.{FixedProjectId}.issue.field.priority.{token}";
+        Assert.True(SubjectParser.TryParse(field, out parsed, out failure));
+        Assert.Null(failure);
+        Assert.Equal("field_changed", parsed.Action);
+        Assert.Equal("priority", parsed.FieldName);
+        Assert.Equal(wantId, parsed.EntityId);
+    }
+
+    // sk-977.7.74: a token that is not the canonical encoding of any id is
+    // refused with a reason, in both project-scoped shapes.
+    [Theory]
+    [InlineData("demo%")]          // truncated escape
+    [InlineData("demo%2")]         // truncated escape
+    [InlineData("demo%2e1")]       // lower-case hex
+    [InlineData("demo%G0")]        // not hex
+    [InlineData("demo%41")]        // escapes a byte that stands for itself
+    [InlineData("demo%%")]         // escape of an escape character
+    [InlineData("demo+1")]         // byte outside the alphabet, unescaped
+    [InlineData("%C3")]            // not UTF-8
+    [InlineData("%FF%FE")]         // not UTF-8
+    [InlineData("demo-42.%2E1")]   // several tokens holding '%'
+    public void ProjectSubject_BadEntityIdToken_ReturnsFalseWithReason(string tail)
+    {
+        foreach (var subject in new[]
+        {
+            $"skein.events.project.{FixedProjectId}.issue.created.{tail}",
+            $"skein.events.project.{FixedProjectId}.issue.field.priority.{tail}",
+        })
+        {
+            Assert.False(SubjectParser.TryParse(subject, out var parsed, out var failure));
+            Assert.Equal(SubjectNamespace.Malformed, parsed.Namespace);
+            Assert.False(string.IsNullOrWhiteSpace(failure));
+        }
+    }
+
+    [Theory]
+    [InlineData("demo-42.1", "demo-42.1")]
+    [InlineData("demo-1::demo-2.1::blocks", "demo-1::demo-2.1::blocks")]
+    public void ProjectSubject_RawIdOfOlderSkeinApi_JoinedBack(string tail, string wantId)
+    {
+        // A skein-api without the encoding writes the raw id, split over
+        // several tokens by its dots; the parser keeps accepting it so the
+        // services can be upgraded in either order.
+        var subject = $"skein.events.project.{FixedProjectId}.issue.closed.{tail}";
+        Assert.True(SubjectParser.TryParse(subject, out var parsed, out var failure));
+        Assert.Null(failure);
+        Assert.Equal(wantId, parsed.EntityId);
     }
 
     [Fact]
