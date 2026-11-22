@@ -27,7 +27,12 @@ namespace SkeinWeb.Hubs;
 /// skein-api's <c>EncodeEntityToken</c>: the bytes <c>A-Z a-z 0-9 _ : -</c>
 /// stand for themselves, every other byte of the UTF-8 id (<c>.</c> and
 /// <c>%</c> among them) is <c>%</c> and two upper-case hex digits, and the
-/// empty id is the lone token <c>%</c>. <see cref="TryParse(string, out ParsedSubject, out string?)"/>
+/// empty id is the lone token <c>%</c>. An id whose encoding would exceed
+/// skein-api's bound (<c>EntityTokenMaxBytes</c>, 1024 bytes) is the digest
+/// token <c>%%</c> and the 64 upper-case hex digits of its SHA-256: the id
+/// cannot be read back from it, so <see cref="ParsedSubject.EntityId"/> is
+/// that token as it is and the id is only in the envelope's
+/// <c>entityId</c>. <see cref="TryParse(string, out ParsedSubject, out string?)"/>
 /// decodes it, so <see cref="ParsedSubject.EntityId"/> is the real id
 /// (<c>demo-42%2E1</c> gives <c>demo-42.1</c>). A token that is not in
 /// that form — a byte outside the alphabet, a lower-case or truncated
@@ -38,10 +43,10 @@ namespace SkeinWeb.Hubs;
 /// split it over several tokens (<c>demo-42.1</c> as <c>demo-42</c> and
 /// <c>1</c>). Such a tail is joined back with dots. It is never confused
 /// with the encoded form: an encoded id is always exactly one token, and a
-/// raw id never holds <c>%</c> (neither the issue id alphabet nor any
-/// generated id admits it), so a multi-token tail with <c>%</c> fails the
-/// parse. A single-token raw id consists of bytes that stand for
-/// themselves and decodes to itself.
+/// raw id never holds <c>%</c>: every raw id (issue ids, UUIDs, dependency
+/// ids <c>from::to::type</c>) is made of the bytes that stand for
+/// themselves plus dots, so each token of a multi-token tail must consist
+/// of those bytes only, and a single-token raw id decodes to itself.
 /// </remarks>
 public static class SubjectParser
 {
@@ -70,6 +75,21 @@ public static class SubjectParser
     /// </param>
     /// <returns><c>true</c> when the subject matches one of the known schemes.</returns>
     public static bool TryParse(string subject, out ParsedSubject parsed, out string? failure)
+    {
+        if (TryParseCore(subject, out parsed, out var reason))
+        {
+            failure = null;
+            return true;
+        }
+        failure = reason ?? "subject does not match a known scheme";
+        return false;
+    }
+
+    /// <summary>
+    /// The parse itself. <paramref name="failure"/> is meaningful only when
+    /// it returns <c>false</c>; the public overload clears it on success.
+    /// </summary>
+    private static bool TryParseCore(string subject, out ParsedSubject parsed, out string? failure)
     {
         parsed = MalformedSentinel(subject);
         failure = "subject does not match a known scheme";
@@ -285,16 +305,22 @@ public static class SubjectParser
                 failure = "entity id has an empty token";
                 return false;
             }
-            if (parts[i].Contains('%'))
+            foreach (var c in parts[i])
             {
-                failure = "entity id spans several tokens and contains '%': it is neither encoded nor raw";
-                return false;
+                if (!IsUnescaped(c))
+                {
+                    failure = "entity id spans several tokens and has a character outside the raw id alphabet";
+                    return false;
+                }
             }
         }
         entityId = string.Join('.', parts, start, count);
         failure = null;
         return true;
     }
+
+    /// <summary>Hex digits of the SHA-256 in a digest token.</summary>
+    private const int DigestHexLength = 64;
 
     private static readonly UTF8Encoding StrictUtf8 =
         new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
@@ -315,6 +341,27 @@ public static class SubjectParser
         }
         if (token == "%")
         {
+            failure = null;
+            return true;
+        }
+        if (token.StartsWith("%%", StringComparison.Ordinal))
+        {
+            // Digest token of an id too long to encode: opaque, the id itself
+            // is only in the envelope.
+            if (token.Length != 2 + DigestHexLength)
+            {
+                failure = "entity id digest token is not 64 hex digits";
+                return false;
+            }
+            for (var i = 2; i < token.Length; i++)
+            {
+                if (HexValue(token[i]) is null)
+                {
+                    failure = $"entity id digest token has a non-upper-case-hex character at offset {i}";
+                    return false;
+                }
+            }
+            entityId = token;
             failure = null;
             return true;
         }

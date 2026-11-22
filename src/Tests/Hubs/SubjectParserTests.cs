@@ -86,6 +86,10 @@ public class SubjectParserTests
     [InlineData("%C3")]            // not UTF-8
     [InlineData("%FF%FE")]         // not UTF-8
     [InlineData("demo-42.%2E1")]   // several tokens holding '%'
+    [InlineData("demo-42.1+2")]    // several tokens, a byte outside the raw id alphabet
+    [InlineData("%%ABC")]          // digest token too short
+    [InlineData("%%833a0585255e446c16e719145efbffae39c44fce96540c01f4e46af7090d1626")] // digest in lower case
+    [InlineData("%%833A0585255E446C16E719145EFBFFAE39C44FCE96540C01F4E46AF7090D16260")] // digest too long
     public void ProjectSubject_BadEntityIdToken_ReturnsFalseWithReason(string tail)
     {
         foreach (var subject in new[]
@@ -97,6 +101,26 @@ public class SubjectParserTests
             Assert.False(SubjectParser.TryParse(subject, out var parsed, out var failure));
             Assert.Equal(SubjectNamespace.Malformed, parsed.Namespace);
             Assert.False(string.IsNullOrWhiteSpace(failure));
+        }
+    }
+
+    [Fact]
+    public void ProjectSubject_DigestTokenOfOverlongId_IsOpaque()
+    {
+        // sk-977.7.74: an id whose encoding exceeds 1024 bytes travels as
+        // "%%" + its SHA-256; the parse succeeds and the token stands for
+        // the id, which the envelope carries.
+        const string digest = "%%833A0585255E446C16E719145EFBFFAE39C44FCE96540C01F4E46AF7090D1626";
+        foreach (var subject in new[]
+        {
+            $"skein.events.project.{FixedProjectId}.dependency.created.{digest}",
+            $"skein.events.project.{FixedProjectId}.issue.field.priority.{digest}",
+        })
+        {
+            Assert.True(SubjectParser.TryParse(subject, out var parsed, out var failure));
+            Assert.Null(failure);
+            Assert.Equal(SubjectNamespace.Project, parsed.Namespace);
+            Assert.Equal(digest, parsed.EntityId);
         }
     }
 
@@ -134,6 +158,22 @@ public class SubjectParserTests
         var subject = $"skein.events.project.{FixedProjectId}.issue.field.acceptance-criteria.demo-42";
         Assert.True(SubjectParser.TryParse(subject, out var parsed));
         Assert.Equal("acceptance-criteria", parsed.FieldName);
+    }
+
+    // The reason overload reports no failure for a subject it parses, in
+    // every scheme it recognises.
+    [Theory]
+    [InlineData("skein.user.77777777-7777-7777-7777-777777777777.created")]
+    [InlineData("skein.user.77777777-7777-7777-7777-777777777777.field.name")]
+    [InlineData("skein.user.77777777-7777-7777-7777-777777777777.theme.preview")]
+    [InlineData("skein.user.77777777-7777-7777-7777-777777777777.theme.updated")]
+    [InlineData("skein.user.77777777-7777-7777-7777-777777777777.theme.user-pref.updated")]
+    [InlineData("skein.events.project.11111111-2222-3333-4444-555555555555.issue.created.demo-42")]
+    [InlineData("skein.events.project.11111111-2222-3333-4444-555555555555.issue.field.priority.demo-42")]
+    public void ParsedSubject_ReportsNoFailure(string subject)
+    {
+        Assert.True(SubjectParser.TryParse(subject, out _, out var failure));
+        Assert.Null(failure);
     }
 
     [Fact]
