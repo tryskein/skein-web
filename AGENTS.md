@@ -119,7 +119,7 @@ The profile is `.progon/web.toml`; run from the repository root:
 |---|---|---|
 | unit | `progon web unit` | `progon web unit 'FullyQualifiedName~<Class or Method>'` |
 | integ | `progon web integ` | `progon web integ 'FullyQualifiedName~<Class or Method>'` |
-| mutation | `progon web mutation --since <BASE> --keep --split <N> --quota-wait 7200 --background <targets>` (see below) | the targets are Stryker `--mutate` globs, e.g. `'**/Health/*.cs'` |
+| mutation | `progon web mutation --since <BASE> --keep --split <N> --quota-wait 7200 --background <targets>` (see below) | the targets are files, e.g. `src/Health/ReadinessEndpoint.cs` |
 
 `integ` starts NATS and Redis fixtures and sets `TEST_NATS_URL`,
 `TEST_NATS_MONITOR_URL` and `TEST_REDIS_URL`. `mutation` runs Stryker.NET on its
@@ -132,15 +132,17 @@ Mutation of everything changed since a base commit (`<BASE>`, the commit the
 work started from), in bash:
 
 ```bash
-mapfile -t T < <(git diff --name-only <BASE>..HEAD -- src | grep -v '^src/Tests/' | grep '\.cs$' | sed 's#^src/##')
+mapfile -t T < <(git diff --name-only <BASE>..HEAD -- src | grep -v '^src/Tests/' | grep '\.cs$')
 progon web mutation --since <BASE> --keep --split 3 --quota-wait 7200 --background "${T[@]}"
 progon wait <group id printed by the command>
 ```
 
-- The targets are globs relative to the project directory `src/`:
-  `Auth/SessionIssuer.cs`, not `src/Auth/SessionIssuer.cs` (a path with the
-  `src/` prefix matches no file, every mutant is ignored and the run ends with
-  `no mutant measured`). Pass each target as its own argument.
+- Name each target as a file path relative to the repository root, as
+  `git diff --name-only` prints it (`src/Auth/SessionIssuer.cs`), one target
+  per argument. progon anchors a target where it finds the file; a glob is
+  anchored at the workdir `src/Tests`, so a bare glob such as `**/Health/*.cs`
+  selects the test project's files, not the service's, and the run measures
+  no service code.
 - `--split` needs the targets named; it divides them into parts that run as one
   group. The whole-run ceiling is 7200 s per part, so a change of a few
   thousand mutants must be split (a run of about 3300 mutants was estimated at

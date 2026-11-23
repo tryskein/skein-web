@@ -64,9 +64,8 @@ prepare = [
 TEST_NATS_URL = "nats://nats:4222"
 TEST_NATS_MONITOR_URL = "http://nats:8222/"
 TEST_REDIS_URL = "redis:6379"
-[kind.mutation.options]
-install = "dotnet tool install --tool-path /work/.progon/tools dotnet-stryker"
-command = ["/work/.progon/tools/dotnet-stryker"]
+# Stryker.NET comes from the pinned local tool manifest (.config/dotnet-tools.json)
+# through the adapter's default `dotnet tool restore` and `dotnet stryker`.
 [[kind.mutation.fixture]]
 name = "nats"
 image = "nats:2.10-alpine"
