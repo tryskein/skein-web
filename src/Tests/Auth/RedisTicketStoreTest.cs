@@ -168,9 +168,9 @@ public sealed class RedisTicketStoreTest : IDisposable
         Assert.InRange(index - lastRow, -1000, 1000); // the index carries the actual lifetime of the row
     }
 
-    // The window is given as hours from the moment the test runs (null: the
-    // bound is absent), not as timestamps: a timestamp taken when the data is
-    // built ends up in the test case's display name, and a runner that
+    // The window is given as hours from a fixed reference instant (null: the
+    // bound is absent), not as timestamps taken when the data is built: such a
+    // timestamp ends up in the test case's display name, and a runner that
     // discovers the cases and runs them in different seconds (Stryker.NET on
     // VSTest) then cannot match the results to the discovered cases.
     public static TheoryData<string, int?, int?> InvalidWindows() => new()
@@ -181,16 +181,17 @@ public sealed class RedisTicketStoreTest : IDisposable
         { "issued after expiry", 1, 0 },
     };
 
-    private static DateTimeOffset? HoursFromNow(DateTimeOffset now, int? hours) =>
-        hours is { } h ? now.AddHours(h) : null;
+    private static readonly DateTimeOffset WindowReference = new(2026, 1, 15, 12, 0, 0, TimeSpan.Zero);
+
+    private static DateTimeOffset? HoursFromReference(int? hours) =>
+        hours is { } h ? WindowReference.AddHours(h) : null;
 
     [RedisTheory]
     [MemberData(nameof(InvalidWindows))]
     public async Task Store_OfATicketWithoutAValidWindow_IsAnError_AndWritesNothing(string _, int? issuedHours, int? expiresHours)
     {
-        var now = WholeSecond(DateTimeOffset.UtcNow);
-        var issued = HoursFromNow(now, issuedHours);
-        var expires = HoursFromNow(now, expiresHours);
+        var issued = HoursFromReference(issuedHours);
+        var expires = HoursFromReference(expiresHours);
         var user = NewUser();
         var db = DbProxy.Create(Db, out var proxy);
         var calls = new List<string>();
@@ -277,16 +278,17 @@ public sealed class RedisTicketStoreTest : IDisposable
     [MemberData(nameof(StoredInvalidWindows))]
     public async Task Retrieve_OfARowWithoutAValidWindow_IsNoSession_AndTheRowIsDeleted(string _, int? issuedHours, int? expiresHours)
     {
-        var now = WholeSecond(DateTimeOffset.UtcNow);
-        var issued = HoursFromNow(now, issuedHours);
-        var expires = HoursFromNow(now, expiresHours);
+        var issued = HoursFromReference(issuedHours);
+        var expires = HoursFromReference(expiresHours);
         var key = NewKey("window");
         var ticket = TestRedis.Ticket(NewUser());
         ticket.Properties.IssuedUtc = issued;
         ticket.Properties.ExpiresUtc = expires;
         await SeedAsync(key, ticket, TimeSpan.FromHours(1));
 
-        Assert.Null(await ReadAsync(Store(), key));
+        // The reader's clock is before every expiry of the table, so a window
+        // the reader wrongly accepted would be a live session, not an ended one.
+        Assert.Null(await ReadAsync(Store(Defaults, ClockAt(WindowReference.AddMinutes(-1))), key));
         Assert.False(await Db.KeyExistsAsync(key));
     }
 
