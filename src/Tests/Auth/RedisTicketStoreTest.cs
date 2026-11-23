@@ -168,22 +168,29 @@ public sealed class RedisTicketStoreTest : IDisposable
         Assert.InRange(index - lastRow, -1000, 1000); // the index carries the actual lifetime of the row
     }
 
-    public static TheoryData<string, DateTimeOffset?, DateTimeOffset?> InvalidWindows()
+    // The window is given as hours from the moment the test runs (null: the
+    // bound is absent), not as timestamps: a timestamp taken when the data is
+    // built ends up in the test case's display name, and a runner that
+    // discovers the cases and runs them in different seconds (Stryker.NET on
+    // VSTest) then cannot match the results to the discovered cases.
+    public static TheoryData<string, int?, int?> InvalidWindows() => new()
     {
-        var at = WholeSecond(DateTimeOffset.UtcNow);
-        return new()
-        {
-            { "no issue time", null, at.AddHours(1) },
-            { "no expiry time", at, null },
-            { "issued equals expiry", at, at },
-            { "issued after expiry", at.AddHours(1), at },
-        };
-    }
+        { "no issue time", null, 1 },
+        { "no expiry time", 0, null },
+        { "issued equals expiry", 0, 0 },
+        { "issued after expiry", 1, 0 },
+    };
+
+    private static DateTimeOffset? HoursFromNow(DateTimeOffset now, int? hours) =>
+        hours is { } h ? now.AddHours(h) : null;
 
     [RedisTheory]
     [MemberData(nameof(InvalidWindows))]
-    public async Task Store_OfATicketWithoutAValidWindow_IsAnError_AndWritesNothing(string _, DateTimeOffset? issued, DateTimeOffset? expires)
+    public async Task Store_OfATicketWithoutAValidWindow_IsAnError_AndWritesNothing(string _, int? issuedHours, int? expiresHours)
     {
+        var now = WholeSecond(DateTimeOffset.UtcNow);
+        var issued = HoursFromNow(now, issuedHours);
+        var expires = HoursFromNow(now, expiresHours);
         var user = NewUser();
         var db = DbProxy.Create(Db, out var proxy);
         var calls = new List<string>();
@@ -264,12 +271,15 @@ public sealed class RedisTicketStoreTest : IDisposable
         }
     }
 
-    public static TheoryData<string, DateTimeOffset?, DateTimeOffset?> StoredInvalidWindows() => InvalidWindows();
+    public static TheoryData<string, int?, int?> StoredInvalidWindows() => InvalidWindows();
 
     [RedisTheory]
     [MemberData(nameof(StoredInvalidWindows))]
-    public async Task Retrieve_OfARowWithoutAValidWindow_IsNoSession_AndTheRowIsDeleted(string _, DateTimeOffset? issued, DateTimeOffset? expires)
+    public async Task Retrieve_OfARowWithoutAValidWindow_IsNoSession_AndTheRowIsDeleted(string _, int? issuedHours, int? expiresHours)
     {
+        var now = WholeSecond(DateTimeOffset.UtcNow);
+        var issued = HoursFromNow(now, issuedHours);
+        var expires = HoursFromNow(now, expiresHours);
         var key = NewKey("window");
         var ticket = TestRedis.Ticket(NewUser());
         ticket.Properties.IssuedUtc = issued;
