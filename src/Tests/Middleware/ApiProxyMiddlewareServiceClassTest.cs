@@ -150,6 +150,31 @@ public class ApiProxyMiddlewareServiceClassTest
         Assert.Equal(0, calls);
     }
 
+    /// <summary>
+    /// The refusal itself is the JSON error the rest of the API answers with:
+    /// a JSON Content-Type and the machine code <c>not_found</c>, the same with
+    /// and without a session cookie, for a service route and for a path that
+    /// leaves the internal-API prefix.
+    /// </summary>
+    [Theory]
+    [InlineData("POST", "/api/v1/auth/login", true)]
+    [InlineData("POST", "/api/v1/auth/login", false)]
+    [InlineData("GET", "/api/v1/../../api/v1/projects", true)]
+    [InlineData("GET", "/api/v1/../../api/v1/projects", false)]
+    public async Task Refusal_IsAJsonNotFoundError(string method, string path, bool cookie)
+    {
+        var (middleware, handler) = Build();
+        var ctx = Context(method, path, "", cookie);
+        await middleware.InvokeAsync(ctx, _ => Task.CompletedTask);
+
+        Assert.Equal(StatusCodes.Status404NotFound, ctx.Response.StatusCode);
+        Assert.Equal(0, handler.Calls);
+        Assert.Equal("application/json", ctx.Response.ContentType);
+        ctx.Response.Body.Position = 0;
+        using var body = await System.Text.Json.JsonDocument.ParseAsync(ctx.Response.Body);
+        Assert.Equal("not_found", body.RootElement.GetProperty("error").GetString());
+    }
+
     [Theory]
     // Dot segments that climb above /ui/v1: the result would address skein-api
     // outside the internal-API prefix (the transitional /api/v1 serves the same
