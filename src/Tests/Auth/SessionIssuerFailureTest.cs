@@ -171,7 +171,7 @@ public class SessionIssuerFailureTest
     {
         var w = Build();
         w.Db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.SocketFailure, $"no connection for {SecretKey}"));
+            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None, $"no connection for {SecretKey}", null, CommandStatus.Unknown));
         var ctx = w.Request(cookie: w.CookieOf(SecretKey));
 
         var ex = await Assert.ThrowsAsync<SessionIssueException>(() => w.Issuer.RevokeIncomingAsync(ctx));
@@ -189,7 +189,7 @@ public class SessionIssuerFailureTest
     {
         var w = Build();
         w.Db.Setup(d => d.ScriptEvaluateAsync(It.Is<string>(s => IsIssueScript(s)), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.SocketFailure, $"no connection for {SecretKey}"));
+            .ThrowsAsync(new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None, $"no connection for {SecretKey}", null, CommandStatus.Unknown));
         var ctx = w.Request();
 
         var ex = await Assert.ThrowsAsync<SessionIssueException>(

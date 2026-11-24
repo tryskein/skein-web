@@ -29,8 +29,9 @@ public sealed class SessionLogRedactionTest
     [InlineData("exists")]
     public async Task AFailedOperation_IsLoggedWithoutTheSessionKey_InTheLineTheFormatterPrints(string operation)
     {
-        var failure = new RedisConnectionException(ConnectionFailureType.SocketFailure,
-            $"No connection is active/available to service this operation: GET {Key}; Timeout performing GET ({Key}), inst: 1");
+        var failure = new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None,
+            $"No connection is active/available to service this operation: GET {Key}; Timeout performing GET ({Key}), inst: 1",
+            null, CommandStatus.Unknown);
         Assert.Contains(Key, failure.ToString()); // the stimulus is suitable only with the key in its own text
 
         var db = new Moq.Mock<IDatabase>();

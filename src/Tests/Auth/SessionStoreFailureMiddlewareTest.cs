@@ -20,7 +20,7 @@ public sealed class SessionStoreFailureMiddlewareTest
 
     private static void FailReads(SessionPipelineHost host) =>
         host.Faults.Before = (name, _) => name == nameof(IDatabase.StringGetAsync)
-            ? new RedisConnectionException(ConnectionFailureType.SocketFailure, "injected-secret-source-text")
+            ? new RedisConnectionException(ConnectionFailureType.SocketFailure, CommandFlags.None, "injected-secret-source-text", null, CommandStatus.Unknown)
             : null;
 
     private static JsonElement Json(SessionPipelineHost.Reply reply) => JsonDocument.Parse(reply.Body).RootElement;

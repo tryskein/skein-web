@@ -234,7 +234,11 @@ public sealed class AccountRoutesPipelineTest : IAsyncLifetime
             var before = _api.Requests.Length;
             using var response = await Send(browser, method, path, body);
 
-            Assert.True(response.IsSuccessStatusCode, $"{method} {path} answered {(int)response.StatusCode} without a session: {(response.IsSuccessStatusCode ? "" : response.Content.ReadAsStringAsync().Result)}");
+            if (!response.IsSuccessStatusCode)
+            {
+                var answer = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+                Assert.Fail($"{method} {path} answered {(int)response.StatusCode} without a session: {answer}");
+            }
             var sent = Assert.Single(_api.Requests[before..]);
             Assert.False(CarriesIdentity(sent), $"{method} {path} reached skein-api with identity headers");
         }

@@ -19,7 +19,7 @@ public class RedisTicketStoreFailureTest
     private static readonly Guid Owner = Guid.Parse("0199a1b2-0000-7000-8000-000000000001");
 
     private static RedisConnectionException Down() =>
-        new(ConnectionFailureType.SocketFailure, $"no connection for {Key}");
+        new(ConnectionFailureType.SocketFailure, CommandFlags.None, $"no connection for {Key}", null, CommandStatus.Unknown);
 
     private static (RedisTicketStore Store, Mock<IDatabase> Db) Build()
     {
@@ -51,7 +51,7 @@ public class RedisTicketStoreFailureTest
     {
         var (store, db) = Build();
         db.Setup(d => d.StringGetAsync(It.IsAny<RedisKey>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisServerException("WRONGTYPE Operation against a key holding the wrong kind of value"));
+            .ThrowsAsync(new RedisServerException(RedisErrorKind.WrongType, CommandFlags.None, "WRONGTYPE Operation against a key holding the wrong kind of value"));
 
         Assert.Null(await store.RetrieveAsync(Key, new DefaultHttpContext(), CancellationToken.None));
     }

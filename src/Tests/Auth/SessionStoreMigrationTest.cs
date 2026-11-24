@@ -892,7 +892,7 @@ public sealed class SessionStoreMigrationTest : IDisposable
     {
         var db = new Mock<IDatabase>();
         db.Setup(d => d.ScriptEvaluateAsync(It.IsAny<string>(), It.IsAny<RedisKey[]>(), It.IsAny<RedisValue[]>(), It.IsAny<CommandFlags>()))
-            .ThrowsAsync(new RedisTimeoutException("timed out on skein:session-format", CommandStatus.Unknown));
+            .ThrowsAsync(new RedisTimeoutException(CommandFlags.None, "timed out on skein:session-format", CommandStatus.Unknown));
         var mux = new Mock<IConnectionMultiplexer>();
         mux.Setup(m => m.GetDatabase(It.IsAny<int>(), It.IsAny<object>())).Returns(db.Object);
 

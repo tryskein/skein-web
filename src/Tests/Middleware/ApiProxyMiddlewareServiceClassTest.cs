@@ -171,7 +171,7 @@ public class ApiProxyMiddlewareServiceClassTest
         Assert.Equal(0, handler.Calls);
         Assert.Equal("application/json", ctx.Response.ContentType);
         ctx.Response.Body.Position = 0;
-        using var body = await System.Text.Json.JsonDocument.ParseAsync(ctx.Response.Body);
+        using var body = await System.Text.Json.JsonDocument.ParseAsync(ctx.Response.Body, cancellationToken: TestContext.Current.CancellationToken);
         Assert.Equal("not_found", body.RootElement.GetProperty("error").GetString());
     }
 

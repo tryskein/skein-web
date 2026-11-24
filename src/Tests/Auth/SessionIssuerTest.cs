@@ -84,7 +84,7 @@ public sealed class SessionIssuerTest
         var set = Assert.Single(reply.Sessions(host.CookieName));
         var fresh = KeyOf(reply);
         Assert.NotEqual(dead ?? "-", fresh);
-        Assert.Equal(fresh, Assert.Single(RowsOf(host, Alice).Where(k => k == fresh)));
+        Assert.Equal(fresh, Assert.Single(RowsOf(host, Alice), k => k == fresh));
         Assert.True(await host.Db.KeyExistsAsync(controlKey)); // the other session is untouched
         if (dead is not null)
         {
