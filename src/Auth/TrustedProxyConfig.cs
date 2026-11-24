@@ -244,8 +244,12 @@ public sealed class TrustedProxyConfig
             ForwardedHeaders.XForwardedHost |
             ForwardedHeaders.XForwardedFor;
 
-        // Peel a single hop only — a multi-hop chain must enumerate each proxy
-        // in the allowlist rather than blanket-trusting an arbitrarily long XFF.
+        // Peel exactly one hop: the middleware reads X-Forwarded-For right to left
+        // and stops after ForwardLimit entries, however many addresses the
+        // allowlist holds. The client address becomes the rightmost entry — the
+        // peer of the trusted proxy directly in front of skein-web. Behind a
+        // chain of several trusted proxies that is the next proxy of the chain,
+        // not the visitor; listing more proxies does not move it further.
         o.ForwardLimit = 1;
 
         foreach (var ip in _proxies)
