@@ -12,8 +12,8 @@ using Microsoft.AspNetCore.Routing;
 
 namespace SkeinWeb.Tests.Auth;
 
-/// <summary>One command a client sent to Redis, as the proxy parsed it.</summary>
-internal sealed record RedisCommand(string Name, string[] Args)
+/// <summary>The arguments of one command a client sent to Redis (the command name excluded), as the proxy parsed it.</summary>
+internal sealed record RedisCommand(string[] Args)
 {
     /// <summary>Whether the command names <paramref name="key"/> among its arguments.</summary>
     public bool Mentions(string key) => Args.Any(a => a == key);
@@ -151,7 +151,7 @@ internal sealed class RedisProxy : IDisposable
             parts[i] = Encoding.UTF8.GetString(buffer.GetRange(pos, n).ToArray());
             pos += n + 2;
         }
-        command = new RedisCommand(parts[0].ToUpperInvariant(), parts[1..]);
+        command = new RedisCommand(parts[1..]);
         length = pos;
         return true;
     }

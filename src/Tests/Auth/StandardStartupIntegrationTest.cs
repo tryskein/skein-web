@@ -32,12 +32,8 @@ internal sealed class StartupStand : IAsyncDisposable
     public IDatabase Db => Mux.GetDatabase(RedisProxy.Database);
     public HttpClient Http { get; }
 
-    private readonly IDictionary<string, string?> _environment;
-    private readonly List<AppProcess> _others = [];
-
-    private StartupStand(RedisProxy proxy, StubSkeinApi api, AppProcess app, ConnectionMultiplexer mux, IDictionary<string, string?> environment)
+    private StartupStand(RedisProxy proxy, StubSkeinApi api, AppProcess app, ConnectionMultiplexer mux)
     {
-        _environment = environment;
         Proxy = proxy;
         Api = api;
         App = app;
@@ -79,7 +75,7 @@ internal sealed class StartupStand : IAsyncDisposable
                 ["SKEIN_API_STARTUP_TIMEOUT_SECONDS"] = "60",
             };
             var app = AppProcess.Start(environmentOfTheStand);
-            return new StartupStand(proxy, api, app, mux, environmentOfTheStand);
+            return new StartupStand(proxy, api, app, mux);
         }
         catch
         {
@@ -91,18 +87,6 @@ internal sealed class StartupStand : IAsyncDisposable
             mux.Dispose();
             throw;
         }
-    }
-
-    /// <summary>
-    /// Starts one more process of the application with the settings of the stand, on the same
-    /// Redis proxy, database and stub skein-api. The stand stays the only owner of the database: it
-    /// is not flushed here, and the stand stops every process it started when it is disposed.
-    /// </summary>
-    public AppProcess StartAnother()
-    {
-        var app = AppProcess.Start(_environment);
-        _others.Add(app);
-        return app;
     }
 
     public async Task<(HttpStatusCode Status, string Body, string[] SetCookies)> SendAsync(
@@ -129,10 +113,6 @@ internal sealed class StartupStand : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         Http.Dispose();
-        foreach (var other in _others)
-        {
-            other.Dispose();
-        }
         App.Dispose();
         Proxy.Dispose();
         await Api.DisposeAsync();
