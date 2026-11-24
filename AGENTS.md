@@ -104,7 +104,7 @@ internal; the browser reaches it through skein-frontend's nginx on `:8080`.
 | Kind | Status | What it is here | Command (local) | Narrowed run | Location |
 |---|---|---|---|---|---|
 | unit | enabled | xUnit + Moq, in-process; infrastructure-dependent tests skip without their settings | `cd src/Tests && dotnet test --nologo --filter 'Category!=Integration'` | `cd src/Tests && dotnet test --nologo --filter 'Category!=Integration&FullyQualifiedName~<Class or Method>'` | `src/Tests/**` |
-| integration | enabled | Session revocation through real NATS subscriptions and the shared Redis ticket store | `./scripts/integration-test.sh` | `./scripts/integration-test.sh 'FullyQualifiedName~<Class or Method>'` | `src/Tests/**`, trait `Category=Integration` |
+| integration | enabled | Session revocation through real NATS subscriptions and the shared Redis ticket store; the start with Redis behind Sentinel | `./scripts/integration-test.sh` | `./scripts/integration-test.sh 'FullyQualifiedName~<Class or Method>'` | `src/Tests/**`, trait `Category=Integration` |
 | e2e | covered by skein-frontend | no own suite; the `e2e` group of skein-frontend exercises the hub, the cookie session and the proxy on a live stack built from `projects/*` | from the top of `skein/`: `./scripts/e2e-test.sh` | from the top of `skein/`: `./scripts/e2e-test.sh -- -g '<test title>'` | `projects/skein-frontend/browser/e2e/` |
 | smoke (image contract) | not used | — | — | — | — |
 | mutation | on demand, a final gate for a large change | Stryker.NET on VSTest, only on lines changed since a base commit; runs on the test VMs only | see "Running on the test VMs" | one or more `--mutate` globs | `.progon/web.toml` |
@@ -121,8 +121,9 @@ The profile is `.progon/web.toml`; run from the repository root:
 | integ | `progon web integ` | `progon web integ 'FullyQualifiedName~<Class or Method>'` |
 | mutation | `progon web mutation --since <BASE> --keep --split <N> --quota-wait 7200 --background <targets>` (see below) | the targets are files, e.g. `src/Health/ReadinessEndpoint.cs` |
 
-`integ` starts NATS and Redis fixtures and sets `TEST_NATS_URL`,
-`TEST_NATS_MONITOR_URL` and `TEST_REDIS_URL`. `mutation` runs Stryker.NET on its
+`integ` starts NATS, Redis and Redis-behind-Sentinel fixtures and sets
+`TEST_NATS_URL`, `TEST_NATS_MONITOR_URL`, `TEST_REDIS_URL` and
+`TEST_REDIS_SENTINEL_URL`. `mutation` runs Stryker.NET on its
 default VSTest runner, with the same fixtures. Not on the Microsoft Testing
 Platform: there its coverage relay goes stale after the tests that start a child
 SkeinWeb (stryker-net#3871) and the later mutants end as timeouts.
@@ -165,6 +166,8 @@ progon wait <group id printed by the command>
   daemon's host (container bind mounts must resolve to that checkout).
   `TEST_NATS_URL`, `TEST_NATS_MONITOR_URL` and `TEST_REDIS_URL` are set by
   the harness; without any of them the integration theory is skipped.
+  `TEST_REDIS_SENTINEL_URL` (a Redis behind Sentinel, also started by the
+  harness) gates the start through Sentinel; without it that test is skipped.
   The harness uses .NET SDK 10; `SKEIN_TEST_RUNNER_IMAGE`, `SKEIN_TEST_CPUS`
   and `SKEIN_TEST_MEMORY` override its runner image and resource limits.
 - e2e: Docker and the full `skein/` workspace with all three services cloned

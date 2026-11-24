@@ -16,12 +16,15 @@ project = "src/Tests/SkeinWeb.Tests.csproj"
 [kind.unit.selection]
 filter = "Category!=Integration"
 
-# Session revocation through real NATS subscriptions and the shared Redis ticket store.
+# Session revocation through real NATS subscriptions and the shared Redis ticket store;
+# the start of the application with Redis reached through Sentinel.
 [kind.integ]
+prepare = ["bash scripts/sentinel-stand.sh \"$PROGON_FIXTURE_SENTINEL\""]
 [kind.integ.env]
 TEST_NATS_URL = "nats://nats:4222"
 TEST_NATS_MONITOR_URL = "http://nats:8222/"
 TEST_REDIS_URL = "redis:6379"
+TEST_REDIS_SENTINEL_URL = "sentinel:26379,serviceName=skein,abortConnect=false"
 [kind.integ.options]
 project = "src/Tests/SkeinWeb.Tests.csproj"
 [kind.integ.selection]
@@ -42,6 +45,14 @@ cpu = 0.5
 memory_mib = 128
 command = ["redis-server", "--appendonly", "no"]
 ready = ["redis-cli", "ping"]
+[[kind.integ.fixture]]
+# A Sentinel stand; scripts/sentinel-stand.sh (in prepare) sets it up and waits for it.
+name = "sentinel"
+image = "redis:7-alpine"
+pull = true
+cpu = 0.5
+memory_mib = 128
+command = ["sh", "-c", "while :; do sleep 3600; done"]
 
 # Stryker.NET on its default VSTest runner. On Microsoft Testing Platform its
 # coverage relay goes stale after the tests that start a child SkeinWeb
@@ -54,6 +65,7 @@ memory_mib = 8192
 timeout_seconds = 7200
 workdir = "src/Tests"
 prepare = [
+  "bash ../../scripts/sentinel-stand.sh \"$PROGON_FIXTURE_SENTINEL\"",
   "dotnet build SkeinWeb.Tests.csproj --nologo -v q",
   # The integration run, with a machine report, before Stryker starts. The xUnit v3 test project is an
   # executable; its in-process runner writes TRX with -result-trx.
@@ -64,6 +76,7 @@ prepare = [
 TEST_NATS_URL = "nats://nats:4222"
 TEST_NATS_MONITOR_URL = "http://nats:8222/"
 TEST_REDIS_URL = "redis:6379"
+TEST_REDIS_SENTINEL_URL = "sentinel:26379,serviceName=skein,abortConnect=false"
 # Stryker.NET comes from the pinned local tool manifest (.config/dotnet-tools.json)
 # through the adapter's default `dotnet tool restore` and `dotnet stryker`.
 [[kind.mutation.fixture]]
@@ -82,3 +95,11 @@ cpu = 0.5
 memory_mib = 128
 command = ["redis-server", "--appendonly", "no"]
 ready = ["redis-cli", "ping"]
+[[kind.mutation.fixture]]
+# A Sentinel stand; scripts/sentinel-stand.sh (in prepare) sets it up and waits for it.
+name = "sentinel"
+image = "redis:7-alpine"
+pull = true
+cpu = 0.5
+memory_mib = 128
+command = ["sh", "-c", "while :; do sleep 3600; done"]

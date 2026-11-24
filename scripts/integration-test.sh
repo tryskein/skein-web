@@ -35,7 +35,7 @@ fi
 
 cleanup() {
     local result=$?
-    docker rm -f "$run_name-runner" "$run_name-nats" "$run_name-redis" >/dev/null 2>&1 || true
+    docker rm -f "$run_name-runner" "$run_name-nats" "$run_name-redis" "$run_name-sentinel" >/dev/null 2>&1 || true
     docker network rm "$run_name" >/dev/null 2>&1 || true
     if ((result == 0)); then
         rm -rf "$result_dir"
@@ -71,7 +71,14 @@ docker run -d --name "$run_name-redis" --network "$run_name" --network-alias red
     --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
     "${hardening[@]}" --pids-limit 128 --read-only \
     redis:7-alpine redis-server --save '' --appendonly no >/dev/null
+# The Sentinel stand (scripts/sentinel-stand.sh): the start of the application
+# with REDIS_URL pointing at Sentinel.
+docker run -d --name "$run_name-sentinel" --network "$run_name" --network-alias sentinel \
+    --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
+    "${hardening[@]}" --pids-limit 128 --read-only --tmpfs /tmp \
+    redis:7-alpine sh -c 'while :; do sleep 3600; done' >/dev/null
 wait_for docker exec "$run_name-redis" redis-cli ping
+"$repo_root/scripts/sentinel-stand.sh" "$run_name-sentinel"
 wait_for docker exec "$run_name-nats" wget -q -O /dev/null http://127.0.0.1:8222/healthz
 
 docker run --rm --name "$run_name-runner" --network "$run_name" \
@@ -79,7 +86,7 @@ docker run --rm --name "$run_name-runner" --network "$run_name" \
     "${hardening[@]}" --pids-limit 2048 \
     -e HOME=/tmp -e DOTNET_CLI_HOME=/tmp -e NUGET_PACKAGES=/tmp/nuget \
     -e TEST_NATS_URL=nats://nats:4222 -e TEST_NATS_MONITOR_URL=http://nats:8222/ \
-    -e TEST_REDIS_URL=redis:6379 \
+    -e TEST_REDIS_URL=redis:6379 -e TEST_REDIS_SENTINEL_URL=sentinel:26379,serviceName=skein,abortConnect=false \
     -v "$repo_root:/work:ro" -v "$result_dir:/results" -w /work "$runner_image" \
     dotnet test src/Tests/SkeinWeb.Tests.csproj --nologo \
     --filter "$test_filter" --logger 'trx;LogFileName=integration.trx' \
