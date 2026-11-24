@@ -71,15 +71,14 @@ docker run -d --name "$run_name-redis" --network "$run_name" --network-alias red
     --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
     "${hardening[@]}" --pids-limit 128 --read-only \
     redis:7-alpine redis-server --save '' --appendonly no >/dev/null
-# Its own primary, a Sentinel that names it (service "skein") and a replica the
-# Sentinel still lists after it went down: the start of the application with
-# REDIS_URL pointing at Sentinel.
+# The Sentinel stand (scripts/sentinel-stand.sh): the start of the application
+# with REDIS_URL pointing at Sentinel.
 docker run -d --name "$run_name-sentinel" --network "$run_name" --network-alias sentinel \
     --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
     "${hardening[@]}" --pids-limit 128 --read-only --tmpfs /tmp \
-    redis:7-alpine sh -c 'redis-server --save "" --appendonly no --dir /tmp & until redis-cli ping >/dev/null 2>&1; do sleep 0.1; done; ip=$(hostname -i | cut -d" " -f1); redis-server --port 6380 --replicaof "$ip" 6379 --replica-announce-ip "$ip" --save "" --appendonly no --dir /tmp & printf "port 26379\ndir /tmp\nsentinel monitor skein %s 6379 1\n" "$ip" > /tmp/sentinel.conf; redis-sentinel /tmp/sentinel.conf & until redis-cli -p 26379 sentinel replicas skein | grep -q 6380; do sleep 0.2; done; redis-cli -p 6380 shutdown nosave; wait' >/dev/null
+    redis:7-alpine sh -c 'while :; do sleep 3600; done' >/dev/null
 wait_for docker exec "$run_name-redis" redis-cli ping
-wait_for docker exec "$run_name-sentinel" sh -c 'redis-cli -p 26379 sentinel replicas skein | grep -q 6380 && ! redis-cli -p 6380 ping >/dev/null 2>&1'
+"$repo_root/scripts/sentinel-stand.sh" "$run_name-sentinel"
 wait_for docker exec "$run_name-nats" wget -q -O /dev/null http://127.0.0.1:8222/healthz
 
 docker run --rm --name "$run_name-runner" --network "$run_name" \

@@ -208,6 +208,11 @@ public sealed class StandardStartupIntegrationTest
         options.AllowAdmin = true;
         using var primary = await ConnectionMultiplexer.ConnectAsync(options);
         var db = primary.GetDatabase();
+        // The state that stopped the start before (sk-1006.9): the connection knows a server that
+        // is neither connected nor known to be a replica — the replica the Sentinel lists and
+        // that is down. Without it the stand does not reproduce the failure.
+        Assert.Contains(primary.GetServers(), s => !s.IsConnected && !s.IsReplica);
+        Assert.Contains(primary.GetServers(), s => s.IsConnected && !s.IsReplica); // the primary
         await db.ExecuteAsync("FLUSHDB");
         try
         {
