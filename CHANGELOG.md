@@ -2,6 +2,23 @@
 
 All notable changes to **skein-web** (.NET 10 BFF / API gateway).
 
+## [2.1.0] - 2026-11-24
+
+- Browser sessions end after 5 days without activity or 30 days after
+  sign-in, instead of a 24-hour sliding lifetime; both limits are
+  configurable (sk-977.7.30).
+- Live updates work for issues whose id contains a dot (sk-977.7.74).
+
+### Upgrade notes
+
+- New optional `SKEIN_SESSION_IDLE_TIMEOUT_HOURS` (default `120`) and
+  `SKEIN_SESSION_ABSOLUTE_TIMEOUT_HOURS` (default `720`) (sk-977.7.30).
+- Redis 6 or newer is required (sk-977.7.30).
+- Existing sessions are not ended by the upgrade, but are no longer renewed:
+  users sign in again within 24 hours (sk-977.7.30).
+- Upgrade skein-web together with skein-api 2.1.0 or before it
+  (sk-977.7.74).
+
 ## [2.0.0] - 2026-11-22
 
 - Security: the service routes of skein-api can no longer be reached from a
