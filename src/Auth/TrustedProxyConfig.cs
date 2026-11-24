@@ -250,10 +250,14 @@ public sealed class TrustedProxyConfig
         // and stops after ForwardLimit entries, however many addresses the
         // allowlist holds. When the transport peer is a trusted proxy and the
         // rightmost entry parses as an address, that entry becomes the client
-        // address — the peer of the trusted proxy directly in front of
-        // skein-web. Behind a chain of several trusted proxies that is the next
-        // proxy of the chain, not the visitor; listing more proxies does not
-        // move it further. A missing or malformed entry leaves the peer address.
+        // address — whatever the trusted proxy directly in front of skein-web
+        // wrote there; how it was obtained is not checked. A proxy that appends
+        // its own incoming peer (nginx's $proxy_add_x_forwarded_for) makes it
+        // that peer: behind a chain of several trusted proxies, the previous
+        // proxy of the chain, not the visitor. A last proxy that writes a single
+        // validated visitor address makes it that address. Listing more proxies
+        // does not move it further. A missing or malformed entry leaves the peer
+        // address.
         o.ForwardLimit = 1;
 
         foreach (var ip in _proxies)
