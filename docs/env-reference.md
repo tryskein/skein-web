@@ -121,16 +121,36 @@ spellings are shown below; the environment form is the one used in deployments.
   once).
 - **Sessions after a rollback:** session rows of this version are Redis strings
   under `skein:session:*`; those of the former version (1.x) are hashes under
-  the same keys. This version reads such a hash as no session and leaves it
-  until it expires. Rows of this version that stay in Redis while the former
-  version runs become valid again when this version returns, whatever happened
-  to their users in the meantime. So after a rollback to the former version,
-  delete the session rows before this version serves again: with skein-web
-  stopped, run against the database skein-web uses
-  `redis-cli -n <db> --scan --pattern 'skein:session:*' | xargs -r -n 500 redis-cli -n <db> del`
-  (`valkey-cli` for Valkey; add the host and credentials of your Redis to both
-  calls). Everyone signs in again; no other key is affected. An ordinary
-  restart or upgrade needs nothing of this.
+  the same keys. Neither version accepts the other's rows, but each version
+  accepts its own rows again when it returns, whatever happened to their users
+  in the meantime, and nothing deletes them at startup. So a rollback to the
+  former version and the return to this version after it are each done with
+  every skein-web replica stopped, deleting the session rows before the other
+  version starts. Everyone signs in again; no other key is affected. An
+  ordinary restart or upgrade needs nothing of this.
+
+  With every skein-web replica stopped, run in Bash (`valkey-cli` instead of
+  `redis-cli` for Valkey; set `REDISCLI_AUTH` to the password, or add
+  `--user`/`--pass`, when Redis requires one):
+
+  ```bash
+  set -euo pipefail
+  DB=0   # the database of REDIS_URL (defaultDatabase); 0 when it names none
+  # Redis reached directly: the host and port of REDIS_URL.
+  HOST=<redis-host> PORT=6379
+  # Through Sentinel, instead: the current primary of the serviceName of
+  # REDIS_URL, as a Sentinel of REDIS_URL names it.
+  # addr=$(redis-cli -e -h <sentinel-host> -p 26379 sentinel get-master-addr-by-name <serviceName>)
+  # HOST=$(sed -n 1p <<<"$addr") PORT=$(sed -n 2p <<<"$addr")
+  [ "$(redis-cli -e -h "$HOST" -p "$PORT" role | sed -n 1p)" = master ] \
+    || { echo "$HOST:$PORT is not the primary" >&2; exit 1; }
+  redis-cli -e -h "$HOST" -p "$PORT" -n "$DB" --scan --pattern 'skein:session:*' \
+    | xargs -r -n 500 redis-cli -e -h "$HOST" -p "$PORT" -n "$DB" del >/dev/null
+  left=$(redis-cli -e -h "$HOST" -p "$PORT" -n "$DB" --scan --pattern 'skein:session:*')
+  [ -z "$left" ] || { echo "session rows are left; run the deletion again" >&2; exit 1; }
+  ```
+
+  Start skein-web only after the last command succeeded.
 
 #### `NATS_URL`
 
