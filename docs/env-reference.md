@@ -291,11 +291,16 @@ spellings are shown below; the environment form is the one used in deployments.
   `X-Forwarded-For` right to left and stops after that one entry, however many
   addresses this list holds. When the transport peer is a trusted proxy and the
   rightmost entry parses as an address, that entry becomes the client address —
-  the peer of the trusted proxy directly in front of skein-web. A missing or
-  malformed entry leaves the peer address. Behind a chain of several trusted
-  proxies that entry is the previous proxy of the chain, not the visitor, and
-  every per-IP limit (the login throttle, the IP buckets of the public account
-  routes, and skein-api's limits through `X-Skein-Client-Ip`) keys on it.
+  whatever the trusted proxy directly in front of skein-web wrote there; the
+  middleware does not check how it was obtained. A missing or malformed entry
+  leaves the peer address. When the proxies append their incoming peer to
+  `X-Forwarded-For` (the bundled frontend nginx does, with
+  `$proxy_add_x_forwarded_for`), that entry is the peer of the last proxy: behind
+  a chain of several trusted proxies it is the previous proxy of the chain, not
+  the visitor. A last proxy that writes a single validated visitor address
+  instead makes that address the client address. Every per-IP limit (the login
+  throttle, the IP buckets of the public account routes, and skein-api's limits
+  through `X-Skein-Client-Ip`) keys on that client address.
   Listing more proxies here does not change this.
 - **Careful:** any deployment behind an ingress or another proxy **must** set
   this. Leaving it empty there does not fail loudly; it silently disables every
