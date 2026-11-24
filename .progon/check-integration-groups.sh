@@ -25,7 +25,6 @@ required=(
   RedisTicketStoreTest
   UserChangedSubscriberIntegrationTests
   SessionIssuerTest
-  SessionStoreMigrationTest
   SessionRevocationAcrossReplicasIntegrationTest
   SessionLogRedactionTest
   EdgePipelineTest
@@ -37,9 +36,6 @@ required=(
   SessionTimeoutsStartupTest
   SessionExpiryPipelineTest
   SessionStoreStartupIntegrationTest
-  SessionCleanupPipelineTest
-  SessionCleanupSurfacesTest
-  SessionCleanupProxyTest
   SessionFormatRejectionTest
 )
 

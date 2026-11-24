@@ -16,12 +16,14 @@ project = "src/Tests/SkeinWeb.Tests.csproj"
 [kind.unit.selection]
 filter = "Category!=Integration"
 
-# Session revocation through real NATS subscriptions and the shared Redis ticket store.
+# Session revocation through real NATS subscriptions and the shared Redis ticket store;
+# the start of the application with Redis reached through Sentinel.
 [kind.integ]
 [kind.integ.env]
 TEST_NATS_URL = "nats://nats:4222"
 TEST_NATS_MONITOR_URL = "http://nats:8222/"
 TEST_REDIS_URL = "redis:6379"
+TEST_REDIS_SENTINEL_URL = "sentinel:26379,serviceName=skein,abortConnect=false"
 [kind.integ.options]
 project = "src/Tests/SkeinWeb.Tests.csproj"
 [kind.integ.selection]
@@ -42,6 +44,16 @@ cpu = 0.5
 memory_mib = 128
 command = ["redis-server", "--appendonly", "no"]
 ready = ["redis-cli", "ping"]
+[[kind.integ.fixture]]
+# Its own primary, a Sentinel that names it (service "skein") and a replica the Sentinel
+# still lists after it went down: the start of the application through Sentinel.
+name = "sentinel"
+image = "redis:7-alpine"
+pull = true
+cpu = 0.5
+memory_mib = 128
+command = ["sh", "-c", 'redis-server --save "" --appendonly no --dir /tmp & until redis-cli ping >/dev/null 2>&1; do sleep 0.1; done; ip=$(hostname -i | cut -d" " -f1); redis-server --port 6380 --replicaof "$ip" 6379 --replica-announce-ip "$ip" --save "" --appendonly no --dir /tmp & printf "port 26379\ndir /tmp\nsentinel monitor skein %s 6379 1\n" "$ip" > /tmp/sentinel.conf; redis-sentinel /tmp/sentinel.conf & until redis-cli -p 26379 sentinel replicas skein | grep -q 6380; do sleep 0.2; done; redis-cli -p 6380 shutdown nosave; wait']
+ready = ["sh", "-c", 'redis-cli -p 26379 sentinel replicas skein | grep -q 6380 && ! redis-cli -p 6380 ping >/dev/null 2>&1']
 
 # Stryker.NET on its default VSTest runner. On Microsoft Testing Platform its
 # coverage relay goes stale after the tests that start a child SkeinWeb
@@ -64,6 +76,7 @@ prepare = [
 TEST_NATS_URL = "nats://nats:4222"
 TEST_NATS_MONITOR_URL = "http://nats:8222/"
 TEST_REDIS_URL = "redis:6379"
+TEST_REDIS_SENTINEL_URL = "sentinel:26379,serviceName=skein,abortConnect=false"
 # Stryker.NET comes from the pinned local tool manifest (.config/dotnet-tools.json)
 # through the adapter's default `dotnet tool restore` and `dotnet stryker`.
 [[kind.mutation.fixture]]
@@ -82,3 +95,13 @@ cpu = 0.5
 memory_mib = 128
 command = ["redis-server", "--appendonly", "no"]
 ready = ["redis-cli", "ping"]
+[[kind.mutation.fixture]]
+# Its own primary, a Sentinel that names it (service "skein") and a replica the Sentinel
+# still lists after it went down: the start of the application through Sentinel.
+name = "sentinel"
+image = "redis:7-alpine"
+pull = true
+cpu = 0.5
+memory_mib = 128
+command = ["sh", "-c", 'redis-server --save "" --appendonly no --dir /tmp & until redis-cli ping >/dev/null 2>&1; do sleep 0.1; done; ip=$(hostname -i | cut -d" " -f1); redis-server --port 6380 --replicaof "$ip" 6379 --replica-announce-ip "$ip" --save "" --appendonly no --dir /tmp & printf "port 26379\ndir /tmp\nsentinel monitor skein %s 6379 1\n" "$ip" > /tmp/sentinel.conf; redis-sentinel /tmp/sentinel.conf & until redis-cli -p 26379 sentinel replicas skein | grep -q 6380; do sleep 0.2; done; redis-cli -p 6380 shutdown nosave; wait']
+ready = ["sh", "-c", 'redis-cli -p 26379 sentinel replicas skein | grep -q 6380 && ! redis-cli -p 6380 ping >/dev/null 2>&1']

@@ -35,7 +35,7 @@ fi
 
 cleanup() {
     local result=$?
-    docker rm -f "$run_name-runner" "$run_name-nats" "$run_name-redis" >/dev/null 2>&1 || true
+    docker rm -f "$run_name-runner" "$run_name-nats" "$run_name-redis" "$run_name-sentinel" >/dev/null 2>&1 || true
     docker network rm "$run_name" >/dev/null 2>&1 || true
     if ((result == 0)); then
         rm -rf "$result_dir"
@@ -71,7 +71,15 @@ docker run -d --name "$run_name-redis" --network "$run_name" --network-alias red
     --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
     "${hardening[@]}" --pids-limit 128 --read-only \
     redis:7-alpine redis-server --save '' --appendonly no >/dev/null
+# Its own primary, a Sentinel that names it (service "skein") and a replica the
+# Sentinel still lists after it went down: the start of the application with
+# REDIS_URL pointing at Sentinel.
+docker run -d --name "$run_name-sentinel" --network "$run_name" --network-alias sentinel \
+    --user "$(id -u):$(id -g)" --cpus 0.5 --memory 128m \
+    "${hardening[@]}" --pids-limit 128 --read-only --tmpfs /tmp \
+    redis:7-alpine sh -c 'redis-server --save "" --appendonly no --dir /tmp & until redis-cli ping >/dev/null 2>&1; do sleep 0.1; done; ip=$(hostname -i | cut -d" " -f1); redis-server --port 6380 --replicaof "$ip" 6379 --replica-announce-ip "$ip" --save "" --appendonly no --dir /tmp & printf "port 26379\ndir /tmp\nsentinel monitor skein %s 6379 1\n" "$ip" > /tmp/sentinel.conf; redis-sentinel /tmp/sentinel.conf & until redis-cli -p 26379 sentinel replicas skein | grep -q 6380; do sleep 0.2; done; redis-cli -p 6380 shutdown nosave; wait' >/dev/null
 wait_for docker exec "$run_name-redis" redis-cli ping
+wait_for docker exec "$run_name-sentinel" sh -c 'redis-cli -p 26379 sentinel replicas skein | grep -q 6380 && ! redis-cli -p 6380 ping >/dev/null 2>&1'
 wait_for docker exec "$run_name-nats" wget -q -O /dev/null http://127.0.0.1:8222/healthz
 
 docker run --rm --name "$run_name-runner" --network "$run_name" \
@@ -79,7 +87,7 @@ docker run --rm --name "$run_name-runner" --network "$run_name" \
     "${hardening[@]}" --pids-limit 2048 \
     -e HOME=/tmp -e DOTNET_CLI_HOME=/tmp -e NUGET_PACKAGES=/tmp/nuget \
     -e TEST_NATS_URL=nats://nats:4222 -e TEST_NATS_MONITOR_URL=http://nats:8222/ \
-    -e TEST_REDIS_URL=redis:6379 \
+    -e TEST_REDIS_URL=redis:6379 -e TEST_REDIS_SENTINEL_URL=sentinel:26379,serviceName=skein,abortConnect=false \
     -v "$repo_root:/work:ro" -v "$result_dir:/results" -w /work "$runner_image" \
     dotnet test src/Tests/SkeinWeb.Tests.csproj --nologo \
     --filter "$test_filter" --logger 'trx;LogFileName=integration.trx' \

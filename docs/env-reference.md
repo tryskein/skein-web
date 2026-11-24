@@ -85,9 +85,6 @@ spellings are shown below; the environment form is the one used in deployments.
   until the window ends.
 - **Required:** no · **Default:** `60` · **Format:** whole number of seconds,
   `1`–`3600`.
-- **Also used by:** the wait of a replica for the startup session cleanup of
-  another replica (see `REDIS_URL`); a cleanup lock that is not gone within
-  the window stops the start.
 - **If skein-api gives no valid answer within the window:** the process logs a
   critical error naming the last failure and exits with code 1 — the pod never
   becomes ready. There is no default mode to fall back on (E-13). A 401 (wrong
@@ -116,51 +113,24 @@ spellings are shown below; the environment form is the one used in deployments.
   about that option.
 - **Careful:** Redis holds sessions *and* cookie-encryption keys. A Redis without
   persistence logs everyone out when it restarts.
-- **Topology:** one Redis (a single primary) is supported; Redis Cluster is not (the
-  session-format cleanup and the session scripts address several keys at once).
-- **Startup session cleanup:** at every start, before the first request,
-  skein-web looks for session rows of the former version (Redis hashes under
-  `skein:session:*`) and reads the marker `skein:session-format`. The scan for
-  those rows (`SCAN … TYPE hash`) needs Redis 6 or newer (Valkey included), and
-  it walks the whole keyspace of the database on every start, a plain restart
-  included.
-  - A plain restart — marker `3` in place, no such hash — ends no session.
-  - When the marker is missing or such a hash is found (the former version ran
-    after a rollback), every `skein:session:*` row that existed when the cleanup
-    began ends: the sessions issued by the former version and the sessions of
-    this version that survived the rollback. Users sign in again. A session
-    issued during the cleanup by a replica that is serving is kept when that
-    cleanup finishes; when the cleanup is interrupted, the next one ends it
-    with the rest.
-  - The cleanup records itself in `skein:session-format` (value `3`) and uses
-    `skein:session-format:lock`, `skein:session-format:generation` and
-    `skein:session-format:issued-during`. It touches no other key: the reverse
-    index `skein:user-tickets:*`, the DataProtection key ring, the login
-    throttle and the SignalR backplane stay.
-  - A replica serves only after it has confirmed in Redis, in one step, that the
-    state it observed is still the same: marker `3`, no cleanup running, the
-    same count in `skein:session-format:generation` (the confirmation adds one
-    to it). A replica that finds the cleanup of another replica running waits
-    until its lock is gone — the marker alone does not end the wait — then
-    looks again and runs the cleanup itself if it did not finish. A lock that
-    is not gone within the `SKEIN_API_STARTUP_TIMEOUT_SECONDS` window stops the
-    start.
-  - The rollback is recognised by what the former version left when the start
-    looks. When its last sessions run out while replicas are starting, and one
-    replica has already confirmed its start, the cleanup does not run: that is
-    the case of a rollback with no session of the former version left, and the
-    rollback procedure below covers it by deleting the marker.
-  - A cleanup that fails with an error releases its lock at once, and the next
-    start runs the cleanup again. When the process stops during the cleanup,
-    the lock runs out within 30 s.
-  - Rollback procedure: switching between the former version and this one, in
-    either direction, is rolled out with every replica of skein-web stopped
-    first, never as a rolling update. Delete `skein:session-format` as part of
-    every rollback to the former version. A rollback that leaves no session of
-    the former version behind is not seen otherwise. Deleting the marker
-    outside a rollback ends every session at the next start.
-  - Every primary must be reachable at startup: the scan for rows of the former
-    version runs on every start, and an unreachable primary stops it.
+- **Topology:** one Redis (a single primary) is supported, reached directly or
+  through Sentinel: a raw configuration string with the Sentinel endpoints and
+  the monitored service, for example
+  `sentinel-1:26379,sentinel-2:26379,serviceName=mymaster,abortConnect=false`.
+  Redis Cluster is not supported (the session scripts address several keys at
+  once).
+- **Sessions after a rollback:** session rows of this version are Redis strings
+  under `skein:session:*`; those of the former version (1.x) are hashes under
+  the same keys. This version reads such a hash as no session and leaves it
+  until it expires. Rows of this version that stay in Redis while the former
+  version runs become valid again when this version returns, whatever happened
+  to their users in the meantime. So after a rollback to the former version,
+  delete the session rows before this version serves again: with skein-web
+  stopped, run against the database skein-web uses
+  `redis-cli -n <db> --scan --pattern 'skein:session:*' | xargs -r -n 500 redis-cli -n <db> del`
+  (`valkey-cli` for Valkey; add the host and credentials of your Redis to both
+  calls). Everyone signs in again; no other key is affected. An ordinary
+  restart or upgrade needs nothing of this.
 
 #### `NATS_URL`
 

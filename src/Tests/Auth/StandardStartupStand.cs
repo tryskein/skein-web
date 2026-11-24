@@ -17,76 +17,12 @@ internal sealed record RedisCommand(string Name, string[] Args)
 {
     /// <summary>Whether the command names <paramref name="key"/> among its arguments.</summary>
     public bool Mentions(string key) => Args.Any(a => a == key);
-
-    public bool IsScriptWith(string fragment) =>
-        Name is "EVAL" or "EVALSHA" && Args.Length > 0 && Args[0].Contains(fragment, StringComparison.Ordinal);
-}
-
-/// <summary>A command the proxy keeps back until the test lets it go.</summary>
-internal sealed class RedisHold(Func<RedisCommand, bool> predicate)
-{
-    private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    public bool Matches(RedisCommand command) => predicate(command);
-    public Task Reached => _reached.Task;
-    public void MarkReached() => _reached.TrySetResult();
-    public Task WaitReleased() => _released.Task;
-    public void Release() => _released.TrySetResult();
-}
-
-/// <summary>
-/// What the server answered to one command, as the proxy parsed it: the cursor of a reply shaped like
-/// the reply of <c>SCAN</c> (an array whose first element is a bulk string and whose second is an
-/// array), else null.
-/// </summary>
-internal sealed record RedisReply(string? Cursor);
-
-/// <summary>
-/// The reply to a command that the proxy keeps back after the server answered and before the
-/// client gets it, until the test lets it go.
-/// </summary>
-internal sealed class RedisReplyHold(Func<RedisCommand, RedisReply, bool> predicate)
-{
-    private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    public bool Matches(RedisCommand command, RedisReply reply) => predicate(command, reply);
-
-    /// <summary>Completes when the matching reply arrived from the server and is kept back.</summary>
-    public Task Reached => _reached.Task;
-
-    /// <summary>The command whose reply is kept back; set when <see cref="Reached"/> completes.</summary>
-    public RedisCommand? Command { get; private set; }
-
-    /// <summary>The reply kept back (for <c>SCAN</c>, its cursor: the page); set when <see cref="Reached"/> completes.</summary>
-    public RedisReply? Reply { get; private set; }
-
-    public void MarkReached(RedisCommand command, RedisReply reply)
-    {
-        Command = command;
-        Reply = reply;
-        _reached.TrySetResult();
-    }
-
-    /// <summary>The proxy could not parse a reply: the test that waits on this hold fails with that error.</summary>
-    public void Fail(Exception error) => _reached.TrySetException(error);
-
-    public Task WaitReleased() => _released.Task;
-    public void Release() => _released.TrySetResult();
 }
 
 /// <summary>
 /// A TCP proxy in front of the real Redis that parses what the client sends (RESP arrays), logs each
-/// command, can keep a chosen command back (not forwarded) until released, can keep the reply to a
-/// chosen command back (answered by the server, not yet passed to the client) until released, can be
-/// cut for good, and selects database <see cref="Database"/> on every upstream connection so the
-/// stand has a Redis of its own. Replies are parsed only by a proxy made with
-/// <c>parseReplies: true</c> (the one <see cref="HoldReply"/> needs); otherwise they are passed on
-/// untouched. A parsed reply is matched to the commands in the order of the connection; push frames
-/// (RESP3 <c>&gt;</c>) answer no command. A reply the proxy cannot parse is recorded in
-/// <see cref="ReplyFailure"/>, fails the armed reply hold, and the rest of that connection is
-/// passed on untouched.
+/// command, can be cut for good, and selects database <see cref="Database"/> on every upstream
+/// connection so the stand has a Redis of its own. Replies are passed on untouched.
 /// </summary>
 internal sealed class RedisProxy : IDisposable
 {
@@ -94,15 +30,10 @@ internal sealed class RedisProxy : IDisposable
     private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
     private readonly List<TcpClient> _sockets = [];
     private readonly object _gate = new();
-    private RedisHold? _hold;
-    private RedisReplyHold? _replyHold;
     private volatile bool _cut;
-    private readonly bool _parseReplies;
-    private Exception? _replyFailure;
 
-    public RedisProxy(string host, int port, bool parseReplies = false)
+    public RedisProxy(string host, int port)
     {
-        _parseReplies = parseReplies;
         _listener.Start();
         _ = Task.Run(async () =>
         {
@@ -122,17 +53,8 @@ internal sealed class RedisProxy : IDisposable
                         _sockets.Add(client);
                         _sockets.Add(upstream);
                     }
-                    if (_parseReplies)
-                    {
-                        var sent = new Queue<RedisCommand>();
-                        _ = Pump(client, upstream, sent);
-                        _ = PumpReplies(upstream, client, sent);
-                    }
-                    else
-                    {
-                        _ = Pump(client, upstream, null);
-                        _ = upstream.GetStream().CopyToAsync(client.GetStream()).ContinueWith(_ => { });
-                    }
+                    _ = Pump(client, upstream);
+                    _ = upstream.GetStream().CopyToAsync(client.GetStream()).ContinueWith(_ => { });
                 }
                 catch (Exception)
                 {
@@ -144,63 +66,6 @@ internal sealed class RedisProxy : IDisposable
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
     public List<RedisCommand> Log { get; } = [];
-
-    public RedisHold Hold(Func<RedisCommand, bool> predicate)
-    {
-        var hold = new RedisHold(predicate);
-        lock (_gate)
-        {
-            _hold = hold;
-        }
-        return hold;
-    }
-
-    /// <summary>
-    /// Keeps back the first reply that <paramref name="predicate"/> accepts — the command it answers
-    /// and the reply — after the server answered and before the client gets it. The holds by command
-    /// (<see cref="Hold"/>) are not affected.
-    /// </summary>
-    public RedisReplyHold HoldReply(Func<RedisCommand, RedisReply, bool> predicate)
-    {
-        if (!_parseReplies)
-        {
-            throw new InvalidOperationException("this proxy passes replies on untouched; make it with parseReplies: true");
-        }
-        var hold = new RedisReplyHold(predicate);
-        lock (_gate)
-        {
-            if (_replyFailure is not null)
-            {
-                throw new InvalidOperationException("the proxy could not parse a reply", _replyFailure);
-            }
-            _replyHold = hold;
-        }
-        return hold;
-    }
-
-    /// <summary>The error of a reply the proxy could not parse, or null.</summary>
-    public Exception? ReplyFailure
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _replyFailure;
-            }
-        }
-    }
-
-    /// <summary>
-    /// Fails when the proxy met a reply it could not parse, whether or not a reply hold was armed
-    /// then: the final check of every test whose proxy parses replies.
-    /// </summary>
-    public void AssertRepliesParsed()
-    {
-        if (ReplyFailure is { } failure)
-        {
-            throw new InvalidOperationException("the Redis proxy met a reply it could not parse", failure);
-        }
-    }
 
     public void Cut()
     {
@@ -223,7 +88,7 @@ internal sealed class RedisProxy : IDisposable
         }
     }
 
-    private async Task Pump(TcpClient client, TcpClient upstream, Queue<RedisCommand>? sent)
+    private async Task Pump(TcpClient client, TcpClient upstream)
     {
         var input = client.GetStream();
         var output = upstream.GetStream();
@@ -247,27 +112,6 @@ internal sealed class RedisProxy : IDisposable
                     {
                         Log.Add(command);
                     }
-                    RedisHold? hold;
-                    lock (_gate)
-                    {
-                        hold = _hold is not null && _hold.Matches(command) ? _hold : null;
-                        if (hold is not null)
-                        {
-                            _hold = null;
-                        }
-                    }
-                    if (hold is not null)
-                    {
-                        hold.MarkReached();
-                        await hold.WaitReleased();
-                    }
-                    if (sent is not null)
-                    {
-                        lock (sent)
-                        {
-                            sent.Enqueue(command);
-                        }
-                    }
                     await output.WriteAsync(raw);
                 }
             }
@@ -276,173 +120,6 @@ internal sealed class RedisProxy : IDisposable
         {
             // a cut or a closed peer ends the pipe
         }
-    }
-
-    private async Task PumpReplies(TcpClient upstream, TcpClient client, Queue<RedisCommand> sent)
-    {
-        var input = upstream.GetStream();
-        var output = client.GetStream();
-        var buffer = new List<byte>();
-        var chunk = new byte[16 * 1024];
-        try
-        {
-            while (true)
-            {
-                var read = await input.ReadAsync(chunk);
-                if (read == 0)
-                {
-                    return;
-                }
-                buffer.AddRange(chunk.AsSpan(0, read).ToArray());
-                while (true)
-                {
-                    RedisReply reply;
-                    bool push;
-                    int length;
-                    try
-                    {
-                        if (!TryParseReply(buffer, out reply, out push, out length))
-                        {
-                            break;
-                        }
-                    }
-                    catch (InvalidOperationException error)
-                    {
-                        // Recorded and reported to the waiting test; the connection is passed on untouched.
-                        lock (_gate)
-                        {
-                            _replyFailure ??= error;
-                            _replyHold?.Fail(error);
-                            _replyHold = null;
-                        }
-                        await output.WriteAsync(buffer.ToArray());
-                        await input.CopyToAsync(output);
-                        return;
-                    }
-                    var raw = buffer.GetRange(0, length).ToArray();
-                    buffer.RemoveRange(0, length);
-                    RedisCommand? command = null;
-                    if (!push)
-                    {
-                        lock (sent)
-                        {
-                            sent.TryDequeue(out command);
-                        }
-                    }
-                    RedisReplyHold? hold = null;
-                    if (command is not null)
-                    {
-                        lock (_gate)
-                        {
-                            if (_replyHold is not null && _replyHold.Matches(command, reply))
-                            {
-                                hold = _replyHold;
-                                _replyHold = null;
-                            }
-                        }
-                    }
-                    if (hold is not null)
-                    {
-                        hold.MarkReached(command!, reply);
-                        await hold.WaitReleased();
-                    }
-                    await output.WriteAsync(raw);
-                }
-            }
-        }
-        catch (Exception)
-        {
-            // a cut or a closed peer ends the pipe
-        }
-    }
-
-    // One complete RESP2/RESP3 value at the start of the buffer: its length, whether it is a push
-    // frame, and the cursor when it has the shape of a SCAN reply.
-    private static bool TryParseReply(List<byte> buffer, out RedisReply reply, out bool push, out int length)
-    {
-        reply = new RedisReply(null);
-        push = buffer.Count > 0 && buffer[0] == (byte)'>';
-        length = 0;
-        var pos = 0;
-        if (!SkipValue(buffer, ref pos, out var first, out var elements))
-        {
-            return false;
-        }
-        length = pos;
-        if (elements is [{ } cursor, null] && first == '*')
-        {
-            reply = new RedisReply(cursor);
-        }
-        return true;
-    }
-
-    // Skips one value; for an aggregate, reports the bulk-string text of each direct element (null
-    // for an element that is not a bulk string).
-    private static bool SkipValue(List<byte> buffer, ref int pos, out char type, out List<string?>? elements)
-    {
-        elements = null;
-        type = '\0';
-        if (pos >= buffer.Count)
-        {
-            return false;
-        }
-        type = (char)buffer[pos];
-        if (!ReadLine(buffer, ref pos, out var line))
-        {
-            return false;
-        }
-        switch (type)
-        {
-            case '+' or '-' or ':' or '_' or '#' or ',' or '(':
-                return true;
-            case '$' or '=' or '!':
-            {
-                var n = int.Parse(line[1..]);
-                if (n < 0)
-                {
-                    return true;
-                }
-                if (buffer.Count < pos + n + 2)
-                {
-                    return false;
-                }
-                pos += n + 2;
-                return true;
-            }
-            case '*' or '~' or '>' or '%' or '|':
-            {
-                var n = int.Parse(line[1..]);
-                if (n < 0)
-                {
-                    return true;
-                }
-                var count = type is '%' or '|' ? 2 * n : n;
-                elements = new List<string?>(count);
-                for (var i = 0; i < count; i++)
-                {
-                    var start = pos;
-                    if (!SkipValue(buffer, ref pos, out var inner, out _))
-                    {
-                        return false;
-                    }
-                    elements.Add(inner == '$' && buffer[start] == (byte)'$' ? BulkText(buffer, start, pos) : null);
-                }
-                // An attribute precedes the value it describes.
-                return type != '|' || SkipValue(buffer, ref pos, out _, out _);
-            }
-            default:
-                throw new InvalidOperationException($"the proxy cannot parse a reply of type '{type}'");
-        }
-    }
-
-    private static string? BulkText(List<byte> buffer, int start, int end)
-    {
-        var header = start;
-        if (!ReadLine(buffer, ref header, out var line) || line == "$-1")
-        {
-            return null;
-        }
-        return Encoding.UTF8.GetString(buffer.GetRange(header, end - header - 2).ToArray());
     }
 
     private static bool TryParse(List<byte> buffer, out RedisCommand command, out int length)

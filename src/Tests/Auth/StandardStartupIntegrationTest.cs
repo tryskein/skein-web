@@ -50,7 +50,7 @@ internal sealed class StartupStand : IAsyncDisposable
 
     public static async Task<StartupStand> StartAsync(
         string environment = "Development", string insecure = "true", string authMode = "local", string? trusted = null,
-        Func<RedisProxy, Task>? beforeLaunch = null)
+        Func<RedisProxy, Task>? beforeLaunch = null, string? redisUrl = null)
     {
         var mux = TestRedis.Connect(RedisProxy.Database);
         mux.GetServers().First(s => !s.IsReplica).FlushDatabase(RedisProxy.Database);
@@ -73,7 +73,7 @@ internal sealed class StartupStand : IAsyncDisposable
                 ["SKEIN_ALLOW_INSECURE_HTTP"] = insecure,
                 ["SKEIN_API_URL"] = api.Url,
                 ["SKEIN_INTERNAL_SECRET"] = Internal,
-                ["REDIS_URL"] = $"redis://127.0.0.1:{proxy.Port}",
+                ["REDIS_URL"] = redisUrl ?? $"redis://127.0.0.1:{proxy.Port}",
                 ["NATS_URL"] = Environment.GetEnvironmentVariable("TEST_NATS_URL"),
                 ["SKEIN_TRUSTED_PROXIES"] = trusted,
                 ["SKEIN_API_STARTUP_TIMEOUT_SECONDS"] = "60",
@@ -141,152 +141,43 @@ internal sealed class StartupStand : IAsyncDisposable
     }
 }
 
+/// <summary>A fact that needs, besides the Redis and the NATS of the harness, a Redis reached through Sentinel.</summary>
+internal sealed class SentinelStartupFactAttribute : FactAttribute
+{
+    public SentinelStartupFactAttribute(
+        [System.Runtime.CompilerServices.CallerFilePath] string? sourceFilePath = null,
+        [System.Runtime.CompilerServices.CallerLineNumber] int sourceLineNumber = -1)
+        : base(sourceFilePath, sourceLineNumber)
+    {
+        if (string.IsNullOrWhiteSpace(TestRedis.Url) || string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TEST_NATS_URL"))
+            || string.IsNullOrWhiteSpace(StandardStartupIntegrationTest.SentinelUrl))
+        {
+            Skip = "Requires TEST_REDIS_URL, TEST_NATS_URL and TEST_REDIS_SENTINEL_URL (the integration harness).";
+        }
+    }
+}
+
 /// <summary>
-/// The startup order of the real application around the startup session cleanup (R68), two processes
-/// on one Redis, and the agent bypass (R72), on the stand. The holds name the commands the
-/// application really sends: the scan for rows of the former format, and the scripts of the pass by
-/// their keys (an <c>EVALSHA</c> carries a SHA, not the script text).
+/// The start of the real application and the agent bypass (R72), on the stand: the application
+/// serves once it is up, whatever the Redis topology behind <c>REDIS_URL</c>, and leaves the session
+/// rows it finds in Redis as they are.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection("startup-stand")]
 public sealed class StandardStartupIntegrationTest
 {
+    /// <summary>
+    /// A StackExchange.Redis configuration string that names Sentinel endpoints and a
+    /// <c>serviceName</c>, or null outside the harness. The harness's Sentinel names its own primary
+    /// and still lists a replica of it that is down, so the connection knows a server that never
+    /// connects.
+    /// </summary>
+    public static string? SentinelUrl => Environment.GetEnvironmentVariable("TEST_REDIS_SENTINEL_URL");
+
     private const string Legacy = "skein:session:legacy";
 
-    private static async Task AssertNoPortForAWhileAsync(AppProcess app)
+    private static async Task<string> SignInAsync(StartupStand stand)
     {
-        for (var i = 0; i < 10; i++)
-        {
-            Assert.False(await app.AcceptsConnectionAsync(), "the port accepted a connection before the cleanup finished");
-            await Task.Delay(100);
-        }
-    }
-
-    private static async Task<(StartupStand Stand, RedisHold Hold)> StartHeldAsync(Func<RedisCommand, bool> predicate, bool marker = false)
-    {
-        RedisHold? hold = null;
-        var stand = await StartupStand.StartAsync(beforeLaunch: async proxy =>
-        {
-            // The legacy hash (and the marker of an earlier deployment) must be there before the application starts.
-            var seed = TestRedis.Connect(RedisProxy.Database);
-            await seed.GetDatabase(RedisProxy.Database).HashSetAsync(Legacy, [new HashEntry("data", 1)]);
-            if (marker)
-            {
-                await seed.GetDatabase(RedisProxy.Database).StringSetAsync(SessionStoreMigration.MarkerKey, SessionStoreMigration.MarkerValue);
-            }
-            seed.Dispose();
-            hold = proxy.Hold(predicate);
-        });
-        try
-        {
-            await hold!.Reached.WaitAsync(TimeSpan.FromSeconds(60));
-        }
-        catch
-        {
-            // A start that never reaches the held command must not leave the process and the ports behind.
-            await stand.DisposeAsync();
-            throw;
-        }
-        return (stand, hold);
-    }
-
-    private static async Task<long> GenerationAsync(StartupStand stand) =>
-        (long?)await stand.Db.StringGetAsync(SessionStoreMigration.GenerationKey) ?? 0;
-
-    // ---- R68 (a): the early window ------------------------------------------------------------
-
-    [StartupFact]
-    public async Task EarlyWindow_OnTheScanForFormerRows_NoPortIsOpen_AndTheFormerHashIsThere()
-    {
-        var (stand, _) = await StartHeldAsync(c => c.Name == "SCAN" && c.Args.Contains(CleanupCalls.SessionPattern));
-        await using var _stand = stand;
-
-        // The scan the implementation sends asks for hashes of the session keys only.
-        var scan = stand.Proxy.Commands().Last(c => c.Name == "SCAN");
-        Assert.Equal(new[] { "MATCH", CleanupCalls.SessionPattern }, scan.Args.Skip(1).Take(2));
-        Assert.Contains("TYPE", scan.Args);
-        Assert.Equal("hash", scan.Args[Array.IndexOf(scan.Args, "TYPE") + 1]);
-        await AssertNoPortForAWhileAsync(stand.App);
-        Assert.True(await stand.Db.KeyExistsAsync(Legacy));
-        Assert.False(await stand.Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.False(stand.App.HasExited, stand.App.Output);
-    }
-
-    // ---- R68 (b), (c): the finish of the pass is the boundary ----------------------------------
-
-    [StartupFact]
-    public async Task TheFinishOfThePass_IsTheBoundary_BeforeIt_NoPortAndNoMarker_AfterIt_TheMarkerTheCountAndService()
-    {
-        var (stand, hold) = await StartHeldAsync(c => CleanupCalls.Of(c) == CleanupStep.Finish);
-        await using var _stand = stand;
-
-        // Held: the owner still has the lock, there is no marker, the count has not moved, the rows are gone.
-        Assert.True(hold.Reached.IsCompletedSuccessfully);
-        await AssertNoPortForAWhileAsync(stand.App);
-        Assert.True(await stand.Db.KeyExistsAsync(SessionStoreMigration.LockKey));
-        Assert.False(await stand.Db.KeyExistsAsync(SessionStoreMigration.MarkerKey));
-        Assert.Equal(0, await GenerationAsync(stand));
-        Assert.False(await stand.Db.KeyExistsAsync(Legacy));
-
-        hold.Release();
-
-        Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
-        Assert.Equal(SessionStoreMigration.MarkerValue, await stand.Db.StringGetAsync(SessionStoreMigration.MarkerKey));
-        Assert.Equal(1, await GenerationAsync(stand));
-        Assert.False(await stand.Db.KeyExistsAsync(SessionStoreMigration.LockKey));
-    }
-
-    // ---- US-5: two processes on one Redis ---------------------------------------------------------
-
-    [StartupFact]
-    public async Task TwoProcesses_OnOneRedis_RunOnePass_AndTheSecondServesOnlyAfterIt()
-    {
-        // The marker of an earlier deployment and a hash of the former format: a re-rollout after a rollback.
-        var (stand, hold) = await StartHeldAsync(c => CleanupCalls.Of(c) == CleanupStep.Finish, marker: true);
-        await using var _stand = stand;
-        var mark = stand.Proxy.Commands().Count;
-
-        var second = stand.StartAnother();
-
-        // The second process observes the pass of the first one and waits: it polls the state.
-        var deadline = DateTime.UtcNow.AddSeconds(60);
-        while (stand.Proxy.Commands().Skip(mark).Count(c => CleanupCalls.Of(c) == CleanupStep.Status) < 3)
-        {
-            Assert.True(DateTime.UtcNow < deadline, "the second process did not reach the wait for the pass: " + second.Output);
-            Assert.False(second.HasExited, second.Output);
-            await Task.Delay(50);
-        }
-        await AssertNoPortForAWhileAsync(second);
-        await AssertNoPortForAWhileAsync(stand.App);
-        Assert.DoesNotContain(stand.Proxy.Commands().Skip(mark), c => CleanupCalls.Of(c) == CleanupStep.Begin);
-
-        hold.Release();
-
-        Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
-        Assert.True(await second.WaitForHealthAsync(TimeSpan.FromSeconds(60)), second.Output);
-        Assert.Equal(2, await GenerationAsync(stand)); // the pass of the first, then the confirmation of the second
-        Assert.Single(stand.Proxy.Commands(), c => CleanupCalls.Of(c) == CleanupStep.Finish);
-        Assert.Equal(SessionStoreMigration.MarkerValue, await stand.Db.StringGetAsync(SessionStoreMigration.MarkerKey));
-        Assert.False(await stand.Db.KeyExistsAsync(Legacy));
-    }
-
-    // ---- R68 (c) and the release of every window ------------------------------------------------
-
-    [StartupFact]
-    public async Task AfterTheCleanup_TheApplicationServes_AndTheEarlyBoundaryRefusesWhenRedisIsGone()
-    {
-        await using var stand = await StartupStand.StartAsync(beforeLaunch: async _ =>
-        {
-            var seed = TestRedis.Connect(RedisProxy.Database);
-            await seed.GetDatabase(RedisProxy.Database).HashSetAsync(Legacy, [new HashEntry("data", 1)]);
-            seed.Dispose();
-        });
-
-        Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
-        Assert.False(await stand.Db.KeyExistsAsync(Legacy));
-        Assert.Equal(SessionStoreMigration.MarkerValue, await stand.Db.StringGetAsync(SessionStoreMigration.MarkerKey));
-
-        // A sign-in through the application; the control: its cookie is accepted.
         using var login = new HttpRequestMessage(HttpMethod.Post, "/api/auth/login")
         {
             Content = new StringContent("{\"email\":\"alice@example.com\",\"password\":\"correct-horse-battery\"}",
@@ -294,7 +185,27 @@ public sealed class StandardStartupIntegrationTest
         };
         using var loginReply = await stand.Http.SendAsync(login);
         Assert.Equal(HttpStatusCode.OK, loginReply.StatusCode);
-        var cookie = loginReply.Headers.GetValues("Set-Cookie").Single(c => c.StartsWith("skein.sid=", StringComparison.Ordinal)).Split(';')[0];
+        return loginReply.Headers.GetValues("Set-Cookie").Single(c => c.StartsWith("skein.sid=", StringComparison.Ordinal)).Split(';')[0];
+    }
+
+    // ---- The start leaves the store as it is; a lost Redis is refused early --------------------------
+
+    [StartupFact]
+    public async Task TheStartLeavesARowOfTheFormerFormat_TheApplicationServes_AndTheEarlyBoundaryRefusesWhenRedisIsGone()
+    {
+        await using var stand = await StartupStand.StartAsync(beforeLaunch: async _ =>
+        {
+            // A session row of the former format (a hash), there before the application starts.
+            var seed = TestRedis.Connect(RedisProxy.Database);
+            await seed.GetDatabase(RedisProxy.Database).HashSetAsync(Legacy, [new HashEntry("data", 1)]);
+            seed.Dispose();
+        });
+
+        Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
+        Assert.Equal(1, await stand.Db.HashLengthAsync(Legacy));
+
+        // A sign-in through the application; the control: its cookie is accepted.
+        var cookie = await SignInAsync(stand);
         Assert.Equal(HttpStatusCode.OK, (await stand.SendAsync("/api/auth/me", cookie)).Status);
 
         var meCalls = stand.Api.MeCalls;
@@ -305,6 +216,35 @@ public sealed class StandardStartupIntegrationTest
         Assert.Empty(refused.SetCookies);
         Assert.Equal("upstream_unavailable", JsonDocument.Parse(refused.Body).RootElement.GetProperty("error").GetString());
         Assert.Equal(meCalls, stand.Api.MeCalls);
+    }
+
+    // ---- Redis behind Sentinel (sk-1006.9) -------------------------------------------------------------
+
+    [SentinelStartupFact]
+    public async Task WithRedisReachedThroughSentinel_AndAReplicaDown_TheApplicationStarts_AndItsSessionLivesOnThePrimary()
+    {
+        // The test reaches the primary the way the application does: through the Sentinel.
+        var options = ConfigurationOptions.Parse(SentinelUrl!);
+        options.AllowAdmin = true;
+        using var primary = await ConnectionMultiplexer.ConnectAsync(options);
+        var db = primary.GetDatabase();
+        await db.ExecuteAsync("FLUSHDB");
+        try
+        {
+            await using var stand = await StartupStand.StartAsync(redisUrl: SentinelUrl);
+
+            Assert.True(await stand.App.WaitForHealthAsync(TimeSpan.FromSeconds(60)), stand.App.Output);
+            var cookie = await SignInAsync(stand);
+            Assert.Equal(HttpStatusCode.OK, (await stand.SendAsync("/api/auth/me", cookie)).Status);
+
+            var rows = (RedisResult[])(await db.ExecuteAsync("KEYS", "skein:session:*"))!;
+            Assert.Single(rows);
+            Assert.Equal(RedisType.String, await db.KeyTypeAsync((string)rows[0]!));
+        }
+        finally
+        {
+            await db.ExecuteAsync("FLUSHDB");
+        }
     }
 
     // ---- R72: /agent/v1 and /mcp do not touch the session; an ordinary path reads it ----------------
