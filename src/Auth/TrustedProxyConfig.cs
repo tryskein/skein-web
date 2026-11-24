@@ -188,8 +188,10 @@ public sealed class TrustedProxyConfig
     /// X-Forwarded-For are all honoured, each gated on the known-proxy check and
     /// peeled for exactly one hop — so OIDC builds an https redirect_uri, the
     /// OIDC same-origin return-URL whitelist (<c>AuthController</c>'s <c>rd</c>
-    /// handling) sees the real host, and the per-IP throttle keys on the real
-    /// client IP, none of which an arbitrary client can forge.
+    /// handling) sees the real host, and the per-IP throttle keys on the address
+    /// the trusted proxy in front of skein-web reports (the visitor when that
+    /// proxy faces clients directly; the previous proxy behind a multi-proxy
+    /// chain), none of which an arbitrary client can forge.
     /// </para>
     /// <para>
     /// <b>With an empty list</b>: only X-Forwarded-Proto is honoured.
@@ -244,12 +246,14 @@ public sealed class TrustedProxyConfig
             ForwardedHeaders.XForwardedHost |
             ForwardedHeaders.XForwardedFor;
 
-        // Peel exactly one hop: the middleware reads X-Forwarded-For right to left
+        // Peel at most one hop: the middleware reads X-Forwarded-For right to left
         // and stops after ForwardLimit entries, however many addresses the
-        // allowlist holds. The client address becomes the rightmost entry — the
-        // peer of the trusted proxy directly in front of skein-web. Behind a
-        // chain of several trusted proxies that is the next proxy of the chain,
-        // not the visitor; listing more proxies does not move it further.
+        // allowlist holds. When the transport peer is a trusted proxy and the
+        // rightmost entry parses as an address, that entry becomes the client
+        // address — the peer of the trusted proxy directly in front of
+        // skein-web. Behind a chain of several trusted proxies that is the next
+        // proxy of the chain, not the visitor; listing more proxies does not
+        // move it further. A missing or malformed entry leaves the peer address.
         o.ForwardLimit = 1;
 
         foreach (var ip in _proxies)
