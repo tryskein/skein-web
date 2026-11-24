@@ -285,6 +285,18 @@ spellings are shown below; the environment form is the one used in deployments.
   being secret, expiring and single-use. Only `X-Forwarded-Proto` is still
   honoured, since it carries no authority and the OIDC callback needs the https
   scheme.
+- **Client address — one hop only:** `ForwardedHeaders` peels at most one
+  `X-Forwarded-For` hop (`ForwardLimit = 1`, set in
+  `src/Auth/TrustedProxyConfig.cs#Apply`). The middleware reads
+  `X-Forwarded-For` right to left and stops after that one entry, however many
+  addresses this list holds. When the transport peer is a trusted proxy and the
+  rightmost entry parses as an address, that entry becomes the client address —
+  the peer of the trusted proxy directly in front of skein-web. A missing or
+  malformed entry leaves the peer address. Behind a chain of several trusted
+  proxies that entry is the previous proxy of the chain, not the visitor, and
+  every per-IP limit (the login throttle, the IP buckets of the public account
+  routes, and skein-api's limits through `X-Skein-Client-Ip`) keys on it.
+  Listing more proxies here does not change this.
 - **Careful:** any deployment behind an ingress or another proxy **must** set
   this. Leaving it empty there does not fail loudly; it silently disables every
   per-IP limit (login and public account routes) and makes `Request.Host` the
