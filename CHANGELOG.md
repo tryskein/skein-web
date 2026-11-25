@@ -2,6 +2,19 @@
 
 All notable changes to **skein-web** (.NET 10 BFF / API gateway).
 
+## [2.1.1] - 2026-11-25
+
+- Fixed: skein-web did not start behind Redis Sentinel while Sentinel
+  listed a replica that is down (sk-1006.9).
+- Docs: Redis behind Sentinel is supported; which `X-Forwarded-For` entry
+  becomes the client address (sk-1004, sk-1084).
+
+### Upgrade notes
+
+- A rollback to 1.x and the return to 2.x now need the session rows deleted
+  by hand with skein-web stopped; everyone signs in again. The command is in
+  `docs/env-reference.md` under `REDIS_URL` (sk-1006.9).
+
 ## [2.1.0] - 2026-11-24
 
 - Browser sessions end after 5 days without activity or 30 days after
